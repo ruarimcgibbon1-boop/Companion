@@ -20,6 +20,67 @@ const DILUTION_TERMS = [
   'priced an offering',
 ]
 
+// Catalyst keyword strength tiers (trader-calibrated). Higher stars = stronger
+// attention/move potential. The MAX star found in a headline drives quality.
+// Ordered longest-phrase-first within a tier so specific phrases win.
+const CATALYST_KEYWORD_TIERS: Array<{ stars: 2 | 3 | 4; terms: string[] }> = [
+  {
+    stars: 4,
+    terms: [
+      'positive endpoint', 'positive ceo statement', 'endpoints', 'endpoint', 'primary',
+    ],
+  },
+  {
+    stars: 3,
+    terms: [
+      'phase iii', 'phase 3', 'positive', 'top-line', 'top line', 'significant',
+      'demonstrates', 'demonstrate', 'demonstrated', 'demonstrating', 'demonstration',
+      'treatment', 'drug trials', 'drug trial', 'agreements', 'agreement', 'cancer',
+      'partnerships', 'partnership', 'collaborations', 'collaboration', 'collab',
+      'improvements', 'improvement', 'successful', 'success', 'billionaire', 'carl icahn',
+      'increase', 'awarded', 'awards', 'award', 'top of the line', 'significance',
+      'significantly', 'important', 'survival', 'reached', 'goal', 'billion',
+    ],
+  },
+  {
+    stars: 2,
+    terms: [
+      'phase ii', 'phase 2', 'receives', 'received', 'receive', 'fda', 'approval',
+      'approves', 'approved', 'approve', 'beneficial', 'benefits', 'benefit',
+      'fast track', 'breakouts', 'breakout', 'acquirements', 'expansion', 'expand',
+      'contracts', 'contract', 'completes', 'completed', 'complete', 'promising',
+      'achievements', 'achievement', 'achieves', 'achieved', 'achieve', 'launches',
+      'repurchase', 'purchase', 'bankruptcy', 'special',
+    ],
+  },
+]
+
+// Precompiled matchers: word-boundary, case-insensitive, one regex per tier.
+const TIER_MATCHERS = CATALYST_KEYWORD_TIERS.map(t => ({
+  stars: t.stars,
+  terms: t.terms,
+  regexes: t.terms.map(term => ({
+    term,
+    re: new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
+  })),
+}))
+
+/** Highest catalyst star tier present, plus the specific keywords matched. */
+export function keywordStrength(title: string, text: string): { stars: 0 | 2 | 3 | 4; matched: string[] } {
+  const combined = `${title} ${text}`
+  let stars: 0 | 2 | 3 | 4 = 0
+  const matched: string[] = []
+  for (const tier of TIER_MATCHERS) {
+    for (const { term, re } of tier.regexes) {
+      if (re.test(combined)) {
+        matched.push(term)
+        if (tier.stars > stars) stars = tier.stars
+      }
+    }
+  }
+  return { stars, matched }
+}
+
 const CATALYST_PATTERNS: Array<{ pattern: RegExp; category: CatalystCategory }> = [
   { pattern: /earnings|revenue|profit|loss|EPS|quarterly result/i, category: 'Earnings' },
   { pattern: /guidance|outlook|forecast|raises|lowers|updates/i, category: 'Guidance' },
@@ -53,16 +114,29 @@ function scoreCatalystQuality(
   category: CatalystCategory,
   isDilutive: boolean,
   ageHours: number,
-  isOriginal: boolean
+  isOriginal: boolean,
+  keywordStars: 0 | 2 | 3 | 4
 ): CatalystQuality {
+  // A dilutive offering dominates short-term price action regardless of any
+  // positive language in the same release.
   if (isDilutive) return 'Negative or Dilutive Catalyst'
+
+  const recent = ageHours < 24
+  const fresh = ageHours < 48
+
+  // Keyword-strength tiers take precedence — they are the trader's calibration.
+  if (keywordStars === 4) return fresh ? 'Strong Confirmed Catalyst' : 'Moderate Catalyst'
+  if (keywordStars === 3) return (recent && isOriginal) ? 'Strong Confirmed Catalyst' : fresh ? 'Moderate Catalyst' : 'Weak or Recycled Catalyst'
+  if (keywordStars === 2) return fresh ? 'Moderate Catalyst' : 'Weak or Recycled Catalyst'
+
+  // No calibrated keyword hit — fall back to category-based scoring.
   if (category === 'No Catalyst') return 'No Recent Catalyst Found'
   if (ageHours > 48) return 'Weak or Recycled Catalyst'
 
   const strongCategories: CatalystCategory[] = ['Earnings', 'FDA/Clinical', 'Acquisition', 'Contract']
   const moderateCategories: CatalystCategory[] = ['Guidance', 'Partnership', 'Analyst Action', 'Product Launch', 'Management Change']
 
-  if (strongCategories.includes(category) && ageHours < 24 && isOriginal) return 'Strong Confirmed Catalyst'
+  if (strongCategories.includes(category) && recent && isOriginal) return 'Strong Confirmed Catalyst'
   if (strongCategories.includes(category) || moderateCategories.includes(category)) return 'Moderate Catalyst'
   return 'Weak or Recycled Catalyst'
 }
@@ -99,11 +173,20 @@ export function processNews(raw: FmpNews[], symbol: string): NewsItem[] {
     const ageHours = ageMs / 3_600_000
     const isDilutive = detectDilution(n.title, n.text)
     const category = detectCatalystCategory(n.title, n.text)
-    const isOriginal = !n.site.toLowerCase().includes('seekingalpha') &&
-      !n.site.toLowerCase().includes('benzinga') &&
-      !n.site.toLowerCase().includes('accesswire') === false  // accesswire IS original
-    const quality = scoreCatalystQuality(category, isDilutive, ageHours, isOriginal)
+    // Original wire releases (globenewswire, accesswire, prnewswire, businesswire)
+    // are higher-signal than aggregators/blogs (seekingalpha, benzinga, yahoo).
+    const site = n.site.toLowerCase()
+    const isAggregator =
+      site.includes('seekingalpha') || site.includes('benzinga') ||
+      site.includes('yahoo') || site.includes('motley') || site.includes('zacks')
+    const isOriginal = !isAggregator
+    const { stars: keywordStars, matched } = keywordStrength(n.title, n.text)
+    const quality = scoreCatalystQuality(category, isDilutive, ageHours, isOriginal, keywordStars)
     const { bullish, bearish } = extractBullishBearish(n.title, n.text)
+    // Surface the calibrated keywords that fired, so the "why" is visible.
+    if (keywordStars > 0 && !isDilutive && matched.length) {
+      bullish.unshift(`${'★'.repeat(keywordStars)} ${matched.slice(0, 4).join(', ')}`)
+    }
 
     items.push({
       id: `${symbol}-${publishedAt}-${key.slice(0, 10)}`,
