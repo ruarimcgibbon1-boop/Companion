@@ -38,7 +38,19 @@ export function ChartPanel() {
     toggleLevels,
     positions,
     setLivePrice,
+    showSetupZones,
+    showTargets,
+    showInvalidation,
+    toggleSetupZones,
+    toggleTargets,
+    toggleInvalidation,
+    monitoredSetups,
   } = useTradingStore()
+
+  // Monitored setups for the currently-charted symbol (overlay source)
+  const symbolSetups = selectedSymbol
+    ? monitoredSetups.filter(s => s.symbol === selectedSymbol).slice(0, 4)
+    : []
 
   // Active (non-closed) position for the currently selected symbol
   const activePosition: Position | null =
@@ -423,6 +435,42 @@ export function ChartPanel() {
         }
       }
 
+      // ── Monitored setup overlays ──────────────────────────────────────────
+      for (const su of symbolSetups) {
+        const dir = su.direction === 'long'
+        if (showSetupZones) {
+          // Zone bounds as a shaded pair of lines + a labelled midline
+          candleSeries.createPriceLine({
+            price: su.zoneUpper, color: dir ? '#22c55e60' : '#ef444460',
+            lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '',
+          })
+          candleSeries.createPriceLine({
+            price: su.zoneLower, color: dir ? '#22c55e60' : '#ef444460',
+            lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '',
+          })
+          candleSeries.createPriceLine({
+            price: su.zoneMidpoint, color: dir ? '#22c55e' : '#ef4444',
+            lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true,
+            title: `${su.grade === 'below' ? '' : su.grade + ' '}${su.type.replace(/_/g, ' ')} ${su.score}`,
+          })
+        }
+        if (showInvalidation) {
+          candleSeries.createPriceLine({
+            price: su.invalidation, color: '#f87171',
+            lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '✕ inval',
+          })
+        }
+        if (showTargets) {
+          for (const t of su.targets.slice(0, 3)) {
+            candleSeries.createPriceLine({
+              price: t.price, color: '#34d399',
+              lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,
+              title: `${t.label}${t.rewardRisk ? ` ${t.rewardRisk}R` : ''}`,
+            })
+          }
+        }
+      }
+
       if (savedRange) {
         try {
           chart.timeScale().setVisibleRange(savedRange as import('lightweight-charts').IRange<import('lightweight-charts').Time>)
@@ -457,7 +505,7 @@ export function ChartPanel() {
       cancelled = true
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, showVwap, showEma9, showEma20, showLevels, snapshot?.sessionLevels, snapshot?.technical, activePosition?.entry, activePosition?.stop, activePosition?.status, activePosition?.targets])
+  }, [candles, showVwap, showEma9, showEma20, showLevels, showSetupZones, showTargets, showInvalidation, symbolSetups, snapshot?.sessionLevels, snapshot?.technical, activePosition?.entry, activePosition?.stop, activePosition?.status, activePosition?.targets])
 
   useEffect(() => () => cleanupRef.current(), [])
 
@@ -532,6 +580,9 @@ export function ChartPanel() {
             { key: 'ema9', label: 'E9', active: showEma9, toggle: toggleEma9, color: 'text-yellow-400' },
             { key: 'ema20', label: 'E20', active: showEma20, toggle: toggleEma20, color: 'text-blue-400' },
             { key: 'lvl', label: 'Levels', active: showLevels, toggle: toggleLevels, color: 'text-gray-400' },
+            { key: 'zones', label: 'Setups', active: showSetupZones, toggle: toggleSetupZones, color: 'text-emerald-400' },
+            { key: 'tgt', label: 'Targets', active: showTargets, toggle: toggleTargets, color: 'text-green-400' },
+            { key: 'inv', label: 'Inval', active: showInvalidation, toggle: toggleInvalidation, color: 'text-red-400' },
           ].map(btn => (
             <button
               key={btn.key}

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getTopGainers, getBatchQuotes, getStockNews } from '@/lib/fmp-client'
-import { getYFCandles } from '@/lib/yahoo-client'
+import { getTopGainers, getMostActive, getBatchQuotes, getStockNews } from '@/lib/fmp-client'
+import { getYFQuote, getYFScreener, getYFTrending } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
 import { processNews } from '@/lib/news-engine'
 import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
@@ -41,27 +41,17 @@ function assignBadges(row: {
   return badges
 }
 
-// Fetch 1min extended candles and return { latestPrice, premarketVolume } for a symbol.
-// Uses the same cache key as the chart so we don't double-hit FMP.
-async function getPremarketData(sym: string): Promise<{ price: number; volume: number } | null> {
+// Fetch Yahoo Finance quote for premarket price + previous close.
+// Much faster than fetching 1min candles — single request per symbol.
+interface PMData { price: number; volume: number; prevClose: number }
+async function getPremarketQuote(sym: string): Promise<PMData | null> {
   try {
-    const candles = await cached(`candles1m:${sym}`, TTL.CANDLES_1M, async () => {
-      try {
-        const yf = await getYFCandles(sym, '1min')
-        if (yf.length > 0) return yf
-      } catch { /* fall through */ }
-      const { getIntradayCandles } = await import('@/lib/fmp-client')
-      return getIntradayCandles(sym, '1min')
-    })
-    if (!candles.length) return null
-    // Latest candle is current premarket price
-    const latest = candles[candles.length - 1]
-    // Sum volume of all candles from today's date (ET date string prefix)
-    const todayEt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date())
-    const pmVolume = candles
-      .filter(c => c.date.startsWith(todayEt))
-      .reduce((s, c) => s + c.volume, 0)
-    return { price: latest.close, volume: pmVolume }
+    const q = await cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym))
+    if (!q) return null
+    // Use preMarketPrice if available, otherwise latest trade price
+    const price = q.preMarketPrice ?? q.price
+    if (!price || !q.previousClose) return null
+    return { price, volume: q.regularMarketVolume ?? 0, prevClose: q.previousClose }
   } catch {
     return null
   }
@@ -95,20 +85,80 @@ export async function GET(request: Request) {
   try {
     if (forceRefresh) {
       cache.delete('gainers')
+      cache.delete('mostActive')
+      cache.delete('yfGainers')
+      cache.delete('yfSmallCap')
+      cache.delete('yfActives')
+      cache.delete('yfTrending')
       cache.delete('batchQuotes:gainers')
     }
 
-    const gainers = await cached('gainers', TTL.GAINERS, getTopGainers)
+    // Universe strategy:
+    // - Regular hours: Yahoo Finance day_gainers + most_actives (real-time, no auth)
+    //   supplemented by FMP biggest-gainers for any symbols YF misses.
+    // - Premarket: FMP biggest-gainers + most-active merged, then YF quote per symbol for gap%.
+    const [yfGainers, yfSmallCap, yfActives, yfTrendingSyms, fmpGainers, fmpMostActive] = await Promise.all([
+      !inPremarket ? cached('yfGainers', TTL.GAINERS, () => getYFScreener('day_gainers', 50)).catch(() => []) : Promise.resolve([]),
+      !inPremarket ? cached('yfSmallCap', TTL.GAINERS, () => getYFScreener('small_cap_gainers', 25)).catch(() => []) : Promise.resolve([]),
+      !inPremarket ? cached('yfActives', TTL.GAINERS, () => getYFScreener('most_actives', 50)).catch(() => []) : Promise.resolve([]),
+      cached('yfTrending', TTL.GAINERS, () => getYFTrending(40)).catch(() => [] as string[]),
+      cached('gainers', TTL.GAINERS, getTopGainers),
+      cached('mostActive', TTL.GAINERS, getMostActive),
+    ])
 
-    const preFiltered = gainers.filter(g => {
-      if (!g.symbol) return false
+    // Fetch YF quotes for trending symbols not already covered by screeners
+    // (trending gives symbols only; we need price/change% from quote)
+    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfMarketCap?: number | null }
+
+    const screenerSymbols = new Set([...yfGainers, ...yfSmallCap, ...yfActives].map(r => r.symbol))
+    const trendingOnly = (yfTrendingSyms as string[]).filter(s => !screenerSymbols.has(s))
+
+    const trendingQuotes = await Promise.allSettled(
+      trendingOnly.map(async sym => {
+        const q = await cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym))
+        if (!q || !q.previousClose || q.price <= 0) return null
+        const changePct = ((q.price - q.previousClose) / q.previousClose) * 100
+        return {
+          symbol: sym,
+          name: '',
+          price: q.price,
+          changesPercentage: changePct,
+          exchange: '',
+          yfChangePct: changePct,
+          yfVolume: q.regularMarketVolume,
+          yfMarketCap: null,
+        } as UniverseEntry
+      })
+    )
+    const trendingRows: UniverseEntry[] = trendingQuotes
+      .filter(r => r.status === 'fulfilled' && r.value != null)
+      .map(r => (r as PromiseFulfilledResult<UniverseEntry>).value)
+
+    // Merge all sources, deduplicate by symbol
+    const seen = new Set<string>()
+
+    const yfRows: UniverseEntry[] = [...yfGainers, ...yfSmallCap, ...yfActives].map(r => ({
+      symbol: r.symbol,
+      name: r.name,
+      price: r.price,
+      changesPercentage: r.changePct,
+      exchange: r.exchange,
+      yfChangePct: r.changePct,
+      yfVolume: r.volume,
+      yfMarketCap: r.marketCap,
+    }))
+    const fmpRows: UniverseEntry[] = [...fmpGainers, ...fmpMostActive]
+
+    const universe = [...yfRows, ...trendingRows, ...fmpRows].filter(g => {
+      if (!g.symbol || seen.has(g.symbol)) return false
+      seen.add(g.symbol)
       if (filters.commonStocksOnly && isExcluded(g.name ?? '', g.symbol, g.exchange)) return false
       return true
     })
 
-    const symbols = preFiltered.map(g => g.symbol)
+    const symbols = universe.map(g => g.symbol)
 
-    // Always fetch quotes for name/exchange/previousClose/avgVolume
+    // Always fetch quotes for name/exchange/avgVolume
     const quotes = await cached(
       'batchQuotes:gainers',
       TTL.BATCH_QUOTE,
@@ -116,13 +166,13 @@ export async function GET(request: Request) {
     )
     const quoteMap = new Map(quotes.map(q => [q.symbol, q]))
 
-    // During premarket: fetch 1min extended candles to get the real current price and PM volume.
-    // Limit to top 25 symbols to keep latency reasonable — candles are cached 30s.
-    let pmDataMap = new Map<string, { price: number; volume: number }>()
+    // During premarket: use YF quote for each symbol to get real premarket price.
+    // This is a single small request per symbol (~50ms) vs fetching full 1min candles.
+    let pmDataMap = new Map<string, PMData>()
     if (inPremarket) {
       const pmResults = await Promise.allSettled(
-        symbols.slice(0, 25).map(async sym => {
-          const data = await getPremarketData(sym)
+        symbols.map(async sym => {
+          const data = await getPremarketQuote(sym)
           return { sym, data }
         })
       )
@@ -143,25 +193,46 @@ export async function GET(request: Request) {
       })
     )
 
-    const rows: ScannerRow[] = preFiltered
-      .map((g: { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string }, i: number) => {
+    const rows: ScannerRow[] = universe
+      .map((g: UniverseEntry, i: number) => {
         const q = quoteMap.get(g.symbol)
         const pm = inPremarket ? pmDataMap.get(g.symbol) : undefined
 
-        // Reject non-equity symbols
-        const quoteExchange = (q?.exchange ?? g.exchange ?? '').toUpperCase()
-        if (['CRYPTO', 'FOREX', 'COMMODITY'].includes(quoteExchange)) return null
+        // Reject non-equity symbols — but only use FMP exchange when we don't have a YF
+        // source confirming it's equity (FMP misclassifies some tickers e.g. USDE as CRYPTO)
+        const gExchange = (g.exchange ?? '').toUpperCase()
+        const qExchange = (q?.exchange ?? '').toUpperCase()
+        // If row came from YF screener/trending (has yfChangePct, non-empty exchange or no fmp mismatch), trust YF
+        const isFmpCryptoMisclassification = g.yfChangePct !== undefined && ['CRYPTO','FOREX','COMMODITY'].includes(qExchange) && !['CRYPTO','FOREX','COMMODITY'].includes(gExchange)
+        if (!isFmpCryptoMisclassification) {
+          const quoteExchange = qExchange || gExchange
+          if (['CRYPTO', 'FOREX', 'COMMODITY'].includes(quoteExchange)) return null
+        }
 
-        // In premarket: use candle price if available; fall back to quote price
-        const price = pm?.price ?? q?.price ?? g.price ?? 0
-        const prevClose = q?.previousClose ?? 0
+        let price: number
+        let changePct: number
+        let prevClose: number
 
-        // Compute change% from candle price vs previousClose for accuracy
-        const changePct = prevClose > 0
-          ? Math.abs(((price - prevClose) / prevClose) * 100)
-          : Math.abs(q?.changePercentage ?? Number(g.changesPercentage ?? 0))
+        if (inPremarket && pm) {
+          // Real premarket gap: YF premarket price vs previous regular-session close
+          price = pm.price
+          prevClose = pm.prevClose
+          changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0
+        } else if (g.yfChangePct !== undefined && g.price) {
+          // YF screener row — already has real-time price and change%
+          price = g.price
+          changePct = g.yfChangePct
+          prevClose = q?.previousClose ?? 0
+        } else {
+          // FMP-only row: use quote data
+          price = q?.price ?? g.price ?? 0
+          prevClose = q?.previousClose ?? 0
+          changePct = prevClose > 0
+            ? ((price - prevClose) / prevClose) * 100
+            : (q?.changePercentage ?? Number(g.changesPercentage ?? 0))
+        }
 
-        const volume = pm?.volume ?? q?.volume ?? 0
+        const volume = pm?.volume ?? g.yfVolume ?? q?.volume ?? 0
         const avgVol = q?.averageVolume ?? 0
         const rvol = avgVol > 0 ? volume / avgVol : null
 
@@ -169,12 +240,15 @@ export async function GET(request: Request) {
         const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume
 
         if (price < filters.minPrice || price > filters.maxPrice) return null
-        if (changePct < filters.minChangePct || changePct > filters.maxChangePct) return null
+        // During premarket only show upside gappers (positive change)
+        const absPct = Math.abs(changePct)
+        if (absPct < filters.minChangePct || absPct > filters.maxChangePct) return null
+        if (inPremarket && changePct <= 0) return null  // skip stocks gapping down in premarket scanner
         if (volume > 0 && volume < effectiveMinVolume) return null
         if (filters.minRelativeVolume > 0 && rvol !== null && rvol < filters.minRelativeVolume) return null
 
         const catalystLabel = (newsMap.get(g.symbol) ?? 'No Recent Catalyst Found') as ScannerRow['catalystLabel']
-        const badges = assignBadges({ relativeVolume: rvol, changePct, catalystCategory: '', catalystLabel, float: null })
+        const badges = assignBadges({ relativeVolume: rvol, changePct: absPct, catalystCategory: '', catalystLabel, float: null })
 
         const premarketChange = pm ? pm.price - prevClose : null
         const premarketChangePct = pm && prevClose > 0 ? ((pm.price - prevClose) / prevClose) * 100 : null
@@ -182,13 +256,13 @@ export async function GET(request: Request) {
         return {
           rank: i + 1,
           symbol: g.symbol,
-          name: g.name ?? '',
+          name: g.name ?? q?.name ?? '',
           price,
-          changePct,
+          changePct: inPremarket ? (premarketChangePct ?? changePct) : changePct,
           volume,
           relativeVolume: rvol,
           float: null as number | null,
-          marketCap: q?.marketCap ?? null,
+          marketCap: g.yfMarketCap ?? q?.marketCap ?? null,
           exchange: g.exchange ?? '',
           catalystLabel,
           catalystCategory: 'No Catalyst' as const,

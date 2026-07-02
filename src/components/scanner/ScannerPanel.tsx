@@ -58,7 +58,7 @@ const QUICK_PRESETS = [
 ]
 
 export function ScannerPanel() {
-  const { scannerRows, scannerLoading, scannerError, lastScanTime, filters, setFilters, selectSymbol, selectedSymbol } = useTradingStore()
+  const { scannerRows, scannerLoading, scannerError, lastScanTime, filters, setFilters, selectSymbol, selectedSymbol, addSearchedSymbol } = useTradingStore()
   const { scan } = useScanner()
   const [search, setSearch] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
@@ -68,6 +68,7 @@ export function ScannerPanel() {
     const sym = search.trim().toUpperCase()
     if (sym) {
       selectSymbol(sym)
+      addSearchedSymbol(sym)   // keep monitoring it even after you navigate away
       setSearch('')
       searchRef.current?.blur()
     }

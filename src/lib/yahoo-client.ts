@@ -28,17 +28,32 @@ export interface YFQuote {
   postMarketPrice: number | null
 }
 
+// Offset (minutes) of America/New_York from UTC at a given instant (handles EDT/EST).
+function etOffsetMinutes(date: Date): number {
+  const utc = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }))
+  const et = new Date(date.toLocaleString('en-US', { timeZone: 'America/New_York' }))
+  return Math.round((et.getTime() - utc.getTime()) / 60000)
+}
+
+// Emit an UNAMBIGUOUS ISO-8601 string with the correct ET offset, e.g.
+// "2026-07-02T10:41:00-04:00". This parses to the same instant on any server
+// timezone — critical because the dev server may not run in ET. The date part
+// still begins "YYYY-MM-DD" so existing `startsWith(todayEt)` checks keep working.
 function toETDateString(unixSec: number): string {
-  return new Date(unixSec * 1000).toLocaleString('en-CA', {
+  const d = new Date(unixSec * 1000)
+  const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).replace(',', '')  // "YYYY-MM-DD HH:MM:SS"
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(d)
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? '00'
+  let hour = get('hour')
+  if (hour === '24') hour = '00'
+  const off = etOffsetMinutes(d)
+  const sign = off <= 0 ? '-' : '+'
+  const abs = Math.abs(off)
+  const offStr = `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`
+  return `${get('year')}-${get('month')}-${get('day')}T${hour}:${get('minute')}:${get('second')}${offStr}`
 }
 
 type YFInterval = '1m' | '2m' | '5m' | '15m' | '1d'
@@ -89,6 +104,58 @@ export async function getYFCandles(
   }
 
   return candles  // already chronological (oldest first)
+}
+
+/**
+ * Yahoo Finance trending tickers for the US market.
+ * Returns bare symbols — no price data, needs a follow-up quote fetch.
+ * No auth required. Covers micro/penny caps that screeners miss.
+ */
+export async function getYFTrending(count = 40): Promise<string[]> {
+  const url = `https://query1.finance.yahoo.com/v1/finance/trending/US?count=${count}`
+  const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 0 } })
+  if (!res.ok) throw new Error(`YF trending HTTP ${res.status}`)
+  const json = await res.json()
+  const quotes: { symbol: string }[] = json?.finance?.result?.[0]?.quotes ?? []
+  return quotes
+    .map(q => q.symbol)
+    .filter(s => s && !s.includes('-') && !s.includes('=') && s.length <= 6)  // drop crypto/fx pairs
+}
+
+export interface YFScreenerRow {
+  symbol: string
+  name: string
+  price: number
+  changePct: number     // regular market change %
+  volume: number
+  marketCap: number | null
+  exchange: string
+}
+
+/**
+ * Fetch Yahoo Finance predefined screener results (no auth required).
+ * scrId options: 'day_gainers' | 'most_actives' | 'day_losers'
+ */
+export async function getYFScreener(
+  scrId: 'day_gainers' | 'most_actives' | 'small_cap_gainers',
+  count = 50
+): Promise<YFScreenerRow[]> {
+  const url = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${scrId}&count=${count}&formatted=false`
+  const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 0 } })
+  if (!res.ok) throw new Error(`YF screener HTTP ${res.status}`)
+  const json = await res.json()
+  const quotes: Record<string, unknown>[] = json?.finance?.result?.[0]?.quotes ?? []
+  return quotes
+    .filter(q => q.symbol && q.regularMarketPrice)
+    .map(q => ({
+      symbol: q.symbol as string,
+      name: (q.shortName ?? q.longName ?? '') as string,
+      price: q.regularMarketPrice as number,
+      changePct: (q.regularMarketChangePercent as number) ?? 0,
+      volume: (q.regularMarketVolume as number) ?? 0,
+      marketCap: (q.marketCap as number) ?? null,
+      exchange: (q.exchange ?? q.fullExchangeName ?? '') as string,
+    }))
 }
 
 export async function getYFQuote(symbol: string): Promise<YFQuote | null> {

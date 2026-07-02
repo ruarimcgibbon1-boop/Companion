@@ -12,13 +12,22 @@ import type {
   PositionTarget,
   TrailingStopMode,
   DEFAULT_FILTERS,
+  DetectedSetup,
+  KeyLevel,
+  PriceRoadmap,
+  SetupStateRecord,
+  MonitorAlert,
+  NotificationSettings,
+  SetupLog,
+  DataIntegrity,
 } from '@/types'
+import { DEFAULT_NOTIFICATION_SETTINGS } from '@/types'
 
 // Avoid importing DEFAULT_FILTERS from types (client-safe)
 const INITIAL_FILTERS: ScannerFilters = {
-  minPrice: 1,
+  minPrice: 0.1,
   maxPrice: 300,
-  minChangePct: 5,
+  minChangePct: 3,
   maxChangePct: 1000,
   minVolume: 500000,
   minRelativeVolume: 0,
@@ -68,6 +77,24 @@ interface TradingStore {
   // Positions
   positions: Position[]
 
+  // ── Always-on monitoring ──
+  monitoredSetups: DetectedSetup[]                 // live — best setups across the universe
+  keyLevels: Record<string, KeyLevel[]>            // live — per symbol (for chart overlays)
+  roadmaps: Record<string, PriceRoadmap>           // live — per symbol
+  monitorMeta: Record<string, DataIntegrity>       // live — per symbol data integrity
+  setupStates: Record<string, SetupStateRecord>    // persisted — state machine records
+  monitorAlerts: MonitorAlert[]                    // persisted (last 100)
+  setupLogs: SetupLog[]                            // persisted — performance log
+  notificationSettings: NotificationSettings        // persisted
+  searchedSymbols: string[]                        // persisted — recent manual searches
+  lastMonitorTime: number | null
+  monitorRunning: boolean
+
+  // Chart overlay toggles
+  showSetupZones: boolean
+  showTargets: boolean
+  showInvalidation: boolean
+
   // Actions
   setScannerRows: (rows: ScannerRow[]) => void
   setScannerLoading: (v: boolean) => void
@@ -99,6 +126,25 @@ interface TradingStore {
   updatePosition: (id: string, patch: Partial<Position>) => void
   closePosition: (id: string, closePrice: number) => void
   removePosition: (id: string) => void
+
+  // Monitoring actions
+  setMonitoredSetups: (s: DetectedSetup[]) => void
+  setKeyLevels: (sym: string, levels: KeyLevel[]) => void
+  setRoadmap: (sym: string, r: PriceRoadmap) => void
+  setMonitorMeta: (sym: string, m: DataIntegrity) => void
+  setSetupState: (id: string, rec: SetupStateRecord) => void
+  addMonitorAlert: (a: MonitorAlert) => void
+  markMonitorAlertRead: (id: string) => void
+  markAllMonitorAlertsRead: () => void
+  clearMonitorAlerts: () => void
+  upsertSetupLog: (log: SetupLog) => void
+  updateNotificationSettings: (patch: Partial<NotificationSettings>) => void
+  addSearchedSymbol: (sym: string) => void
+  setLastMonitorTime: (t: number) => void
+  setMonitorRunning: (v: boolean) => void
+  toggleSetupZones: () => void
+  toggleTargets: () => void
+  toggleInvalidation: () => void
 }
 
 export const useTradingStore = create<TradingStore>()(
@@ -126,6 +172,21 @@ export const useTradingStore = create<TradingStore>()(
       watchlist: [],
       alerts: [],
       positions: [],
+
+      monitoredSetups: [],
+      keyLevels: {},
+      roadmaps: {},
+      monitorMeta: {},
+      setupStates: {},
+      monitorAlerts: [],
+      setupLogs: [],
+      notificationSettings: DEFAULT_NOTIFICATION_SETTINGS,
+      searchedSymbols: [],
+      lastMonitorTime: null,
+      monitorRunning: false,
+      showSetupZones: true,
+      showTargets: true,
+      showInvalidation: true,
 
       setScannerRows: (rows) => set({ scannerRows: rows }),
       setScannerLoading: (v) => set({ scannerLoading: v }),
@@ -176,6 +237,41 @@ export const useTradingStore = create<TradingStore>()(
       removePosition: (id) => set(s => ({
         positions: s.positions.filter(p => p.id !== id),
       })),
+
+      // ── Monitoring ──
+      setMonitoredSetups: (setups) => set({ monitoredSetups: setups }),
+      setKeyLevels: (sym, levels) => set(s => ({ keyLevels: { ...s.keyLevels, [sym]: levels } })),
+      setRoadmap: (sym, r) => set(s => ({ roadmaps: { ...s.roadmaps, [sym]: r } })),
+      setMonitorMeta: (sym, m) => set(s => ({ monitorMeta: { ...s.monitorMeta, [sym]: m } })),
+      setSetupState: (id, rec) => set(s => ({ setupStates: { ...s.setupStates, [id]: rec } })),
+      addMonitorAlert: (a) => set(s => ({ monitorAlerts: [a, ...s.monitorAlerts].slice(0, 100) })),
+      markMonitorAlertRead: (id) => set(s => ({
+        monitorAlerts: s.monitorAlerts.map(a => a.id === id ? { ...a, read: true } : a),
+      })),
+      markAllMonitorAlertsRead: () => set(s => ({
+        monitorAlerts: s.monitorAlerts.map(a => ({ ...a, read: true })),
+      })),
+      clearMonitorAlerts: () => set({ monitorAlerts: [] }),
+      upsertSetupLog: (log) => set(s => {
+        const idx = s.setupLogs.findIndex(l => l.id === log.id)
+        if (idx >= 0) {
+          const next = [...s.setupLogs]
+          next[idx] = log
+          return { setupLogs: next }
+        }
+        return { setupLogs: [log, ...s.setupLogs].slice(0, 500) }
+      }),
+      updateNotificationSettings: (patch) => set(s => ({
+        notificationSettings: { ...s.notificationSettings, ...patch },
+      })),
+      addSearchedSymbol: (sym) => set(s => ({
+        searchedSymbols: [sym, ...s.searchedSymbols.filter(x => x !== sym)].slice(0, 20),
+      })),
+      setLastMonitorTime: (t) => set({ lastMonitorTime: t }),
+      setMonitorRunning: (v) => set({ monitorRunning: v }),
+      toggleSetupZones: () => set(s => ({ showSetupZones: !s.showSetupZones })),
+      toggleTargets: () => set(s => ({ showTargets: !s.showTargets })),
+      toggleInvalidation: () => set(s => ({ showInvalidation: !s.showInvalidation })),
     }),
     {
       name: 'trading-companion',
@@ -187,6 +283,15 @@ export const useTradingStore = create<TradingStore>()(
         showEma9: s.showEma9,
         showEma20: s.showEma20,
         showLevels: s.showLevels,
+        showSetupZones: s.showSetupZones,
+        showTargets: s.showTargets,
+        showInvalidation: s.showInvalidation,
+        // Monitoring — persisted so setups + logs survive a restart
+        setupStates: s.setupStates,
+        monitorAlerts: s.monitorAlerts,
+        setupLogs: s.setupLogs,
+        notificationSettings: s.notificationSettings,
+        searchedSymbols: s.searchedSymbols,
         // Persist positions but strip live fields
         positions: s.positions.map(p => ({
           ...p,

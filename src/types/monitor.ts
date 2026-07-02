@@ -1,0 +1,362 @@
+/**
+ * Types for the always-on setup-monitoring engine.
+ *
+ * These extend the existing snapshot analysis with:
+ *  - Ranked support/resistance levels (KeyLevel)
+ *  - Distinct, separately-scored setups (DetectedSetup)
+ *  - A live price roadmap above and below current price
+ *  - A per-setup state machine with adaptive alert thresholds
+ *  - Setup performance logs for later calibration
+ */
+
+// ── Setup taxonomy ──────────────────────────────────────────────────────────
+
+export type SetupType =
+  | 'pullback'
+  | 'breakout'
+  | 'ema9_bounce'
+  | 'ema21_bounce'
+  | 'vwap_bounce'
+  | 'vwap_reclaim'
+  | 'level_reclaim'
+  | 'resistance_rejection'
+  | 'support_breakdown'
+
+export type SetupDirection = 'long' | 'short'
+
+/**
+ * Lifecycle of every potential setup. Alerts are emitted on state transitions
+ * (plus material score/roadmap changes), never on every poll.
+ */
+export type SetupState =
+  | 'identified'   // level found, price not yet close enough to alert
+  | 'approaching'  // price within adaptive early-warning distance
+  | 'at_level'     // price inside the reaction zone
+  | 'confirming'   // evidence the anticipated reaction is occurring
+  | 'triggered'    // full setup conditions met
+  | 'failed'       // technical justification lost / invalidated
+  | 'expired'      // level no longer relevant (aged out / far away)
+
+export type SetupGrade = 'A+' | 'A' | 'A-' | 'B+' | 'B' | 'C' | 'below'
+
+// ── Support / resistance levels ─────────────────────────────────────────────
+
+export type LevelSource =
+  | 'premarket_high' | 'premarket_low'
+  | 'prev_day_high' | 'prev_day_low' | 'prev_close'
+  | 'day_high' | 'day_low'
+  | 'or5_high' | 'or5_low' | 'or15_high' | 'or15_low'
+  | 'swing_high' | 'swing_low'
+  | 'daily_swing_high' | 'daily_swing_low'
+  | 'gap_fill' | 'consolidation_high' | 'consolidation_low'
+  | 'whole_dollar' | 'half_dollar'
+  | 'ema9' | 'ema21' | 'vwap'
+  | 'ma50' | 'ma200'
+  | 'volume_shelf' | 'breakout_retest'
+
+export interface KeyLevel {
+  /** Zone bounds (merged from nearby levels). */
+  lower: number
+  upper: number
+  midpoint: number
+  kind: 'support' | 'resistance'
+  /** 0-100 strength. */
+  strength: number
+  /** Human sources that contributed to this level. */
+  sources: LevelSource[]
+  sourceLabels: string[]
+  /** How many times price reacted at this zone in the loaded window. */
+  touches: number
+  /** Unix ms of most recent reaction, or null. */
+  lastReactionAt: number | null
+  /** Setup we'd expect if price returns here. */
+  expectedSetup: SetupType | null
+  /** Is this a dynamic (moving) level like an EMA/VWAP? */
+  dynamic: boolean
+  /** True if confluent with VWAP or an EMA. */
+  hasConfluence: boolean
+}
+
+// ── Detected setup ──────────────────────────────────────────────────────────
+
+export interface SetupTarget {
+  price: number
+  label: string
+  rewardRisk: number | null
+}
+
+export interface ScoreBreakdown {
+  levelQuality: number       // /20
+  priceAction: number        // /15
+  volumeMomentum: number     // /15
+  trendAlignment: number     // /10
+  catalyst: number           // /10
+  rewardRisk: number         // /15
+  liquidity: number          // /10
+  confirmation: number       // /5
+}
+
+export interface DetectedSetup {
+  /** Stable id: `${symbol}:${type}:${zoneMidpoint}` rounded — used for dedup + state tracking. */
+  id: string
+  symbol: string
+  type: SetupType
+  direction: SetupDirection
+  state: SetupState
+  score: number
+  grade: SetupGrade
+  breakdown: ScoreBreakdown
+
+  /** Reaction zone. */
+  zoneLower: number
+  zoneUpper: number
+  zoneMidpoint: number
+  /** Why this zone matters. */
+  rationale: string
+
+  /** What must happen for the setup to become actionable. */
+  confirmation: string[]
+  /** Where the setup is invalidated. */
+  invalidation: number
+  stopReference: number
+
+  targets: SetupTarget[]
+  rewardRisk: number | null
+
+  /** Distances (percent) from dynamic references at detection time. */
+  distanceToZonePct: number
+  distanceFromVwapPct: number | null
+  distanceFromEma9Pct: number | null
+  distanceFromEma21Pct: number | null
+
+  /** Adaptive early-warning distance (percent) computed for this stock. */
+  approachThresholdPct: number
+
+  /** Setup-specific context. */
+  testCount: number          // e.g. Nth EMA/VWAP test (support weakens with repetition)
+  confidence: number         // 0-100 qualitative confidence
+  risks: string[]
+  keyRisks: string[]
+  notes: string
+
+  /** Next level if this one holds / fails. */
+  nextIfHolds: number | null
+  nextIfFails: number | null
+}
+
+// ── Price roadmap ───────────────────────────────────────────────────────────
+
+export interface RoadmapLevel {
+  price: number
+  zoneLower: number
+  zoneUpper: number
+  label: string
+  why: string
+  possibleSetup: SetupType | null
+  confirmationNeeded: string
+  invalidation: string
+  ifHolds: string
+  ifFails: string
+  strength: number
+  distancePct: number
+}
+
+export interface PriceRoadmap {
+  symbol: string
+  currentPrice: number
+  upside: RoadmapLevel[]
+  downside: RoadmapLevel[]
+  updatedAt: number
+}
+
+// ── Data integrity flags ────────────────────────────────────────────────────
+
+export interface DataIntegrity {
+  marketDataTimestamp: number   // unix ms of the freshest underlying data point
+  ageMs: number
+  session: string               // SessionType as string
+  delayed: boolean              // true if the feed is stale/delayed
+  missing: string[]             // named data points that were unavailable
+}
+
+// ── Per-symbol monitor result (returned by /api/monitor) ────────────────────
+
+export interface MonitorResult {
+  symbol: string
+  price: number
+  changePct: number
+  relativeVolume: number | null
+  spreadPct: number | null
+  catalyst: string
+  levels: KeyLevel[]
+  setups: DetectedSetup[]
+  roadmap: PriceRoadmap
+  integrity: DataIntegrity
+  error?: string
+}
+
+// ── State machine record (persisted for restart restoration) ────────────────
+
+export interface SetupStateRecord {
+  id: string
+  symbol: string
+  type: SetupType
+  state: SetupState
+  score: number
+  grade: SetupGrade
+  zoneMidpoint: number
+  /** True while price is inside the zone (drives leave/return dedup). */
+  inZone: boolean
+  lastState: SetupState
+  lastScore: number
+  lastAlertAt: number | null
+  alertsSent: number
+  firstSeenAt: number
+  updatedAt: number
+  /** States we've already alerted, so we don't repeat the same transition. */
+  alertedStates: SetupState[]
+}
+
+// ── Alert produced by the state machine ─────────────────────────────────────
+
+export type MonitorAlertKind =
+  | 'early_warning'
+  | 'level_reached'
+  | 'confirming'
+  | 'triggered'
+  | 'failed'
+  | 'score_upgrade'
+
+export interface MonitorAlert {
+  id: string             // dedup key
+  symbol: string
+  setupId: string
+  kind: MonitorAlertKind
+  setupType: SetupType
+  direction: SetupDirection
+  state: SetupState
+  score: number
+  grade: SetupGrade
+  title: string
+  body: string
+  price: number
+  zoneLower: number
+  zoneUpper: number
+  confirmation: string[]
+  invalidation: number
+  targets: SetupTarget[]
+  risks: string[]
+  timestamp: number
+  dataAgeMs: number
+  delayed: boolean
+  read: boolean
+}
+
+// ── Notification settings (persisted) ───────────────────────────────────────
+
+export interface NotificationSettings {
+  enabled: boolean
+  minScore: number
+  minLevelStrength: number
+  /** Multiplier on the adaptive threshold (1 = default). */
+  earlyWarningMultiplier: number
+  sound: boolean
+  browserNotifications: boolean
+  inApp: boolean
+  setupTypes: Record<SetupType, boolean>
+  allowLong: boolean
+  allowShort: boolean
+  premarketAlerts: boolean
+  regularHoursAlerts: boolean
+  afterHoursAlerts: boolean
+  /** 'watchlist' = only watchlist symbols; 'scanner' = whole monitored universe. */
+  scope: 'watchlist' | 'scanner'
+  cooldownMs: number
+  maxAlertsPerTicker: number
+  /** Materials score change (points) required to re-alert. */
+  scoreChangeThreshold: number
+}
+
+export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
+  enabled: true,
+  minScore: 70,
+  minLevelStrength: 40,
+  earlyWarningMultiplier: 1,
+  sound: false,
+  browserNotifications: true,
+  inApp: true,
+  setupTypes: {
+    pullback: true,
+    breakout: true,
+    ema9_bounce: true,
+    ema21_bounce: true,
+    vwap_bounce: true,
+    vwap_reclaim: true,
+    level_reclaim: true,
+    resistance_rejection: true,
+    support_breakdown: true,
+  },
+  allowLong: true,
+  allowShort: true,
+  premarketAlerts: true,
+  regularHoursAlerts: true,
+  afterHoursAlerts: false,
+  scope: 'scanner',
+  cooldownMs: 90_000,
+  maxAlertsPerTicker: 8,
+  scoreChangeThreshold: 6,
+}
+
+// ── Setup performance log (persisted, feeds the review page) ─────────────────
+
+export interface SetupLog {
+  id: string
+  symbol: string
+  type: SetupType
+  direction: SetupDirection
+  identifiedAt: number
+  priceAtIdentification: number
+  zoneLower: number
+  zoneUpper: number
+  score: number
+  grade: SetupGrade
+  confirmation: string[]
+  invalidation: number
+  targets: SetupTarget[]
+  statesReached: SetupState[]
+  /** Filled as monitoring continues. */
+  maxFavorablePrice: number
+  maxAdversePrice: number
+  maxFavorablePct: number
+  maxAdversePct: number
+  outcome: 'open' | 'target_hit' | 'invalidated' | 'expired'
+  outcomeReason: string | null
+  triggeredAt: number | null
+  resolvedAt: number | null
+  relativeVolumeAtId: number | null
+  sessionAtId: string
+  /** Nth test of the reference level, for first-test vs repeat analysis. */
+  testCount: number
+}
+
+export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
+  pullback: 'Pullback',
+  breakout: 'Breakout',
+  ema9_bounce: '9 EMA Bounce',
+  ema21_bounce: '21 EMA Bounce',
+  vwap_bounce: 'VWAP Bounce',
+  vwap_reclaim: 'VWAP Reclaim',
+  level_reclaim: 'Level Reclaim',
+  resistance_rejection: 'Resistance Rejection',
+  support_breakdown: 'Support Breakdown',
+}
+
+export const SETUP_STATE_LABELS: Record<SetupState, string> = {
+  identified: 'Identified',
+  approaching: 'Approaching',
+  at_level: 'At Level',
+  confirming: 'Confirming',
+  triggered: 'Triggered',
+  failed: 'Failed',
+  expired: 'Expired',
+}

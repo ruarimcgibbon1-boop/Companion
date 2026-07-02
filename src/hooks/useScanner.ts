@@ -4,7 +4,7 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import type { ScannerRow } from '@/types'
 
-const SCAN_INTERVAL = 60_000 // 1 min
+const SCAN_INTERVAL = 30_000 // 30s — matches candle refresh cadence
 
 export function useScanner() {
   const {

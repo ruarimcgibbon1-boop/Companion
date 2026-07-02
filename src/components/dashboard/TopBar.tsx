@@ -4,6 +4,9 @@ import { useState, useEffect } from 'react'
 import { getSessionType, formatET, formatLondon, sessionLabel, sessionColor } from '@/lib/market-hours'
 import { AlertsDrawer } from './AlertsDrawer'
 import { TradeJournal } from '@/components/journal/TradeJournal'
+import { OpportunitiesDrawer } from '@/components/opportunities/OpportunitiesDrawer'
+import { useMonitor } from '@/hooks/useMonitor'
+import { useTradingStore } from '@/store/trading-store'
 
 export function TopBar() {
   const [etTime, setEtTime] = useState('')
@@ -11,6 +14,12 @@ export function TopBar() {
   const [session, setSession] = useState('')
   const [sessionColorClass, setSessionColorClass] = useState('text-gray-500 bg-gray-900/20')
   const [journalOpen, setJournalOpen] = useState(false)
+  const [oppsOpen, setOppsOpen] = useState(false)
+
+  // Always-on monitoring engine — runs app-wide, independent of the selected ticker.
+  useMonitor()
+  const setupCount = useTradingStore(s => s.monitoredSetups.filter(su => su.score >= 75).length)
+  const unreadSignals = useTradingStore(s => s.monitorAlerts.filter(a => !a.read).length)
 
   useEffect(() => {
     const update = () => {
@@ -50,6 +59,20 @@ export function TopBar() {
           <span>LON {londonTime}</span>
         </div>
         <button
+          onClick={() => setOppsOpen(true)}
+          className="relative text-xs px-2.5 py-1 rounded border border-blue-800 bg-blue-950/40 text-blue-300 hover:text-white hover:border-blue-600 transition-colors font-medium"
+        >
+          ⚡ Opportunities
+          {setupCount > 0 && (
+            <span className="ml-1.5 text-[10px] px-1 rounded bg-blue-700 text-white">{setupCount}</span>
+          )}
+          {unreadSignals > 0 && (
+            <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white text-[9px] flex items-center justify-center font-bold">
+              {unreadSignals > 9 ? '9+' : unreadSignals}
+            </span>
+          )}
+        </button>
+        <button
           onClick={() => setJournalOpen(true)}
           className="text-xs px-2.5 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 transition-colors font-medium"
         >
@@ -58,6 +81,7 @@ export function TopBar() {
         <AlertsDrawer />
       </div>
       {journalOpen && <TradeJournal onClose={() => setJournalOpen(false)} />}
+      {oppsOpen && <OpportunitiesDrawer onClose={() => setOppsOpen(false)} />}
     </header>
   )
 }

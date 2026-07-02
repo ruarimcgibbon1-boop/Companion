@@ -139,6 +139,14 @@ export async function getTopGainers(): Promise<FmpGainer[]> {
   }
 }
 
+export async function getMostActive(): Promise<FmpGainer[]> {
+  try {
+    return await fmpGet('/most-active', {}, z.array(FmpGainerSchema))
+  } catch {
+    return []
+  }
+}
+
 export async function getQuote(symbol: string): Promise<FmpQuote | null> {
   try {
     const data = await fmpGet('/quote', { symbol }, z.array(FmpQuoteSchema))
