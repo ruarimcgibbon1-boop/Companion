@@ -136,9 +136,9 @@ export async function buildSnapshot(symbol: string): Promise<TickerSnapshot | nu
     const currentPrice = livePrice
     const zones = calculateSupportResistance(intraday, sessionLevels, currentPrice, technical)
     const pullbacks = calculatePullbackScenarios(currentPrice, technical, sessionLevels, zones)
-    const setupScore = calculateSetupScore(technical, pullbacks, zones, catalystQuality, currentPrice)
+    const setupScore = calculateSetupScore(technical, pullbacks, zones, catalystQuality)
     const warnings = getWarnings(technical, currentPrice, pullbacks)
-    const breakoutStatus = detectBreakout(intraday, sessionLevels, technical, zones, currentPrice, quote.volume ?? 0, quote.averageVolume ?? 0)
+    const breakoutStatus = detectBreakout(intraday, sessionLevels, technical, zones, currentPrice)
     const tradePlans = buildTradePlans({ price: currentPrice, technical, levels: sessionLevels, zones, catalystQuality, breakout: breakoutStatus })
 
     const companyProfile: CompanyProfile | null = profile

@@ -40,36 +40,6 @@ function etHHMM(ts: number): number {
   return h * 100 + m
 }
 
-function etDayOfWeek(ts: number): number {
-  const d = new Date(ts)
-  return Number(
-    new Intl.DateTimeFormat('en-US', {
-      timeZone: 'America/New_York',
-      weekday: 'long',
-    })
-      .formatToParts(d)
-      .find(p => p.type === 'weekday')!
-      .value === 'Saturday'
-      ? 6
-      : new Intl.DateTimeFormat('en-US', {
-          timeZone: 'America/New_York',
-          weekday: 'long',
-        })
-            .formatToParts(d)
-            .find(p => p.type === 'weekday')!
-            .value === 'Sunday'
-        ? 0
-        : new Date(
-            new Intl.DateTimeFormat('en-US', {
-              timeZone: 'America/New_York',
-              year: 'numeric',
-              month: '2-digit',
-              day: '2-digit',
-            }).format(d)
-          ).getDay()
-  )
-}
-
 function isWeekendET(ts: number): boolean {
   const d = new Date(ts)
   const dayName = new Intl.DateTimeFormat('en-US', {

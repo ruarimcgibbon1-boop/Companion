@@ -174,8 +174,7 @@ export function calculateSetupScore(
   technical: TechnicalData,
   scenarios: PullbackScenario[],
   zones: SupportResistanceZone[],
-  catalystQuality: CatalystQuality,
-  price: number
+  catalystQuality: CatalystQuality
 ): SetupScore {
   // Trend & structure (20)
   let trendStructure = 0

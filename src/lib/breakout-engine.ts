@@ -54,9 +54,7 @@ export function detectBreakout(
   levels: SessionLevels,
   technical: TechnicalData,
   zones: SupportResistanceZone[],
-  currentPrice: number,
-  currentVolume: number,
-  avgVolume: number
+  currentPrice: number
 ): BreakoutStatus {
   const none: BreakoutStatus = {
     state: 'none',

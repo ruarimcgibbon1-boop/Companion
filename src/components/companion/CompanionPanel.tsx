@@ -365,7 +365,7 @@ function PlansTab({ snap, liveTradePlans, livePrice }: { snap: TickerSnapshot; l
   )
 }
 
-function PlanCard({ plan, price }: { plan: TradePlan; price: number }) {
+function PlanCard({ plan }: { plan: TradePlan; price: number }) {
   const planTypeColor = plan.type === 'No-Trade' ? 'text-gray-500' : plan.valid ? 'text-blue-400' : 'text-gray-600'
   return (
     <div className={`rounded-lg border p-3 ${plan.type === 'No-Trade' ? 'bg-gray-900/40 border-gray-800' : plan.valid ? 'bg-gray-900 border-gray-700' : 'bg-gray-900/40 border-gray-800'}`}>

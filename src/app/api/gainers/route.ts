@@ -168,7 +168,7 @@ export async function GET(request: Request) {
 
     // During premarket: use YF quote for each symbol to get real premarket price.
     // This is a single small request per symbol (~50ms) vs fetching full 1min candles.
-    let pmDataMap = new Map<string, PMData>()
+    const pmDataMap = new Map<string, PMData>()
     if (inPremarket) {
       const pmResults = await Promise.allSettled(
         symbols.map(async sym => {

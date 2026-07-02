@@ -32,8 +32,9 @@ export function AlertsDrawer() {
   const [open, setOpen] = useState(false)
   const unread = alerts.filter(a => !a.read).length
 
-  // Flash the panel open briefly when a new alert arrives
+  // Flash the panel open briefly when a new alert arrives — intentional UI sync
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (unread > 0) setOpen(true)
   }, [unread])
 

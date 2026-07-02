@@ -37,8 +37,9 @@ export function ChatTab({ snapshot, symbol }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // Reset conversation when ticker changes
+  // Reset conversation when ticker changes — intentional state sync on prop change
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMessages([])
     setError(null)
   }, [symbol])
@@ -134,8 +135,6 @@ export function ChatTab({ snapshot, symbol }: Props) {
     setMessages([])
     setError(null)
   }
-
-  const noKey = !snapshot && symbol === null
 
   return (
     <div className="flex flex-col h-full">

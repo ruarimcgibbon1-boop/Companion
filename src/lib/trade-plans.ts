@@ -43,7 +43,7 @@ function rr(entry: number, stop: number, target: number): number | null {
 // ── Plan A: Breakout ───────────────────────────────────────────────────────
 
 function buildPlanA(ctx: Context): TradePlan {
-  const { price, technical, levels, zones, breakout } = ctx
+  const { price, levels, zones, breakout } = ctx
   const hod = levels.regularHigh ?? levels.premarketHigh
   const t1 = hod ? nextResistance(price, hod, zones) : null
   const t2 = t1 ? nextResistance(price, t1, zones) : null

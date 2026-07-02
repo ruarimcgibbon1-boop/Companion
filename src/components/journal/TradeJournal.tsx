@@ -100,8 +100,10 @@ function EquityCurve({ trades }: { trades: Position[] }) {
   }
 
   // Build cumulative P&L series
-  let running = 0
-  const points = [0, ...closed.map(p => { running += realizedPnl(p)!; return running })]
+  const points = closed.reduce<number[]>(
+    (acc, p) => [...acc, acc[acc.length - 1] + (realizedPnl(p) ?? 0)],
+    [0]
+  )
   const min = Math.min(...points)
   const max = Math.max(...points)
   const range = max - min || 1
@@ -118,7 +120,7 @@ function EquityCurve({ trades }: { trades: Position[] }) {
   const pathD = coords.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')
   const fillD = `${pathD} L${coords[coords.length - 1].x},${H} L${coords[0].x},${H} Z`
 
-  const isPositive = running >= 0
+  const isPositive = points[points.length - 1] >= 0
   const color = isPositive ? '#22c55e' : '#ef4444'
 
   return (

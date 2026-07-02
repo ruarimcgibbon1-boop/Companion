@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useId } from 'react'
+import { useState } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { usePositionTracker } from '@/hooks/usePositionTracker'
 import { dataAge } from '@/lib/market-hours'
@@ -10,11 +10,6 @@ import type { Position, PositionDirection, TrailingStopMode, PositionTarget } fr
 
 function uid(): string {
   return Math.random().toString(36).slice(2, 10)
-}
-
-function fmt(v: number | null | undefined, decimals = 2): string {
-  if (v == null) return '—'
-  return `$${v.toFixed(decimals)}`
 }
 
 function fmtPnl(v: number | null | undefined): string {

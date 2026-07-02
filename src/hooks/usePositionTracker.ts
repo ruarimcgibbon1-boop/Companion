@@ -48,7 +48,7 @@ function applyTrailingStop(pos: Position, currentPrice: number): Partial<Positio
 }
 
 function checkTargets(pos: Position, currentPrice: number): { targets: typeof pos.targets; newStatus: typeof pos.status; newStop: number } {
-  let targets = pos.targets.map(t => ({ ...t }))
+  const targets = pos.targets.map(t => ({ ...t }))
   let newStatus = pos.status
   let newStop = pos.stop
   const isLong = pos.direction === 'long'

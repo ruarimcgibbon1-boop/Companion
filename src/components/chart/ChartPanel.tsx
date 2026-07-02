@@ -90,13 +90,17 @@ export function ChartPanel() {
     } finally {
       setLoading(false)
     }
+    // Zustand setters are stable references — safe to omit from deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- clear chart state when the ticker is deselected
     if (!selectedSymbol) { setCandles([]); setLivePrice(null); return }
     fetchCandles(selectedSymbol, chartInterval)
     const id = setInterval(() => fetchCandles(selectedSymbol, chartInterval), 30_000)
     return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSymbol, chartInterval, fetchCandles])
 
   // ── Build / rebuild chart ─────────────────────────────────────────────────

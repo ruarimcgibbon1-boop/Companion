@@ -294,7 +294,7 @@ describe('calculateSetupScore', () => {
       twentyDayHigh: 12, twentyDayLow: 7, avgVolume20d: 1_000_000,
       isBreakingOutOfRange: true,
     }
-    const score = calculateSetupScore(tech, [], [], 'Moderate Catalyst', 10.2)
+    const score = calculateSetupScore(tech, [], [], 'Moderate Catalyst')
     expect(score.total).toBeGreaterThanOrEqual(0)
     expect(score.total).toBeLessThanOrEqual(100)
     expect(score.status).toBeTruthy()
