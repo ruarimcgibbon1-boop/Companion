@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getTopGainers, getMostActive, getBatchQuotes, getStockNews } from '@/lib/fmp-client'
-import { getYFQuote, getYFScreener, getYFTrending } from '@/lib/yahoo-client'
+import { getYFQuote, getYFScreener, getYFTrending, getYFCandles } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
 import { processNews } from '@/lib/news-engine'
 import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
@@ -41,17 +41,36 @@ function assignBadges(row: {
   return badges
 }
 
-// Fetch Yahoo Finance quote for premarket price + previous close.
-// Much faster than fetching 1min candles — single request per symbol.
+// Real premarket price for a symbol. Yahoo's meta.preMarketPrice is unreliable
+// (undefined for thin micro-caps), so we take the freshest premarket candle close
+// — the same candle path the monitor uses — and the previous close from the quote.
+// Candles are cached under the shared `candles1m:` key, so this doesn't double-hit.
 interface PMData { price: number; volume: number; prevClose: number }
 async function getPremarketQuote(sym: string): Promise<PMData | null> {
   try {
-    const q = await cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym))
-    if (!q) return null
-    // Use preMarketPrice if available, otherwise latest trade price
-    const price = q.preMarketPrice ?? q.price
-    if (!price || !q.previousClose) return null
-    return { price, volume: q.regularMarketVolume ?? 0, prevClose: q.previousClose }
+    const [candles, q] = await Promise.all([
+      cached(`candles1m:${sym}`, TTL.CANDLES_1M, async () => {
+        try {
+          const yf = await getYFCandles(sym, '1min')
+          if (yf.length > 0) return yf
+        } catch { /* fall through */ }
+        const { getIntradayCandles } = await import('@/lib/fmp-client')
+        return getIntradayCandles(sym, '1min')
+      }),
+      cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym)),
+    ])
+    const prevClose = q?.previousClose ?? null
+    if (!candles.length || !prevClose) return null
+
+    // Today's premarket bars (ET date prefix works for both ISO-offset and plain formats)
+    const todayEt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date())
+    const todays = candles.filter(c => c.date.startsWith(todayEt))
+    const series = todays.length ? todays : candles
+    const latest = series[series.length - 1]
+    const price = latest?.close
+    if (!price) return null
+    const volume = todays.reduce((s, c) => s + c.volume, 0)
+    return { price, volume, prevClose }
   } catch {
     return null
   }
