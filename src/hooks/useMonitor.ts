@@ -162,6 +162,7 @@ export function useMonitor() {
         s.setKeyLevels(r.symbol, r.levels)
         s.setRoadmap(r.symbol, r.roadmap)
         s.setMonitorMeta(r.symbol, r.integrity)
+        s.setSymbolSetups(r.symbol, r.setups)
 
         for (const setup of r.setups) {
           allSetups.push(setup)

@@ -9,7 +9,7 @@ import {
   type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType,
 } from '@/types'
 
-type Tab = 'opportunities' | 'approaching' | 'roadmap' | 'signals' | 'review' | 'settings'
+type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'roadmap' | 'signals' | 'review' | 'settings'
 
 const GRADE_COLOR: Record<SetupGrade, string> = {
   'A+': 'text-emerald-300 bg-emerald-900/40 border-emerald-700',
@@ -47,8 +47,10 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
   const monitorAlerts = useTradingStore(s => s.monitorAlerts)
   const unread = monitorAlerts.filter(a => !a.read).length
 
+  const watchlistCount = useTradingStore(s => s.watchlist.length)
   const TABS: { id: Tab; label: string; badge?: number }[] = [
     { id: 'opportunities', label: 'Opportunities' },
+    { id: 'watchlist', label: `Watchlist${watchlistCount ? ` (${watchlistCount})` : ''}` },
     { id: 'approaching', label: 'Approaching' },
     { id: 'roadmap', label: 'Roadmap' },
     { id: 'signals', label: 'Signals', badge: unread },
@@ -86,6 +88,7 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
 
       <div className="flex-1 overflow-hidden">
         {tab === 'opportunities' && <OpportunitiesTab onPick={onClose} />}
+        {tab === 'watchlist' && <WatchlistTab onPick={onClose} />}
         {tab === 'approaching' && <ApproachingTab onPick={onClose} />}
         {tab === 'roadmap' && <RoadmapTab />}
         {tab === 'signals' && <SignalsTab onPick={onClose} />}
@@ -231,6 +234,119 @@ function Row({ label, value, danger }: { label: string; value: string; danger?: 
     <div className="flex justify-between">
       <span className="text-gray-600">{label}</span>
       <span className={danger ? 'text-red-400' : 'text-gray-300'}>{value}</span>
+    </div>
+  )
+}
+
+// ── Watchlist ───────────────────────────────────────────────────────────────
+
+const ACTION_RANK: Record<string, number> = { buy: 5, prep_buy: 4, watch: 3, sell_short: 2, prep_short: 2, avoid: 1 }
+
+function WatchlistTab({ onPick }: { onPick: () => void }) {
+  const watchlist = useTradingStore(s => s.watchlist)
+  const symbolSetups = useTradingStore(s => s.symbolSetups)
+  const roadmaps = useTradingStore(s => s.roadmaps)
+  const meta = useTradingStore(s => s.monitorMeta)
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+  const addToWatchlist = useTradingStore(s => s.addToWatchlist)
+  const addSearchedSymbol = useTradingStore(s => s.addSearchedSymbol)
+  const removeFromWatchlist = useTradingStore(s => s.removeFromWatchlist)
+  const [input, setInput] = useState('')
+
+  const rows = useMemo(() => {
+    return watchlist.map(w => {
+      const setups = symbolSetups[w.symbol] ?? []
+      const best = setups.filter(s => s.direction === 'long').sort((a, b) => b.score - a.score)[0] ?? null
+      return { symbol: w.symbol, best, price: roadmaps[w.symbol]?.currentPrice ?? null, integrity: meta[w.symbol] ?? null, road: roadmaps[w.symbol] ?? null }
+    }).sort((a, b) => {
+      const ra = a.best ? ACTION_RANK[a.best.signal.action] ?? 0 : 0
+      const rb = b.best ? ACTION_RANK[b.best.signal.action] ?? 0 : 0
+      return rb - ra || (b.best?.score ?? 0) - (a.best?.score ?? 0)
+    })
+  }, [watchlist, symbolSetups, roadmaps, meta])
+
+  const add = (e: React.FormEvent) => {
+    e.preventDefault()
+    const sym = input.trim().toUpperCase()
+    if (sym) { addToWatchlist(sym); addSearchedSymbol(sym); setInput('') }
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <form onSubmit={add} className="flex gap-2 px-4 py-2 border-b border-gray-800">
+        <input value={input} onChange={e => setInput(e.target.value.toUpperCase())} placeholder="Add instrument… e.g. AAPL"
+          className="flex-1 max-w-xs bg-gray-900 border border-gray-700 focus:border-blue-500 rounded px-2.5 py-1 text-sm text-white placeholder-gray-600 focus:outline-none font-mono"
+          autoCapitalize="characters" autoCorrect="off" spellCheck={false} />
+        <button type="submit" disabled={!input.trim()} className="px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-40 text-white text-xs font-medium">Add</button>
+        <span className="ml-auto self-center text-[11px] text-gray-600">Clean buy signal per instrument · updates every sweep</span>
+      </form>
+
+      <div className="flex-1 overflow-y-auto p-3 space-y-2">
+        {rows.length === 0 && (
+          <div className="text-center text-gray-600 text-sm py-16">
+            Your watchlist is empty. Add instruments above, or star a ticker from the companion panel. Each one gets a clean BUY / WAIT signal here, monitored every 25s.
+          </div>
+        )}
+        {rows.map(r => <WatchlistRow key={r.symbol} row={r} onOpen={() => { selectSymbol(r.symbol); onPick() }} onRemove={() => removeFromWatchlist(r.symbol)} />)}
+      </div>
+    </div>
+  )
+}
+
+function WatchlistRow({ row, onOpen, onRemove }: {
+  row: { symbol: string; best: DetectedSetup | null; price: number | null; integrity: import('@/types').DataIntegrity | null; road: import('@/types').PriceRoadmap | null }
+  onOpen: () => void
+  onRemove: () => void
+}) {
+  const { symbol, best, price, integrity, road } = row
+  const st = best ? (SIGNAL_STYLE[best.signal.action] ?? SIGNAL_STYLE.watch) : { bg: 'bg-gray-800/40 border border-gray-700', text: 'text-gray-500', dot: 'bg-gray-600' }
+  const verb = best ? best.signal.verb : 'NO SETUP'
+  const nextUp = road?.upside?.[0]
+
+  return (
+    <div className="flex items-stretch gap-3 bg-gray-900/60 border border-gray-800 hover:border-gray-600 rounded-lg overflow-hidden">
+      <button onClick={onOpen} className="flex-1 text-left flex items-center gap-3 px-3 py-2.5 min-w-0">
+        {/* Instrument + price */}
+        <div className="w-20 flex-shrink-0">
+          <div className="text-sm font-bold text-white">{symbol}</div>
+          <div className="text-[11px] text-gray-400">{price != null ? `$${price.toFixed(price < 1 ? 3 : 2)}` : '—'}</div>
+          {integrity && (
+            <div className="flex items-center gap-1 mt-0.5">
+              <span className={`w-1.5 h-1.5 rounded-full ${integrity.delayed ? 'bg-orange-500' : 'bg-green-500'}`} />
+              <span className="text-[9px] text-gray-600">{integrity.delayed ? 'delayed' : `${Math.round(integrity.ageMs / 1000)}s`}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Big signal verb */}
+        <div className={`flex items-center gap-2 rounded-md px-2.5 py-1.5 w-32 flex-shrink-0 ${st.bg}`}>
+          <span className={`w-2 h-2 rounded-full ${st.dot} ${best?.signal.urgency === 'now' ? 'animate-pulse' : ''}`} />
+          <span className={`text-sm font-bold ${st.text}`}>{verb}</span>
+        </div>
+
+        {/* Directive + numbers */}
+        <div className="flex-1 min-w-0">
+          {best ? (
+            <>
+              <p className="text-[11px] text-gray-300 leading-snug truncate">{best.signal.headline}</p>
+              <div className="flex items-center gap-3 mt-0.5 text-[10px] text-gray-500">
+                <span>{SETUP_TYPE_LABELS[best.type]}</span>
+                <span className="text-gray-600">·</span>
+                <span>score {best.score} {best.grade !== 'below' ? best.grade : ''}</span>
+                {best.rewardRisk != null && <><span className="text-gray-600">·</span><span>R/R {best.rewardRisk.toFixed(1)}:1</span></>}
+                <span className="text-gray-600">·</span>
+                <span className="text-red-400/80">stop ${best.invalidation.toFixed(best.invalidation < 1 ? 3 : 2)}</span>
+              </div>
+            </>
+          ) : (
+            <p className="text-[11px] text-gray-500 leading-snug">
+              No buy setup yet — watching.{nextUp ? ` Next resistance $${nextUp.zoneLower.toFixed(2)}–$${nextUp.zoneUpper.toFixed(2)} (${nextUp.label}).` : ' Analysing on next sweep…'}
+            </p>
+          )}
+        </div>
+      </button>
+
+      <button onClick={onRemove} title="Remove from watchlist" className="px-2 text-gray-600 hover:text-red-400 hover:bg-gray-800/60 flex-shrink-0">✕</button>
     </div>
   )
 }

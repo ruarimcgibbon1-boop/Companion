@@ -76,6 +76,7 @@ interface TradingStore {
 
   // ── Always-on monitoring ──
   monitoredSetups: DetectedSetup[]                 // live — best setups across the universe
+  symbolSetups: Record<string, DetectedSetup[]>    // live — every setup per symbol (unfiltered)
   keyLevels: Record<string, KeyLevel[]>            // live — per symbol (for chart overlays)
   roadmaps: Record<string, PriceRoadmap>           // live — per symbol
   monitorMeta: Record<string, DataIntegrity>       // live — per symbol data integrity
@@ -126,6 +127,7 @@ interface TradingStore {
 
   // Monitoring actions
   setMonitoredSetups: (s: DetectedSetup[]) => void
+  setSymbolSetups: (sym: string, setups: DetectedSetup[]) => void
   setKeyLevels: (sym: string, levels: KeyLevel[]) => void
   setRoadmap: (sym: string, r: PriceRoadmap) => void
   setMonitorMeta: (sym: string, m: DataIntegrity) => void
@@ -171,6 +173,7 @@ export const useTradingStore = create<TradingStore>()(
       positions: [],
 
       monitoredSetups: [],
+      symbolSetups: {},
       keyLevels: {},
       roadmaps: {},
       monitorMeta: {},
@@ -237,6 +240,7 @@ export const useTradingStore = create<TradingStore>()(
 
       // ── Monitoring ──
       setMonitoredSetups: (setups) => set({ monitoredSetups: setups }),
+      setSymbolSetups: (sym, setups) => set(s => ({ symbolSetups: { ...s.symbolSetups, [sym]: setups } })),
       setKeyLevels: (sym, levels) => set(s => ({ keyLevels: { ...s.keyLevels, [sym]: levels } })),
       setRoadmap: (sym, r) => set(s => ({ roadmaps: { ...s.roadmaps, [sym]: r } })),
       setMonitorMeta: (sym, m) => set(s => ({ monitorMeta: { ...s.monitorMeta, [sym]: m } })),
