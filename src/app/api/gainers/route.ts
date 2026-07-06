@@ -41,6 +41,18 @@ function assignBadges(row: {
   return badges
 }
 
+// Fraction of the 9:30–16:00 ET regular session elapsed (clamped 0.05–1) so
+// relative volume is time-of-day adjusted rather than compared to a full day.
+function sessionFractionElapsed(): number {
+  const et = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())
+  const [h, m] = et.split(':').map(Number)
+  const mins = h * 60 + m
+  const open = 9 * 60 + 30, close = 16 * 60
+  if (mins >= close) return 1
+  if (mins <= open) return 0.05   // premarket — compare against a small slice of the day
+  return Math.max(0.05, (mins - open) / (close - open))
+}
+
 // Real premarket price for a symbol. Yahoo's meta.preMarketPrice is unreliable
 // (undefined for thin micro-caps), so we take the freshest premarket candle close
 // — the same candle path the monitor uses — and the previous close from the quote.
@@ -127,7 +139,7 @@ export async function GET(request: Request) {
 
     // Fetch YF quotes for trending symbols not already covered by screeners
     // (trending gives symbols only; we need price/change% from quote)
-    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfMarketCap?: number | null }
+    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfAvgVolume?: number | null; yfMarketCap?: number | null }
 
     const screenerSymbols = new Set([...yfGainers, ...yfSmallCap, ...yfActives].map(r => r.symbol))
     const trendingOnly = (yfTrendingSyms as string[]).filter(s => !screenerSymbols.has(s))
@@ -164,6 +176,7 @@ export async function GET(request: Request) {
       exchange: r.exchange,
       yfChangePct: r.changePct,
       yfVolume: r.volume,
+      yfAvgVolume: r.avgVolume,
       yfMarketCap: r.marketCap,
     }))
     const fmpRows: UniverseEntry[] = [...fmpGainers, ...fmpMostActive]
@@ -252,8 +265,10 @@ export async function GET(request: Request) {
         }
 
         const volume = pm?.volume ?? g.yfVolume ?? q?.volume ?? 0
-        const avgVol = q?.averageVolume ?? 0
-        const rvol = avgVol > 0 ? volume / avgVol : null
+        // Prefer YF screener's 3-month average daily volume; fall back to FMP quote's.
+        const avgVol = (g.yfAvgVolume && g.yfAvgVolume > 0) ? g.yfAvgVolume : (q?.averageVolume ?? 0)
+        // Session-adjusted relative volume: today's volume vs the normal pace by this time.
+        const rvol = avgVol > 0 ? volume / (avgVol * sessionFractionElapsed()) : null
 
         // Premarket volume is inherently lower — relax filter to 5% of normal
         const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume

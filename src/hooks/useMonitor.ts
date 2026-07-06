@@ -3,7 +3,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
-import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord } from '@/types'
+import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord } from '@/types'
 
 const MONITOR_INTERVAL = 25_000  // 25s — scanner-wide sweep
 
@@ -166,6 +166,7 @@ export function useMonitor() {
       const logMap = new Map(s.setupLogs.map(l => [l.id, l]))
       const changedLogs: SetupLog[] = []
       const newAlerts: MonitorAlert[] = []
+      const newBuySignals: BuySignalRecord[] = []
 
       for (const r of results) {
         keyLevels[r.symbol] = r.levels
@@ -201,6 +202,26 @@ export function useMonitor() {
 
           if (alert) {
             newAlerts.push(alert)
+            // Record every actionable BUY indication for end-of-day review.
+            if (alert.kind === 'triggered' && setup.direction === 'long') {
+              newBuySignals.push({
+                id: alert.id,
+                setupId: setup.id,
+                symbol: setup.symbol,
+                timestamp: now,
+                setupType: setup.type,
+                triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
+                entryLow: setup.zoneLower,
+                entryHigh: setup.zoneUpper,
+                invalidation: setup.invalidation,
+                stop: setup.stopReference,
+                targets: setup.targets.map(t => t.price),
+                score: setup.score,
+                grade: setup.grade,
+                rewardRisk: setup.rewardRisk,
+                priceAtSignal: r.price,
+              })
+            }
             if (settings.browserNotifications && !alert.delayed) sendBrowserNotification(alert)
             if (settings.sound) playAlertSound(alert.kind)
           }
@@ -213,7 +234,7 @@ export function useMonitor() {
         .sort((a, b) => b.score - a.score)
         .slice(0, 60)
 
-      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, setupStates, logs: changedLogs, alerts: newAlerts, ranked, now })
+      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, now })
     } catch {
       /* network error — keep last state */
     } finally {

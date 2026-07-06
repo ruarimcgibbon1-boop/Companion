@@ -128,6 +128,7 @@ export interface YFScreenerRow {
   price: number
   changePct: number     // regular market change %
   volume: number
+  avgVolume: number | null   // 3-month average daily volume (for relative volume)
   marketCap: number | null
   exchange: string
 }
@@ -153,6 +154,7 @@ export async function getYFScreener(
       price: q.regularMarketPrice as number,
       changePct: (q.regularMarketChangePercent as number) ?? 0,
       volume: (q.regularMarketVolume as number) ?? 0,
+      avgVolume: (q.averageDailyVolume3Month as number) ?? (q.averageDailyVolume10Day as number) ?? null,
       marketCap: (q.marketCap as number) ?? null,
       exchange: (q.exchange ?? q.fullExchangeName ?? '') as string,
     }))

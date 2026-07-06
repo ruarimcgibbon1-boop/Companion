@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "insider-screener",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "/Users/elonmusk/insider-screener", "run", "dev", "--", "-p", "3001"],
+      "port": 3001
+    },
+    {
+      "name": "companion",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 3000
+    }
+  ]
+}

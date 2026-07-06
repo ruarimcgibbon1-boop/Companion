@@ -51,7 +51,7 @@ class Cache {
 export const cache = new Cache()
 
 export const TTL = {
-  GAINERS: 60_000,         // 1 min — refresh gainers list frequently
+  GAINERS: 20_000,         // 20s — keep the gainers column visibly fresh
   QUOTE: 15_000,           // 15 sec
   BATCH_QUOTE: 20_000,     // 20 sec — batch quotes for scanner
   CANDLES_1M: 30_000,      // 30 sec

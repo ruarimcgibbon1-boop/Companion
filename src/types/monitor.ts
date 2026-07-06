@@ -370,6 +370,26 @@ export interface SetupLog {
   testCount: number
 }
 
+// ── Buy-signal log (every BUY indication, for end-of-day review) ────────────
+
+export interface BuySignalRecord {
+  id: string              // unique per trigger event (= the alert id)
+  setupId: string
+  symbol: string
+  timestamp: number       // epoch ms when the BUY fired
+  setupType: SetupType
+  triggerPrice: number    // the level that was reclaimed/broken
+  entryLow: number        // reaction zone
+  entryHigh: number
+  invalidation: number
+  stop: number
+  targets: number[]
+  score: number
+  grade: SetupGrade
+  rewardRisk: number | null
+  priceAtSignal: number
+}
+
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   pullback: 'Pullback',
   breakout: 'Breakout',

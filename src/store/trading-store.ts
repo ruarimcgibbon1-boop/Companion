@@ -17,6 +17,7 @@ import type {
   NotificationSettings,
   SetupLog,
   DataIntegrity,
+  BuySignalRecord,
 } from '@/types'
 import { DEFAULT_NOTIFICATION_SETTINGS } from '@/types'
 
@@ -27,7 +28,7 @@ const INITIAL_FILTERS: ScannerFilters = {
   minChangePct: 3,
   maxChangePct: 1000,
   minVolume: 500000,
-  minRelativeVolume: 0,
+  minRelativeVolume: 1.5,   // filter out non-movers — require ≥1.5× relative volume
   minMarketCap: null,
   maxMarketCap: null,
   maxFloat: null,
@@ -35,7 +36,7 @@ const INITIAL_FILTERS: ScannerFilters = {
   commonStocksOnly: true,
   includeLowFloat: true,
   sessionMode: 'regular',
-  maxResults: 30,
+  maxResults: 10,           // top 10 gainers in the left column
   minNewsRecencyHours: null,
 }
 
@@ -47,6 +48,7 @@ interface MonitorSweep {
   setupStates: Record<string, SetupStateRecord>
   logs: SetupLog[]
   alerts: MonitorAlert[]
+  buySignals: BuySignalRecord[]
   ranked: DetectedSetup[]
   now: number
 }
@@ -94,6 +96,7 @@ interface TradingStore {
   monitorMeta: Record<string, DataIntegrity>       // live — per symbol data integrity
   setupStates: Record<string, SetupStateRecord>    // persisted — state machine records
   monitorAlerts: MonitorAlert[]                    // persisted (last 100)
+  buySignals: BuySignalRecord[]                    // persisted — every BUY indication, for review
   setupLogs: SetupLog[]                            // persisted — performance log
   notificationSettings: NotificationSettings        // persisted
   searchedSymbols: string[]                        // persisted — recent manual searches
@@ -150,6 +153,7 @@ interface TradingStore {
   markMonitorAlertRead: (id: string) => void
   markAllMonitorAlertsRead: () => void
   clearMonitorAlerts: () => void
+  clearBuySignals: () => void
   upsertSetupLog: (log: SetupLog) => void
   updateNotificationSettings: (patch: Partial<NotificationSettings>) => void
   addSearchedSymbol: (sym: string) => void
@@ -193,6 +197,7 @@ export const useTradingStore = create<TradingStore>()(
       monitorMeta: {},
       setupStates: {},
       monitorAlerts: [],
+      buySignals: [],
       setupLogs: [],
       notificationSettings: DEFAULT_NOTIFICATION_SETTINGS,
       searchedSymbols: [],
@@ -273,6 +278,10 @@ export const useTradingStore = create<TradingStore>()(
           setupStates: { ...s.setupStates, ...p.setupStates },
           setupLogs,
           monitorAlerts: p.alerts.length ? [...p.alerts, ...s.monitorAlerts].slice(0, 100) : s.monitorAlerts,
+          // Dedup buy signals by id (one per trigger event); newest first, cap 300.
+          buySignals: p.buySignals.length
+            ? [...p.buySignals.filter(b => !s.buySignals.some(e => e.id === b.id)), ...s.buySignals].slice(0, 300)
+            : s.buySignals,
           monitoredSetups: p.ranked,
           lastMonitorTime: p.now,
         }
@@ -290,6 +299,7 @@ export const useTradingStore = create<TradingStore>()(
         monitorAlerts: s.monitorAlerts.map(a => ({ ...a, read: true })),
       })),
       clearMonitorAlerts: () => set({ monitorAlerts: [] }),
+      clearBuySignals: () => set({ buySignals: [] }),
       upsertSetupLog: (log) => set(s => {
         const idx = s.setupLogs.findIndex(l => l.id === log.id)
         if (idx >= 0) {
@@ -313,6 +323,17 @@ export const useTradingStore = create<TradingStore>()(
     }),
     {
       name: 'trading-companion',
+      version: 1,
+      // v1: apply the tighter scanner defaults (rvol ≥ 1.5, top 10) to users
+      // who already have older filters saved in localStorage.
+      migrate: (persisted, version) => {
+        const st = persisted as { filters?: ScannerFilters } | undefined
+        if (st?.filters && version < 1) {
+          st.filters.minRelativeVolume = 1.5
+          st.filters.maxResults = 10
+        }
+        return st as unknown
+      },
       partialize: (s) => ({
         watchlist: s.watchlist,
         filters: s.filters,
@@ -327,6 +348,7 @@ export const useTradingStore = create<TradingStore>()(
         // Monitoring — persisted so setups + logs survive a restart
         setupStates: s.setupStates,
         monitorAlerts: s.monitorAlerts,
+        buySignals: s.buySignals,
         setupLogs: s.setupLogs,
         notificationSettings: s.notificationSettings,
         searchedSymbols: s.searchedSymbols,

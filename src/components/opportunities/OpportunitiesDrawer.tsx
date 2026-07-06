@@ -9,7 +9,7 @@ import {
   type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType,
 } from '@/types'
 
-type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'roadmap' | 'signals' | 'review' | 'settings'
+type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'roadmap' | 'signals' | 'buylog' | 'review' | 'settings'
 
 const GRADE_COLOR: Record<SetupGrade, string> = {
   'A+': 'text-emerald-300 bg-emerald-900/40 border-emerald-700',
@@ -48,12 +48,14 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
   const unread = monitorAlerts.filter(a => !a.read).length
 
   const watchlistCount = useTradingStore(s => s.watchlist.length)
+  const buySignalCount = useTradingStore(s => s.buySignals.length)
   const TABS: { id: Tab; label: string; badge?: number }[] = [
     { id: 'opportunities', label: 'Opportunities' },
     { id: 'watchlist', label: `Watchlist${watchlistCount ? ` (${watchlistCount})` : ''}` },
     { id: 'approaching', label: 'Approaching' },
     { id: 'roadmap', label: 'Roadmap' },
     { id: 'signals', label: 'Signals', badge: unread },
+    { id: 'buylog', label: `Buy Log${buySignalCount ? ` (${buySignalCount})` : ''}` },
     { id: 'review', label: 'Review' },
     { id: 'settings', label: 'Settings' },
   ]
@@ -92,6 +94,7 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
         {tab === 'approaching' && <ApproachingTab onPick={onClose} />}
         {tab === 'roadmap' && <RoadmapTab />}
         {tab === 'signals' && <SignalsTab onPick={onClose} />}
+        {tab === 'buylog' && <BuyLogTab onPick={onClose} />}
         {tab === 'review' && <ReviewTab />}
         {tab === 'settings' && <SettingsTab />}
       </div>
@@ -506,6 +509,96 @@ function SignalsTab({ onPick }: { onPick: () => void }) {
           </button>
         ))}
       </div>
+    </div>
+  )
+}
+
+// ── Buy Log ─────────────────────────────────────────────────────────────────
+
+function etTime(ts: number): string {
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(ts))
+}
+
+const OUTCOME_STYLE: Record<string, { label: string; cls: string }> = {
+  target_hit: { label: 'Target hit', cls: 'text-emerald-300 bg-emerald-900/40' },
+  invalidated: { label: 'Stopped', cls: 'text-red-300 bg-red-900/40' },
+  expired: { label: 'Expired', cls: 'text-gray-400 bg-gray-800' },
+  open: { label: 'Open', cls: 'text-blue-300 bg-blue-900/30' },
+}
+
+function BuyLogTab({ onPick }: { onPick: () => void }) {
+  const buySignals = useTradingStore(s => s.buySignals)
+  const setupLogs = useTradingStore(s => s.setupLogs)
+  const roadmaps = useTradingStore(s => s.roadmaps)
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+  const clear = useTradingStore(s => s.clearBuySignals)
+  const logById = useMemo(() => new Map(setupLogs.map(l => [l.id, l])), [setupLogs])
+
+  const exportCsv = () => {
+    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'outcome', 'mfe_pct', 'mae_pct']
+    const rows = buySignals.map(b => {
+      const log = logById.get(b.setupId)
+      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
+    })
+    const csv = [head.join(','), ...rows].join('\n')
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
+    const a = document.createElement('a')
+    a.href = url; a.download = `buy-signals-${new Date().toISOString().slice(0, 10)}.csv`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
+        <span className="text-[11px] text-gray-500">{buySignals.length} buy signals logged · newest first · timestamps in ET</span>
+        <div className="flex gap-2">
+          <button onClick={exportCsv} disabled={!buySignals.length} className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40">Export CSV</button>
+          <button onClick={clear} disabled={!buySignals.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
+        </div>
+      </div>
+
+      {buySignals.length === 0 ? (
+        <div className="text-center text-gray-600 text-sm py-16">
+          No buy signals yet today. Every time the engine fires a BUY, it&apos;s logged here with its level, invalidation, targets, and timestamp — so you can review the day&apos;s calls at the close.
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto">
+          <div className="grid grid-cols-[4.5rem_3.5rem_1fr_5rem_5rem_6rem_3rem_5rem] gap-2 px-4 py-1.5 text-[10px] text-gray-600 border-b border-gray-800 sticky top-0 bg-[#0a0d12]">
+            <span>Time ET</span><span>Sym</span><span>Setup</span><span className="text-right">Trigger</span><span className="text-right">Stop</span><span className="text-right">Targets</span><span className="text-right">Score</span><span className="text-right">Result</span>
+          </div>
+          {buySignals.map(b => {
+            const log = logById.get(b.setupId)
+            const cur = roadmaps[b.symbol]?.currentPrice ?? null
+            const movePct = cur != null && b.priceAtSignal > 0 ? ((cur - b.priceAtSignal) / b.priceAtSignal) * 100 : null
+            const oc = OUTCOME_STYLE[log?.outcome ?? 'open']
+            return (
+              <button key={b.id} onClick={() => { selectSymbol(b.symbol); onPick() }}
+                className="w-full text-left grid grid-cols-[4.5rem_3.5rem_1fr_5rem_5rem_6rem_3rem_5rem] gap-2 px-4 py-2 border-b border-gray-800/50 hover:bg-gray-800/40 items-center">
+                <span className="text-[11px] text-gray-400 font-mono">{etTime(b.timestamp)}</span>
+                <span className="text-xs font-bold text-white">{b.symbol}</span>
+                <div className="min-w-0">
+                  <div className="text-[11px] text-gray-300">{SETUP_TYPE_LABELS[b.setupType]} <span className="text-gray-600">{b.grade !== 'below' ? b.grade : ''}</span></div>
+                  <div className="text-[10px] text-gray-600">entry ${fmt(b.entryLow)}–${fmt(b.entryHigh)} · inval ${fmt(b.invalidation)}{b.rewardRisk != null ? ` · R/R ${b.rewardRisk.toFixed(1)}:1` : ''}</div>
+                </div>
+                <span className="text-[11px] text-right text-gray-300">${fmt(b.triggerPrice)}</span>
+                <span className="text-[11px] text-right text-red-400">${fmt(b.stop)}</span>
+                <span className="text-[11px] text-right text-emerald-400/90">{b.targets.slice(0, 2).map(t => `$${fmt(t)}`).join(' ') || '—'}</span>
+                <span className="text-[11px] text-right text-gray-300">{b.score}</span>
+                <div className="text-right">
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${oc.cls}`}>{oc.label}</span>
+                  <div className="text-[10px] mt-0.5">
+                    {log ? (
+                      <span className="text-gray-500">+{log.maxFavorablePct.toFixed(1)}% / {log.maxAdversePct.toFixed(1)}%</span>
+                    ) : movePct != null ? (
+                      <span className={movePct >= 0 ? 'text-green-400/80' : 'text-red-400/80'}>{movePct >= 0 ? '+' : ''}{movePct.toFixed(1)}%</span>
+                    ) : null}
+                  </div>
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

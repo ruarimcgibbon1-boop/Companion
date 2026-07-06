@@ -4,7 +4,7 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import type { ScannerRow } from '@/types'
 
-const SCAN_INTERVAL = 30_000 // 30s — matches candle refresh cadence
+const SCAN_INTERVAL = 20_000 // 20s — keep the gainers column fresh
 
 export function useScanner() {
   const {
@@ -19,6 +19,8 @@ export function useScanner() {
   const abortRef = useRef<AbortController | null>(null)
 
   const scan = useCallback(async (force = false) => {
+    // Skip background polling when the tab is hidden (a forced/manual scan still runs).
+    if (!force && typeof document !== 'undefined' && document.hidden) return
     abortRef.current?.abort()
     abortRef.current = new AbortController()
 
@@ -56,8 +58,11 @@ export function useScanner() {
   useEffect(() => {
     scan()
     timerRef.current = setInterval(scan, SCAN_INTERVAL)
+    const onVisible = () => { if (!document.hidden) scan() }
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
+      document.removeEventListener('visibilitychange', onVisible)
       abortRef.current?.abort()
     }
   }, [scan])
