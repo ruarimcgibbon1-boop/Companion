@@ -39,6 +39,18 @@ const INITIAL_FILTERS: ScannerFilters = {
   minNewsRecencyHours: null,
 }
 
+interface MonitorSweep {
+  keyLevels: Record<string, KeyLevel[]>
+  roadmaps: Record<string, PriceRoadmap>
+  meta: Record<string, DataIntegrity>
+  symbolSetups: Record<string, DetectedSetup[]>
+  setupStates: Record<string, SetupStateRecord>
+  logs: SetupLog[]
+  alerts: MonitorAlert[]
+  ranked: DetectedSetup[]
+  now: number
+}
+
 type ChartInterval = '1min' | '5min' | '15min' | 'daily'
 type ActiveTab = 'overview' | 'plans' | 'pullback' | 'levels' | 'news' | 'technical' | 'risks' | 'calc' | 'chat'
 
@@ -127,6 +139,8 @@ interface TradingStore {
 
   // Monitoring actions
   setMonitoredSetups: (s: DetectedSetup[]) => void
+  /** Apply an entire monitor sweep in ONE state update (perf-critical). */
+  ingestMonitorSweep: (p: MonitorSweep) => void
   setSymbolSetups: (sym: string, setups: DetectedSetup[]) => void
   setKeyLevels: (sym: string, levels: KeyLevel[]) => void
   setRoadmap: (sym: string, r: PriceRoadmap) => void
@@ -240,6 +254,29 @@ export const useTradingStore = create<TradingStore>()(
 
       // ── Monitoring ──
       setMonitoredSetups: (setups) => set({ monitoredSetups: setups }),
+      ingestMonitorSweep: (p) => set(s => {
+        // Merge setup logs by id (update in place, prepend new), cap at 500.
+        const idIndex = new Map(s.setupLogs.map((l, i) => [l.id, i]))
+        const arr = s.setupLogs.slice()
+        const fresh: typeof s.setupLogs = []
+        for (const l of p.logs) {
+          const i = idIndex.get(l.id)
+          if (i != null) arr[i] = l
+          else fresh.push(l)
+        }
+        const setupLogs = [...fresh, ...arr].slice(0, 500)
+        return {
+          keyLevels: { ...s.keyLevels, ...p.keyLevels },
+          roadmaps: { ...s.roadmaps, ...p.roadmaps },
+          monitorMeta: { ...s.monitorMeta, ...p.meta },
+          symbolSetups: { ...s.symbolSetups, ...p.symbolSetups },
+          setupStates: { ...s.setupStates, ...p.setupStates },
+          setupLogs,
+          monitorAlerts: p.alerts.length ? [...p.alerts, ...s.monitorAlerts].slice(0, 100) : s.monitorAlerts,
+          monitoredSetups: p.ranked,
+          lastMonitorTime: p.now,
+        }
+      }),
       setSymbolSetups: (sym, setups) => set(s => ({ symbolSetups: { ...s.symbolSetups, [sym]: setups } })),
       setKeyLevels: (sym, levels) => set(s => ({ keyLevels: { ...s.keyLevels, [sym]: levels } })),
       setRoadmap: (sym, r) => set(s => ({ roadmaps: { ...s.roadmaps, [sym]: r } })),

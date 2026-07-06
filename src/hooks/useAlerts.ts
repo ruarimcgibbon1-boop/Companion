@@ -153,12 +153,11 @@ export function useAlerts() {
     requestPermission()
   }, [requestPermission])
 
-  useEffect(() => {
-    if (!watchlist.length) return
-    pollWatchlist()
-    timerRef.current = setInterval(pollWatchlist, POLL_INTERVAL)
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current)
-    }
-  }, [watchlist, pollWatchlist])
+  // NOTE: the legacy watchlist poller is retired — the always-on monitoring
+  // engine (useMonitor) already analyses every watchlist symbol and produces
+  // richer, deduped signals. Running both duplicated /api/snapshot calls every
+  // 20s and was a needless load. Kept `pollWatchlist` for reference / manual use.
+  void pollWatchlist
+  void timerRef
+  void POLL_INTERVAL
 }

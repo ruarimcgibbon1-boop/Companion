@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { isTodayPremarket, isTodayAfterHours, isRegularHours } from '@/lib/market-hours'
 import { emaAll } from '@/lib/technical'
@@ -47,10 +47,17 @@ export function ChartPanel() {
     monitoredSetups,
   } = useTradingStore()
 
-  // Monitored setups for the currently-charted symbol (overlay source)
-  const symbolSetups = selectedSymbol
-    ? monitoredSetups.filter(s => s.symbol === selectedSymbol).slice(0, 4)
-    : []
+  // Monitored setups for the currently-charted symbol (overlay source).
+  // Memoised so the chart-building effect only re-runs when the *selected*
+  // symbol's overlays actually change — not on every 25s monitor sweep.
+  const symbolSetups = useMemo(
+    () => selectedSymbol ? monitoredSetups.filter(s => s.symbol === selectedSymbol).slice(0, 4) : [],
+    [monitoredSetups, selectedSymbol]
+  )
+  const overlayKey = useMemo(
+    () => symbolSetups.map(s => `${s.id}:${s.state}:${s.zoneLower.toFixed(3)}:${s.zoneUpper.toFixed(3)}:${s.invalidation.toFixed(3)}:${s.targets.map(t => t.price.toFixed(3)).join(',')}`).join('|'),
+    [symbolSetups]
+  )
 
   // Active (non-closed) position for the currently selected symbol
   const activePosition: Position | null =
@@ -508,8 +515,10 @@ export function ChartPanel() {
     return () => {
       cancelled = true
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, showVwap, showEma9, showEma20, showLevels, showSetupZones, showTargets, showInvalidation, symbolSetups, snapshot?.sessionLevels, snapshot?.technical, activePosition?.entry, activePosition?.stop, activePosition?.status, activePosition?.targets])
+    // overlayKey is a stable signature of symbolSetups — avoids rebuilding the
+    // chart on every monitor sweep when the selected symbol's overlays are unchanged.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candles, showVwap, showEma9, showEma20, showLevels, showSetupZones, showTargets, showInvalidation, overlayKey, snapshot?.sessionLevels, snapshot?.technical, activePosition?.entry, activePosition?.stop, activePosition?.status, activePosition?.targets])
 
   useEffect(() => () => cleanupRef.current(), [])
 

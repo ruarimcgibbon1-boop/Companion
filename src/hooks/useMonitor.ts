@@ -58,8 +58,7 @@ function gatherUniverse(): string[] {
 
 // ── Setup log helpers ───────────────────────────────────────────────────────
 
-function ensureLog(setup: DetectedSetup, price: number, session: string, now: number): SetupLog {
-  const existing = useTradingStore.getState().setupLogs.find(l => l.id === setup.id)
+function ensureLog(setup: DetectedSetup, price: number, session: string, now: number, existing: SetupLog | undefined): SetupLog {
   if (existing) return existing
   return {
     id: setup.id,
@@ -134,10 +133,9 @@ export function useMonitor() {
 
   const runSweep = useCallback(async () => {
     if (inFlight.current) return
+    // Pause when the tab is backgrounded — no point sweeping what nobody's watching.
+    if (typeof document !== 'undefined' && document.hidden) return
     const store = useTradingStore.getState()
-    if (!store.notificationSettings.enabled && store.notificationSettings.scope !== 'scanner') {
-      // still run for panels, but skip if fully disabled + not needed — keep running for panels
-    }
     const symbols = gatherUniverse()
     if (symbols.length === 0) return
 
@@ -158,11 +156,22 @@ export function useMonitor() {
       const now = Date.now()
       const allSetups: DetectedSetup[] = []
 
+      // Accumulate the whole sweep locally, then commit in a SINGLE store write
+      // (previously this made 500+ set() calls per sweep — the main lag source).
+      const keyLevels: Record<string, typeof results[number]['levels']> = {}
+      const roadmaps: Record<string, typeof results[number]['roadmap']> = {}
+      const meta: Record<string, typeof results[number]['integrity']> = {}
+      const symbolSetups: Record<string, DetectedSetup[]> = {}
+      const setupStates: Record<string, SetupStateRecord> = {}
+      const logMap = new Map(s.setupLogs.map(l => [l.id, l]))
+      const changedLogs: SetupLog[] = []
+      const newAlerts: MonitorAlert[] = []
+
       for (const r of results) {
-        s.setKeyLevels(r.symbol, r.levels)
-        s.setRoadmap(r.symbol, r.roadmap)
-        s.setMonitorMeta(r.symbol, r.integrity)
-        s.setSymbolSetups(r.symbol, r.setups)
+        keyLevels[r.symbol] = r.levels
+        roadmaps[r.symbol] = r.roadmap
+        meta[r.symbol] = r.integrity
+        symbolSetups[r.symbol] = r.setups
 
         for (const setup of r.setups) {
           allSetups.push(setup)
@@ -171,7 +180,7 @@ export function useMonitor() {
           const meetsLevel = (setup.breakdown.levelQuality / 20) * 100 >= settings.minLevelStrength * 0.2 || setup.confidence >= settings.minLevelStrength
           if (setup.score < 55 && !meetsLevel) continue
 
-          const prevRec = s.setupStates[setup.id] ?? null
+          const prevRec = setupStates[setup.id] ?? s.setupStates[setup.id] ?? null
           const { record, alert } = transition({
             record: prevRec,
             setup,
@@ -182,16 +191,16 @@ export function useMonitor() {
             delayed: r.integrity.delayed,
             now,
           })
-          s.setSetupState(setup.id, record)
+          setupStates[setup.id] = record
 
           // Performance log
-          let log = ensureLog(setup, r.price, r.integrity.session, record.firstSeenAt)
+          let log = ensureLog(setup, r.price, r.integrity.session, record.firstSeenAt, logMap.get(setup.id))
           log = updateLog(log, setup, record, r.price, now)
-          s.upsertSetupLog(log)
+          logMap.set(setup.id, log)
+          changedLogs.push(log)
 
           if (alert) {
-            s.addMonitorAlert(alert)
-            if (settings.inApp) { /* already stored */ }
+            newAlerts.push(alert)
             if (settings.browserNotifications && !alert.delayed) sendBrowserNotification(alert)
             if (settings.sound) playAlertSound(alert.kind)
           }
@@ -203,8 +212,8 @@ export function useMonitor() {
         .filter(su => su.score >= Math.min(settings.minScore, 60))
         .sort((a, b) => b.score - a.score)
         .slice(0, 60)
-      s.setMonitoredSetups(ranked)
-      s.setLastMonitorTime(now)
+
+      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, setupStates, logs: changedLogs, alerts: newAlerts, ranked, now })
     } catch {
       /* network error — keep last state */
     } finally {
@@ -223,7 +232,13 @@ export function useMonitor() {
   useEffect(() => {
     runSweep()
     timerRef.current = setInterval(runSweep, MONITOR_INTERVAL)
-    return () => { if (timerRef.current) clearInterval(timerRef.current) }
+    // Re-sweep immediately when the tab regains focus (it was paused while hidden).
+    const onVisible = () => { if (!document.hidden) runSweep() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [runSweep])
 
   return { runSweep }
