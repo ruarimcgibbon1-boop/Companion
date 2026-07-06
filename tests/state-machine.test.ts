@@ -1,12 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import { transition, type TransitionInput } from '../src/lib/setup-state-machine'
+import { deriveSignal } from '../src/lib/signals'
 import { DEFAULT_NOTIFICATION_SETTINGS } from '../src/types'
 import type { DetectedSetup, SetupState, SetupStateRecord, NotificationSettings } from '../src/types'
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
 function makeSetup(over: Partial<DetectedSetup> = {}): DetectedSetup {
-  return {
+  const base: Omit<DetectedSetup, 'signal'> = {
     id: 'TEST:pullback:5.00',
     symbol: 'TEST',
     type: 'pullback',
@@ -38,6 +39,7 @@ function makeSetup(over: Partial<DetectedSetup> = {}): DetectedSetup {
     nextIfFails: 4.7,
     ...over,
   }
+  return { ...base, signal: deriveSignal(base as DetectedSetup) }
 }
 
 function baseInput(over: Partial<TransitionInput> = {}): TransitionInput {
@@ -217,6 +219,7 @@ describe('state machine — restart restoration', () => {
       firstSeenAt: 999_000,
       updatedAt: 1_000_000,
       alertedStates: ['approaching', 'at_level'],
+      targetsHitAlerted: 0,
     }
     // After restart the same setup is re-detected and confirms
     const confirming = makeSetup({ state: 'confirming', score: 84, grade: 'A-' })

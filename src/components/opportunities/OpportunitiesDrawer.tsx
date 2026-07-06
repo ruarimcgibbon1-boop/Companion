@@ -21,6 +21,15 @@ const GRADE_COLOR: Record<SetupGrade, string> = {
   'below': 'text-gray-500 bg-gray-800/40 border-gray-700',
 }
 
+const SIGNAL_STYLE: Record<string, { bg: string; text: string; dot: string }> = {
+  buy:         { bg: 'bg-emerald-600/25 border border-emerald-500', text: 'text-emerald-300', dot: 'bg-emerald-400' },
+  sell_short:  { bg: 'bg-red-600/25 border border-red-500', text: 'text-red-300', dot: 'bg-red-400' },
+  prep_buy:    { bg: 'bg-green-700/20 border border-green-700', text: 'text-green-300', dot: 'bg-green-500' },
+  prep_short:  { bg: 'bg-red-700/20 border border-red-700', text: 'text-red-300', dot: 'bg-red-500' },
+  watch:       { bg: 'bg-gray-700/30 border border-gray-600', text: 'text-gray-300', dot: 'bg-gray-400' },
+  avoid:       { bg: 'bg-gray-800/60 border border-gray-700', text: 'text-gray-500', dot: 'bg-gray-600' },
+}
+
 const STATE_COLOR: Record<SetupState, string> = {
   identified: 'text-gray-400 bg-gray-800',
   approaching: 'text-blue-300 bg-blue-900/40',
@@ -184,7 +193,21 @@ function SetupCard({ setup: s, onClick }: { setup: DetectedSetup; onClick: () =>
         <span className="text-[11px] text-gray-500">{Math.abs(s.distanceToZonePct) < 0.05 ? 'at zone' : `${s.distanceToZonePct > 0 ? '+' : ''}${fmt(s.distanceToZonePct, 1)}%`}</span>
       </div>
 
-      <p className="text-[11px] text-gray-400 leading-snug mb-1.5">{s.rationale}</p>
+      {/* Decisive buy/sell signal */}
+      {(() => {
+        const st = SIGNAL_STYLE[s.signal.action] ?? SIGNAL_STYLE.watch
+        return (
+          <div className={`flex items-start gap-2 rounded-md px-2 py-1.5 mb-1.5 ${st.bg}`}>
+            <span className={`mt-0.5 w-2 h-2 rounded-full flex-shrink-0 ${st.dot} ${s.signal.urgency === 'now' ? 'animate-pulse' : ''}`} />
+            <div className="min-w-0">
+              <span className={`text-xs font-bold ${st.text}`}>{s.signal.verb}</span>
+              <span className="text-[11px] text-gray-300 ml-1.5">{s.signal.headline}</span>
+            </div>
+          </div>
+        )
+      })()}
+
+      <p className="text-[11px] text-gray-500 leading-snug mb-1.5">{s.rationale}</p>
 
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px]">
         <Row label="Zone" value={`$${fmt(s.zoneLower)}–$${fmt(s.zoneUpper)}`} />
@@ -326,6 +349,7 @@ function RoadmapRow({ l, side, idx }: { l: import('@/types').RoadmapLevel; side:
 // ── Signals ─────────────────────────────────────────────────────────────────
 
 const KIND_COLOR: Record<MonitorAlert['kind'], string> = {
+  take_profit: 'border-l-emerald-300',
   early_warning: 'border-l-blue-400',
   level_reached: 'border-l-cyan-400',
   confirming: 'border-l-yellow-400',

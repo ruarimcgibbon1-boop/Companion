@@ -17,6 +17,7 @@ import type {
 } from '@/types'
 import { scoreSetup, type ScoringContext } from './scoring-matrix'
 import { approachThresholdPct } from './adaptive-threshold'
+import { deriveSignal } from './signals'
 
 export interface DetectionContext {
   symbol: string
@@ -212,7 +213,7 @@ function buildSetup(args: BuildArgs): DetectedSetup {
 
   const id = `${ctx.symbol}:${type}:${zoneMidpoint.toFixed(2)}`
 
-  return {
+  const built: Omit<DetectedSetup, 'signal'> = {
     id,
     symbol: ctx.symbol,
     type,
@@ -243,6 +244,8 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     nextIfHolds: nextForward,
     nextIfFails: nextBackward,
   }
+
+  return { ...built, signal: deriveSignal(built as DetectedSetup) }
 }
 
 function nearestLevelToZone(levels: KeyLevel[], mid: number): KeyLevel | null {
@@ -498,10 +501,14 @@ function detectBreakdown(ctx: DetectionContext): DetectedSetup | null {
 }
 
 function ordinal(n: number): string {
-  if (n === 1) return 'st'
-  if (n === 2) return 'nd'
-  if (n === 3) return 'rd'
-  return 'th'
+  const v = n % 100
+  if (v >= 11 && v <= 13) return 'th'
+  switch (n % 10) {
+    case 1: return 'st'
+    case 2: return 'nd'
+    case 3: return 'rd'
+    default: return 'th'
+  }
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────

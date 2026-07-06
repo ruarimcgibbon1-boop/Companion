@@ -77,40 +77,57 @@ function alertKindFor(state: SetupState): MonitorAlertKind | null {
 
 function buildAlertText(setup: DetectedSetup, kind: MonitorAlertKind, price: number): { title: string; body: string } {
   const typeLabel = SETUP_TYPE_LABELS[setup.type]
-  const zone = `$${setup.zoneLower.toFixed(2)}–$${setup.zoneUpper.toFixed(2)}`
   const grade = setup.grade === 'below' ? '' : ` (${setup.grade})`
+  const verb = setup.signal.verb
   switch (kind) {
     case 'early_warning':
       return {
-        title: `${setup.symbol} approaching ${typeLabel} zone`,
-        body: `${setup.symbol} is approaching the ${zone} ${typeLabel.toLowerCase()} zone. ${setup.rationale} Score ${setup.score}/100${grade}. ${setup.confirmation[0]}.`,
+        title: `👀 ${setup.symbol} — ${verb} setup approaching`,
+        body: setup.signal.headline + ` Score ${setup.score}/100${grade}.`,
       }
     case 'level_reached':
       return {
-        title: `${setup.symbol} at ${typeLabel} level`,
-        body: `${setup.symbol} entered ${zone}. Price $${price.toFixed(2)}. Confirmation needed: ${setup.confirmation.join('; ')}. Invalidation: $${setup.invalidation.toFixed(2)}.`,
+        title: `⏳ ${setup.symbol} — ${verb} (${typeLabel})`,
+        body: setup.signal.headline,
       }
     case 'confirming':
       return {
-        title: `${setup.symbol} ${typeLabel} confirming`,
-        body: `${setup.symbol} is beginning to confirm at ${zone}. Score ${setup.score}/100${grade}. Next: $${(setup.targets[0]?.price ?? setup.nextIfHolds ?? price).toFixed(2)}.`,
+        title: `⚡ ${setup.symbol} — ${verb} (${typeLabel})`,
+        body: setup.signal.headline + ` Score ${setup.score}/100${grade}.`,
       }
-    case 'triggered':
+    case 'triggered': {
+      const emoji = setup.direction === 'long' ? '🟢' : '🔴'
       return {
-        title: `${setup.symbol} ${typeLabel} TRIGGERED`,
-        body: `${setup.symbol} ${typeLabel.toLowerCase()} triggered at $${price.toFixed(2)}. Targets: ${setup.targets.slice(0, 2).map(t => `$${t.price.toFixed(2)}`).join(' → ') || 'n/a'}. Stop ref $${setup.stopReference.toFixed(2)}.`,
+        title: `${emoji} ${verb} ${setup.symbol} — ${typeLabel} triggered`,
+        body: setup.signal.headline,
       }
+    }
+    case 'take_profit': {
+      const hit = hitTargetLabel(setup, price)
+      const move = setup.direction === 'long' ? 'trim/sell into strength' : 'cover into weakness'
+      return {
+        title: `💰 ${setup.symbol} — SELL / take profit`,
+        body: `${setup.symbol} reached ${hit} at $${price.toFixed(2)} — ${move}. Consider trailing the stop above breakeven.`,
+      }
+    }
     case 'failed':
       return {
-        title: `${setup.symbol} ${typeLabel} invalidated`,
-        body: `${setup.symbol} ${typeLabel.toLowerCase()} invalidated — lost $${setup.invalidation.toFixed(2)}. ${setup.nextIfFails ? `Next level: $${setup.nextIfFails.toFixed(2)}.` : ''}`,
+        title: `🛑 ${setup.symbol} — AVOID (${typeLabel} invalidated)`,
+        body: setup.signal.headline,
       }
     case 'score_upgrade':
       return {
-        title: `${setup.symbol} ${typeLabel} upgraded`,
-        body: `${setup.symbol} ${typeLabel.toLowerCase()} score upgraded to ${setup.score}/100${grade} — ${SETUP_STATE_LABELS[setup.state]}.`,
+        title: `↗ ${setup.symbol} — ${verb} upgraded`,
+        body: `${setup.symbol} ${typeLabel.toLowerCase()} upgraded to ${setup.score}/100${grade} — ${SETUP_STATE_LABELS[setup.state]}.`,
       }
   }
+}
+
+// Which target did price reach (long: highest target at/below price; short: lowest at/above).
+function hitTargetLabel(setup: DetectedSetup, price: number): string {
+  const reached = setup.targets.filter(t => setup.direction === 'long' ? price >= t.price : price <= t.price)
+  const t = setup.direction === 'long' ? reached[reached.length - 1] : reached[0]
+  return t ? t.label : 'a target'
 }
 
 function makeAlert(
@@ -173,6 +190,7 @@ export function transition(input: TransitionInput): TransitionResult {
     firstSeenAt: now,
     updatedAt: now,
     alertedStates: [],
+    targetsHitAlerted: 0,
   }
 
   // Zone re-entry: if price left the zone since we last engaged, clear the
@@ -200,10 +218,21 @@ export function transition(input: TransitionInput): TransitionResult {
   const materialScoreJump = newState === base.state && ORDER[newState] >= ORDER.at_level &&
     setup.score - base.lastScore >= settings.scoreChangeThreshold
 
-  if (kind && !gated && !overCap) {
-    if (advanced && !alreadyAlertedThisState) {
+  // Take-profit: once triggered/engaged, fire a SELL/trim signal each time price
+  // reaches the next unhit target (up to the first two). Critical → bypasses cooldown.
+  const engagedTriggered = newState === 'triggered' || base.alertedStates.includes('triggered')
+  let targetsHitAlerted = base.targetsHitAlerted
+  const nextTarget = setup.targets[targetsHitAlerted]
+  const reachedNextTarget = engagedTriggered && nextTarget != null && targetsHitAlerted < Math.min(2, setup.targets.length) &&
+    (setup.direction === 'long' ? price >= nextTarget.price : price <= nextTarget.price)
+
+  if (!gated && !overCap) {
+    if (advanced && !alreadyAlertedThisState && kind) {
       alert = makeAlert(setup, kind, price, now, dataAgeMs, delayed)
       alertedStates.push(newState)
+    } else if (reachedNextTarget) {
+      alert = makeAlert(setup, 'take_profit', price, now, dataAgeMs, delayed)
+      targetsHitAlerted += 1
     } else if (materialScoreJump && !withinCooldown) {
       alert = makeAlert(setup, 'score_upgrade', price, now, dataAgeMs, delayed)
     }
@@ -222,6 +251,7 @@ export function transition(input: TransitionInput): TransitionResult {
     alertsSent: base.alertsSent + (alert ? 1 : 0),
     updatedAt: now,
     alertedStates,
+    targetsHitAlerted,
   }
 
   return { record: updated, alert }

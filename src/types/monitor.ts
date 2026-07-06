@@ -96,6 +96,31 @@ export interface ScoreBreakdown {
   confirmation: number       // /5
 }
 
+// ── Actionable buy/sell signal ──────────────────────────────────────────────
+
+export type SignalAction =
+  | 'buy'          // triggered long — actionable entry now
+  | 'prep_buy'     // long confirming — get ready
+  | 'sell_short'   // triggered short — actionable entry now
+  | 'prep_short'   // short confirming — get ready
+  | 'watch'        // at/approaching a zone — wait for the trigger
+  | 'avoid'        // invalidated / no clean action
+
+export interface TradeSignal {
+  action: SignalAction
+  /** Big decisive label: 'BUY', 'PREP BUY', 'SELL / SHORT', 'PREP SHORT', 'WAIT', 'AVOID'. */
+  verb: string
+  urgency: 'now' | 'soon' | 'watch' | 'none'
+  /** One-line plain-English directive with the numbers. */
+  headline: string
+  /** The price that flips this to actionable (level to reclaim/break/lose). */
+  triggerPrice: number | null
+  /** What has to happen at the trigger price. */
+  triggerCondition: string
+  stop: number
+  targets: number[]
+}
+
 export interface DetectedSetup {
   /** Stable id: `${symbol}:${type}:${zoneMidpoint}` rounded — used for dedup + state tracking. */
   id: string
@@ -142,6 +167,9 @@ export interface DetectedSetup {
   /** Next level if this one holds / fails. */
   nextIfHolds: number | null
   nextIfFails: number | null
+
+  /** Decisive buy/sell directive derived from state + geometry. */
+  signal: TradeSignal
 }
 
 // ── Price roadmap ───────────────────────────────────────────────────────────
@@ -215,6 +243,8 @@ export interface SetupStateRecord {
   updatedAt: number
   /** States we've already alerted, so we don't repeat the same transition. */
   alertedStates: SetupState[]
+  /** How many profit targets we've already sent a take-profit signal for. */
+  targetsHitAlerted: number
 }
 
 // ── Alert produced by the state machine ─────────────────────────────────────
@@ -224,6 +254,7 @@ export type MonitorAlertKind =
   | 'level_reached'
   | 'confirming'
   | 'triggered'
+  | 'take_profit'
   | 'failed'
   | 'score_upgrade'
 

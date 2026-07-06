@@ -174,11 +174,13 @@ export function scoreSetup(ctx: ScoringContext): ScoreResult {
     confirmation: round(confFill * max.confirmation),
   }
 
-  const total = Math.max(0, Math.min(100,
+  // Round to a whole number — the sub-scores are fractional, and summing them
+  // otherwise produces float artifacts (e.g. 63.9999999) in the UI.
+  const total = Math.round(Math.max(0, Math.min(100,
     breakdown.levelQuality + breakdown.priceAction + breakdown.volumeMomentum +
     breakdown.trendAlignment + breakdown.catalyst + breakdown.rewardRisk +
     breakdown.liquidity + breakdown.confirmation - testPenalty
-  ))
+  )))
 
   return { total, grade: gradeFor(total), breakdown, risks }
 }
