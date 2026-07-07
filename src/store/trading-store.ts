@@ -1,7 +1,7 @@
 'use client'
 
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { persist, createJSONStorage } from 'zustand/middleware'
 import type {
   ScannerRow,
   TickerSnapshot,
@@ -270,12 +270,27 @@ export const useTradingStore = create<TradingStore>()(
           else fresh.push(l)
         }
         const setupLogs = [...fresh, ...arr].slice(0, 500)
+
+        // Cap setupStates: it's keyed by setup id and merges every sweep, so
+        // across a trading day it grows unbounded and blows the localStorage
+        // quota. Keep the 500 most-recently-updated records.
+        const SETUP_STATES_CAP = 500
+        const mergedStates = { ...s.setupStates, ...p.setupStates }
+        const stateEntries = Object.entries(mergedStates)
+        const setupStates = stateEntries.length > SETUP_STATES_CAP
+          ? Object.fromEntries(
+              stateEntries
+                .sort(([, a], [, b]) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+                .slice(0, SETUP_STATES_CAP)
+            )
+          : mergedStates
+
         return {
           keyLevels: { ...s.keyLevels, ...p.keyLevels },
           roadmaps: { ...s.roadmaps, ...p.roadmaps },
           monitorMeta: { ...s.monitorMeta, ...p.meta },
           symbolSetups: { ...s.symbolSetups, ...p.symbolSetups },
-          setupStates: { ...s.setupStates, ...p.setupStates },
+          setupStates,
           setupLogs,
           monitorAlerts: p.alerts.length ? [...p.alerts, ...s.monitorAlerts].slice(0, 100) : s.monitorAlerts,
           // Dedup buy signals by id (one per trigger event); newest first, cap 300.
@@ -324,6 +339,31 @@ export const useTradingStore = create<TradingStore>()(
     {
       name: 'trading-companion',
       version: 1,
+      // Resilient storage: if a write exceeds the localStorage quota, retry
+      // after dropping the heavy/regenerable monitor arrays rather than letting
+      // the QuotaExceededError bubble up and crash the app. Those fields are
+      // rebuilt on the next monitor sweep.
+      storage: createJSONStorage(() => {
+        if (typeof window === 'undefined') return undefined as unknown as Storage
+        const HEAVY_KEYS = ['setupStates', 'setupLogs', 'buySignals', 'monitorAlerts']
+        return {
+          getItem: (name: string) => window.localStorage.getItem(name),
+          removeItem: (name: string) => window.localStorage.removeItem(name),
+          setItem: (name: string, value: string) => {
+            try {
+              window.localStorage.setItem(name, value)
+            } catch {
+              try {
+                const parsed = JSON.parse(value)
+                if (parsed?.state) for (const k of HEAVY_KEYS) delete parsed.state[k]
+                window.localStorage.setItem(name, JSON.stringify(parsed))
+              } catch {
+                /* give up quietly — persistence is best-effort */
+              }
+            }
+          },
+        }
+      }),
       // v1: apply the tighter scanner defaults (rvol ≥ 1.5, top 10) to users
       // who already have older filters saved in localStorage.
       migrate: (persisted, version) => {

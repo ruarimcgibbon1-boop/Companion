@@ -10,6 +10,11 @@
 
 import type { DetectedSetup, TradeSignal, SignalAction, SetupType } from '@/types'
 
+// A triggered setup whose reward/risk is below this floor is NOT worth a BUY /
+// SELL·SHORT call — the target is too close to the stop. We downgrade it to a
+// WATCH that names the reason rather than screaming an action on a bad trade.
+const MIN_TRIGGER_RR = 1.5
+
 // Price-aware formatting: micro-caps need more decimals than large caps.
 function px(n: number): string {
   const abs = Math.abs(n)
@@ -50,8 +55,13 @@ export function deriveSignal(s: DetectedSetup): TradeSignal {
   let headline: string
 
   switch (s.state) {
-    case 'triggered':
-      if (long) {
+    case 'triggered': {
+      // Poor reward/risk (target too close to the stop) → don't call an action.
+      const poorRR = s.rewardRisk != null && s.rewardRisk < MIN_TRIGGER_RR
+      if (poorRR) {
+        action = 'watch'; verb = 'WATCH'; urgency = 'watch'
+        headline = `${s.symbol} ${label(s.type)} triggered but R/R only ${rr(s)} — target ${px(targets[0] ?? triggerPrice)} too close to stop ${px(stop)}. Skip unless the setup improves.`
+      } else if (long) {
         action = 'buy'; verb = 'BUY'; urgency = 'now'
         headline = `BUY ${s.symbol} — ${label(s.type)} triggered. Entry ~${px(triggerPrice)}, stop ${px(stop)}, sell into ${tgtText}. R/R ${rr(s)}.`
       } else {
@@ -59,6 +69,7 @@ export function deriveSignal(s: DetectedSetup): TradeSignal {
         headline = `SELL/SHORT ${s.symbol} — ${label(s.type)} triggered. Entry ~${px(triggerPrice)}, stop ${px(stop)}, cover into ${tgtText}. R/R ${rr(s)}.`
       }
       break
+    }
 
     case 'confirming':
       if (long) {

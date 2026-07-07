@@ -394,6 +394,14 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   const vwap = sl.vwap
   if (vwap == null) return null
   const band = (t.atr ?? price * 0.01) * 0.3
+
+  // Proximity gate: a VWAP bounce/reclaim only exists when price is actually
+  // NEAR VWAP. Without this, any stock trading above VWAP (by any distance)
+  // was tagged a "vwap bounce" — even 15% away. Require price within ~1 ATR or
+  // 2.5% of VWAP (whichever is larger, to allow volatile low-float names).
+  const nearThreshold = Math.max(price * 0.025, band * 3)
+  if (Math.abs(price - vwap) > nearThreshold) return null
+
   const zoneLower = vwap - band
   const zoneUpper = vwap + band
   const above = price >= vwap
