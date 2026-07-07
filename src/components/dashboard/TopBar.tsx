@@ -5,6 +5,7 @@ import { getSessionType, formatET, formatLondon, sessionLabel, sessionColor } fr
 import { AlertsDrawer } from './AlertsDrawer'
 import { TradeJournal } from '@/components/journal/TradeJournal'
 import { OpportunitiesDrawer } from '@/components/opportunities/OpportunitiesDrawer'
+import { ContinuationDrawer } from '@/components/continuation/ContinuationDrawer'
 import { useMonitor } from '@/hooks/useMonitor'
 import { useTradingStore } from '@/store/trading-store'
 
@@ -15,6 +16,7 @@ export function TopBar() {
   const [sessionColorClass, setSessionColorClass] = useState('text-gray-500 bg-gray-900/20')
   const [journalOpen, setJournalOpen] = useState(false)
   const [oppsOpen, setOppsOpen] = useState(false)
+  const [contOpen, setContOpen] = useState(false)
 
   // Always-on monitoring engine — runs app-wide, independent of the selected ticker.
   useMonitor()
@@ -73,6 +75,12 @@ export function TopBar() {
           )}
         </button>
         <button
+          onClick={() => setContOpen(true)}
+          className="text-xs px-2.5 py-1 rounded border border-emerald-800 bg-emerald-950/40 text-emerald-300 hover:text-white hover:border-emerald-600 transition-colors font-medium"
+        >
+          🎯 Continuation
+        </button>
+        <button
           onClick={() => setJournalOpen(true)}
           className="text-xs px-2.5 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 transition-colors font-medium"
         >
@@ -82,6 +90,7 @@ export function TopBar() {
       </div>
       {journalOpen && <TradeJournal onClose={() => setJournalOpen(false)} />}
       {oppsOpen && <OpportunitiesDrawer onClose={() => setOppsOpen(false)} />}
+      {contOpen && <ContinuationDrawer onClose={() => setContOpen(false)} />}
     </header>
   )
 }
