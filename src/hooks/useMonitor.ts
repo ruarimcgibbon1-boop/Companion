@@ -125,6 +125,24 @@ function updateLog(log: SetupLog, setup: DetectedSetup, rec: SetupStateRecord, p
   }
 }
 
+// ── Buy-signal de-duplication ────────────────────────────────────────────────
+// The scanner re-fires the same idea on every poll and across sibling detectors
+// (e.g. JLHL logged 12 near-identical BUYs on 2026-07-07 as ema9/ema21/pullback
+// all triggered into the same rollover). Keep the FIRST fire per symbol + entry
+// cluster within a cooldown window; suppress the rest so the log reflects one
+// tradeable idea, not the poll cadence.
+const ENTRY_SIMILARITY_PCT = 0.03            // entries within 3% ⇒ the same idea
+const BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000 // 45 minutes
+
+function isDuplicateBuy(sym: string, entryHigh: number, now: number, prior: BuySignalRecord[]): boolean {
+  for (const b of prior) {
+    if (b.symbol !== sym) continue
+    if (now - b.timestamp > BUY_DEDUP_COOLDOWN_MS) continue
+    if (b.entryHigh > 0 && Math.abs(entryHigh - b.entryHigh) / b.entryHigh < ENTRY_SIMILARITY_PCT) return true
+  }
+  return false
+}
+
 // ── Hook ────────────────────────────────────────────────────────────────────
 
 export function useMonitor() {
@@ -202,8 +220,12 @@ export function useMonitor() {
 
           if (alert) {
             newAlerts.push(alert)
-            // Record every actionable BUY indication for end-of-day review.
-            if (alert.kind === 'triggered' && setup.direction === 'long') {
+            // Record every actionable BUY indication for end-of-day review —
+            // but only the first per symbol+entry cluster (dedup the poll spam).
+            if (
+              alert.kind === 'triggered' && setup.direction === 'long' &&
+              !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, [...s.buySignals, ...newBuySignals])
+            ) {
               newBuySignals.push({
                 id: alert.id,
                 setupId: setup.id,

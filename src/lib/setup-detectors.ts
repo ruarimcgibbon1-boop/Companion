@@ -76,6 +76,39 @@ function volumeExpanding(candles: Candle[]): boolean {
   return last.volume > avg * 1.3
 }
 
+// ── Long-bounce quality gates (from the 2026-07-06/07 trade review) ──────────
+// Buying "bounces" into a stock that has already rolled over off its session
+// high (CLRO 10.5 after a 9→12 run; JLHL 4.8 after topping 5.5; FISV 54.8 off
+// the top) produced the worst clusters of losers. Veto the *trigger* in those
+// conditions — the setup stays visible as a watch but won't log a BUY.
+const ROLLOVER_OFF_HIGH_PCT = 0.08   // ≥8% below the session high = extended round-trip
+// A stop tighter than this is noise on a low-float and gets shaken out before
+// the thesis plays (SEER's 0.6% scalp). We floor stop width — never tighten.
+const MIN_STOP_PCT = 0.015
+
+function sessionHigh(candles: Candle[]): number {
+  let h = 0
+  for (const c of candles) if (c.high > h) h = c.high
+  return h
+}
+
+/** Last few candles carving lower highs on a net-lower close = a down-leg, not a healthy higher-low pullback. */
+export function rollingOver(candles: Candle[]): boolean {
+  const r = lastN(candles, 4)
+  if (r.length < 4) return false
+  const lowerHighs = r[3].high < r[1].high && r[2].high <= r[1].high
+  const netDown = r[3].close < r[0].close
+  return lowerHighs && netDown
+}
+
+/** Veto a long *bounce* trigger when price has already rolled over well off the session high. */
+export function longBounceRolledOver(ctx: DetectionContext): boolean {
+  const hi = sessionHigh(ctx.candles)
+  if (hi <= 0) return false
+  const offHigh = (hi - ctx.price) / hi
+  return offHigh > ROLLOVER_OFF_HIGH_PCT && rollingOver(ctx.candles)
+}
+
 function cleanCandlesInto(candles: Candle[], direction: SetupDirection): boolean {
   // For a long, penalise large red candles in the pullback; for a short, large green.
   const recent = lastN(candles, 5)
@@ -136,6 +169,8 @@ interface BuildArgs {
   confirming: boolean
   notes: string
   risks?: string[]
+  /** When active, suppress the `triggered` state (no BUY logged) and surface the reason. */
+  vetoTrigger?: { active: boolean; reason: string }
 }
 
 function buildSetup(args: BuildArgs): DetectedSetup {
@@ -146,7 +181,14 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // Targets from ranked levels in the trade direction.
   const forward = direction === 'long' ? levelsAbove(levels, price) : levelsBelow(levels, price)
   const entryRef = direction === 'long' ? zoneUpper : zoneLower
-  const stopRef = invalidation
+
+  // Minimum stop-width floor: widen a degenerate sub-MIN_STOP_PCT stop so we never
+  // emit a scalp that noise stops out (SEER 0.6%, 2026-07-06). Only ever widens.
+  const minStopDist = price * MIN_STOP_PCT
+  let stopRef = invalidation
+  if (direction === 'long' && entryRef - stopRef < minStopDist) stopRef = entryRef - minStopDist
+  else if (direction === 'short' && stopRef - entryRef < minStopDist) stopRef = entryRef + minStopDist
+
   const targets: SetupTarget[] = forward.slice(0, 3).map((l, i) => ({
     price: l.midpoint,
     label: `T${i + 1}${l.sourceLabels[0] ? ` (${l.sourceLabels[0]})` : ''}`,
@@ -199,9 +241,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   const approachThreshold = approachThresholdPct({ price, technical: t, candles: ctx.candles, spreadPct: ctx.spreadPct })
 
   // Observed (instantaneous) state from geometry + evidence.
+  // A vetoed trigger cannot advance to `triggered` (so it logs no BUY) but stays visible.
+  const vetoed = args.vetoTrigger?.active ?? false
   const inZone = price >= zoneLower && price <= zoneUpper
   let state: SetupState
-  if (args.triggered) state = 'triggered'
+  if (args.triggered && !vetoed) state = 'triggered'
   else if (inZone && args.confirming) state = 'confirming'
   else if (inZone) state = 'at_level'
   else if (Math.abs(distanceToZonePct) <= approachThreshold) state = 'approaching'
@@ -227,7 +271,7 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     zoneMidpoint,
     rationale,
     confirmation,
-    invalidation,
+    invalidation: stopRef,
     stopReference: stopRef,
     targets,
     rewardRisk: bestRR,
@@ -238,7 +282,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     approachThresholdPct: approachThreshold,
     testCount,
     confidence: Math.round((total + (level?.strength ?? 40)) / 2),
-    risks: [...new Set([...(args.risks ?? []), ...scoreRisks])],
+    risks: [...new Set([
+      ...(args.risks ?? []),
+      ...(vetoed && args.vetoTrigger ? [args.vetoTrigger.reason] : []),
+      ...scoreRisks,
+    ])],
     keyRisks: scoreRisks.slice(0, 3),
     notes: args.notes,
     nextIfHolds: nextForward,
@@ -299,6 +347,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
     confirmationSignals: signals,
     triggered,
     confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over ≥8% off session high on lower highs — bounce may be a falling knife' },
     notes: `${depth[0].toUpperCase() + depth.slice(1)} pullback. Prioritise controlled selling; avoid buying large red candles.`,
     risks: t.lowerHighsLows ? ['Lower highs/lows forming — pullback may become a trend reversal'] : [],
   })
@@ -384,6 +433,7 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
     confirmationSignals: signals,
     triggered,
     confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over ≥8% off session high on lower highs — bounce may be a falling knife' },
     notes: tests >= 3 ? `${label} tested ${tests}× — support weakening, reduce size.` : `Clean ${label} test — momentum reference intact.`,
     risks: tests >= 3 ? [`${label} tested ${tests}× — each retest weakens it`] : [],
   })
@@ -438,6 +488,7 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
     confirmationSignals: signals,
     triggered,
     confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over ≥8% off session high on lower highs — bounce may be a falling knife' },
     notes: tests > 4 ? 'VWAP crossed many times — choppy, treat reclaims sceptically.' : 'Respecting VWAP so far this session.',
     risks: tests > 4 ? ['VWAP whipsawed repeatedly — low reliability'] : [],
   })
