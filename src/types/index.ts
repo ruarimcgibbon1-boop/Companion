@@ -290,7 +290,10 @@ export interface ScannerFilters {
 
 export const DEFAULT_FILTERS: ScannerFilters = {
   minPrice: 1,
-  maxPrice: 300,
+  // No max-price cap by default — intraday continuation must not inherit the
+  // swing-trade "$300 max" restriction. A liquid $400 stock can be the better
+  // intraday trade. Kept configurable; 100000 is an effective "no cap".
+  maxPrice: 100_000,
   minChangePct: 5,
   maxChangePct: 1000,
   minVolume: 500000,

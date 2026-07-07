@@ -209,6 +209,38 @@ export interface DataIntegrity {
 
 // ── Per-symbol monitor result (returned by /api/monitor) ────────────────────
 
+/**
+ * Compact per-symbol technical/session summary surfaced on the monitor result so
+ * the continuation evaluator can classify front-side/backside and extension
+ * without re-deriving indicators. All fields are honest nulls when unavailable.
+ */
+export interface ContinuationTechnicals {
+  vwap: number | null
+  ema9: number | null
+  ema20: number | null
+  rsi14: number | null
+  atr: number | null
+  atrPct: number | null
+  distanceFromVwapPct: number | null
+  distanceFromEma9Pct: number | null
+  distanceFromDayHighPct: number | null
+  aboveVwap: boolean | null
+  higherHighsLows: boolean | null
+  lowerHighsLows: boolean | null
+  trend5m: 'up' | 'down' | 'flat'
+  trend15m: 'up' | 'down' | 'flat'
+  volumeTrend: 'increasing' | 'decreasing' | 'flat'
+  gapPct: number | null
+  premarketHigh: number | null
+  premarketVolume: number | null
+  dayHigh: number | null
+  previousDayHigh: number | null
+  previousClose: number | null
+  or5High: number | null
+  or15High: number | null
+  twentyDayHigh: number | null
+}
+
 export interface MonitorResult {
   symbol: string
   price: number
@@ -220,6 +252,7 @@ export interface MonitorResult {
   setups: DetectedSetup[]
   roadmap: PriceRoadmap
   integrity: DataIntegrity
+  technicals?: ContinuationTechnicals
   error?: string
 }
 
