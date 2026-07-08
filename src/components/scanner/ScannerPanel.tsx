@@ -1,13 +1,10 @@
 'use client'
 
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import type { ScannerRow, BadgeType } from '@/types'
 import { dataAge, getSessionType } from '@/lib/market-hours'
 import { useScanner } from '@/hooks/useScanner'
-
-const sessionType = typeof window !== 'undefined' ? getSessionType() : 'regular'
-const isPremarketSession = sessionType === 'premarket'
 
 const BADGE_COLORS: Record<BadgeType, string> = {
   'Fresh News': 'bg-blue-500/20 text-blue-400 border border-blue-500/30',
@@ -62,6 +59,19 @@ export function ScannerPanel() {
   const { scan } = useScanner()
   const [search, setSearch] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
+
+  // Session is time-derived, so it must NOT be computed during render — the
+  // server and first client render would disagree and break hydration. Start
+  // from the server-safe default and resolve the real session after mount,
+  // re-checking periodically to catch premarket→regular→afterhours transitions.
+  const [sessionType, setSessionType] = useState<ReturnType<typeof getSessionType>>('regular')
+  useEffect(() => {
+    const update = () => setSessionType(getSessionType())
+    update()
+    const id = setInterval(update, 60_000)
+    return () => clearInterval(id)
+  }, [])
+  const isPremarketSession = sessionType === 'premarket'
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault()
