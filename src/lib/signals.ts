@@ -43,6 +43,10 @@ export function deriveSignal(s: DetectedSetup): TradeSignal {
   // The level that flips the setup actionable: reclaim/break the top (long) or
   // lose the bottom (short) of the zone.
   const triggerPrice = long ? s.zoneUpper : s.zoneLower
+  // Where you actually fill entering on the trigger (buy the reclaim), never
+  // below current price for a long — so we don't tell the user to rest a limit
+  // in a zone that a strong mover never revisits.
+  const entryFill = s.entryFill ?? triggerPrice
   const cond = triggerConditionFor(s.type, s.direction)
   const stop = s.invalidation
   const targets = s.targets.map(t => t.price)
@@ -63,7 +67,7 @@ export function deriveSignal(s: DetectedSetup): TradeSignal {
         headline = `${s.symbol} ${label(s.type)} triggered but R/R only ${rr(s)} — target ${px(targets[0] ?? triggerPrice)} too close to stop ${px(stop)}. Skip unless the setup improves.`
       } else if (long) {
         action = 'buy'; verb = 'BUY'; urgency = 'now'
-        headline = `BUY ${s.symbol} — ${label(s.type)} triggered. Entry ~${px(triggerPrice)}, stop ${px(stop)}, sell into ${tgtText}. R/R ${rr(s)}.`
+        headline = `BUY ${s.symbol} — ${label(s.type)} triggered. Enter now ~${px(entryFill)} (on the reclaim), stop ${px(stop)}, sell into ${tgtText}. R/R ${rr(s)}.`
       } else {
         action = 'sell_short'; verb = 'SELL / SHORT'; urgency = 'now'
         headline = `SELL/SHORT ${s.symbol} — ${label(s.type)} triggered. Entry ~${px(triggerPrice)}, stop ${px(stop)}, cover into ${tgtText}. R/R ${rr(s)}.`

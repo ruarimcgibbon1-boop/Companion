@@ -85,6 +85,12 @@ const ROLLOVER_OFF_HIGH_PCT = 0.08   // ≥8% below the session high = extended 
 // A stop tighter than this is noise on a low-float and gets shaken out before
 // the thesis plays (SEER's 0.6% scalp). We floor stop width — never tighten.
 const MIN_STOP_PCT = 0.015
+// A long "bounce" whose price has already run well above its entry zone is a
+// chase, not a bounce: the zone is unfillable and entering at the trigger means
+// a wide stop for a tiny first target. Don't let it fire a BUY. (2026-07-08's
+// runnable triggers sat 0.6–2.4% above the zone; the dead 8–10% chases — PRME
+// EMA21, ELTX pullback — get dropped.)
+const MAX_TRIGGER_EXTENSION_PCT = 0.04
 
 function sessionHigh(candles: Candle[]): number {
   let h = 0
@@ -191,6 +197,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   const forward = direction === 'long' ? levelsAbove(levels, price) : levelsBelow(levels, price)
   const entryRef = direction === 'long' ? zoneUpper : zoneLower
 
+  // Where you'd actually fill entering ON the trigger (buy the reclaim), never
+  // below current price for a long. Strong movers never come back to the zone,
+  // so a resting limit misses them — the real entry is here.
+  const entryFill = direction === 'long' ? Math.max(zoneUpper, price) : Math.min(zoneLower, price)
+
   // Minimum stop-width floor: widen a degenerate sub-MIN_STOP_PCT stop so we never
   // emit a scalp that noise stops out (SEER 0.6%, 2026-07-06). Only ever widens.
   const minStopDist = price * MIN_STOP_PCT
@@ -252,9 +263,14 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // Observed (instantaneous) state from geometry + evidence.
   // A vetoed trigger cannot advance to `triggered` (so it logs no BUY) but stays visible.
   const vetoed = args.vetoTrigger?.active ?? false
+  // An over-extended long bounce is a chase, not a fillable trigger — drop it entirely.
+  const extended = direction === 'long'
+    ? price > zoneUpper * (1 + MAX_TRIGGER_EXTENSION_PCT)
+    : price < zoneLower * (1 - MAX_TRIGGER_EXTENSION_PCT)
+  const rawTrigger = args.triggered && !extended
   const inZone = price >= zoneLower && price <= zoneUpper
   let state: SetupState
-  if (args.triggered && !vetoed) state = 'triggered'
+  if (rawTrigger && !vetoed) state = 'triggered'
   else if (inZone && args.confirming) state = 'confirming'
   else if (inZone) state = 'at_level'
   else if (Math.abs(distanceToZonePct) <= approachThreshold) state = 'approaching'
@@ -272,8 +288,9 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     type,
     direction,
     state,
-    triggeredRaw: args.triggered,
+    triggeredRaw: rawTrigger,
     qualityVetoed: vetoed,
+    entryFill,
     score: total,
     grade,
     breakdown,

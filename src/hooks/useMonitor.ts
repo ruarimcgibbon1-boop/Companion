@@ -232,6 +232,13 @@ export function useMonitor() {
             setup.direction === 'long' && setup.triggeredRaw &&
             !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, [...s.buySignals, ...newBuySignals])
           ) {
+            // Record the fill you'd get entering on the trigger, and an R/R honest
+            // to that entry — not the (often unreachable) zone bottom.
+            const fill = setup.entryFill ?? setup.zoneUpper
+            const t1 = setup.targets[0]?.price ?? null
+            const rr = t1 != null && fill > setup.stopReference
+              ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
+              : setup.rewardRisk
             newBuySignals.push({
               id: `${setup.id}:triggered:${Math.floor(now / 1000)}`,
               setupId: setup.id,
@@ -240,13 +247,13 @@ export function useMonitor() {
               setupType: setup.type,
               triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
               entryLow: setup.zoneLower,
-              entryHigh: setup.zoneUpper,
+              entryHigh: fill,
               invalidation: setup.invalidation,
               stop: setup.stopReference,
               targets: setup.targets.map(t => t.price),
               score: setup.score,
               grade: setup.grade,
-              rewardRisk: setup.rewardRisk,
+              rewardRisk: rr,
               priceAtSignal: r.price,
               flagged: setup.qualityVetoed ?? false,
             })

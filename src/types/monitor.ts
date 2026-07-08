@@ -134,6 +134,8 @@ export interface DetectedSetup {
   triggeredRaw?: boolean
   /** A quality gate (e.g. rolled-over-off-high) fired — the signal is logged but flagged. */
   qualityVetoed?: boolean
+  /** Price you'd actually fill entering on the trigger (buy the reclaim), never below current price for a long. */
+  entryFill?: number
   score: number
   grade: SetupGrade
   breakdown: ScoreBreakdown

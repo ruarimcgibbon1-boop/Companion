@@ -97,6 +97,32 @@ describe('premarket-anchored VWAP', () => {
   })
 })
 
+describe('entry-on-trigger + extension drop', () => {
+  // A rising series that closes strong, so a long bounce/momentum setup can trigger.
+  const rising = bars([4.7, 4.78, 4.86, 4.95, 5.0, 5.04, 5.08])
+
+  it('entryFill is the current price when price is above the zone (buy the reclaim, not a limit below)', () => {
+    const setups = detectSetups(ctx(rising, 5.08))
+    const longs = setups.filter(s => s.direction === 'long' && s.entryFill != null)
+    expect(longs.length).toBeGreaterThan(0)
+    for (const s of longs) {
+      // never asks you to enter below current price on a long
+      expect(s.entryFill!).toBeGreaterThanOrEqual(Math.min(s.zoneUpper, 5.08) - 1e-9)
+    }
+  })
+
+  it('does not trigger a long bounce when price is >4% above the entry zone (a chase, not a bounce)', () => {
+    // price 5.50 sits ~8% above a ~5.05 zone — the PRME-EMA21 / ELTX-pullback case
+    const setups = detectSetups(ctx(rising, 5.5))
+    for (const s of setups) {
+      if (s.direction === 'long' && s.zoneUpper > 0 && 5.5 > s.zoneUpper * 1.04) {
+        expect(s.state).not.toBe('triggered')
+        expect(s.triggeredRaw ?? false).toBe(false)
+      }
+    }
+  })
+})
+
 describe('minimum stop-width floor', () => {
   it('never emits a long setup whose stop is tighter than 1.5%', () => {
     // Tiny ATR would otherwise yield a razor-thin stop (the SEER 0.6% case)
