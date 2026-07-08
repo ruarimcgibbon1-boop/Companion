@@ -151,10 +151,15 @@ export function calculateSessionLevels(
   const or15High = or15Candles.length ? Math.max(...or15Candles.map(c => c.high)) : null
   const or15Low = or15Candles.length ? Math.min(...or15Candles.map(c => c.low)) : null
 
+  // VWAP anchors to the active session: today's regular candles once the bell
+  // rings, otherwise today's premarket candles — so a premarket-anchored VWAP is
+  // available before the open instead of nothing (which was silently disabling
+  // every VWAP-based setup in premarket).
+  const vwapBase = regular.length ? regular : premarket
   // Incorporate live price tick into VWAP so it reflects current quote, not just last closed candle
-  const vwapCandles = (livePrice != null && liveVolume != null && liveVolume > 0 && regular.length)
-    ? [...regular, { time: Date.now() / 1000, open: livePrice, high: livePrice, low: livePrice, close: livePrice, volume: liveVolume }]
-    : regular
+  const vwapCandles = (livePrice != null && liveVolume != null && liveVolume > 0 && vwapBase.length)
+    ? [...vwapBase, { time: Date.now() / 1000, open: livePrice, high: livePrice, low: livePrice, close: livePrice, volume: liveVolume }]
+    : vwapBase
   const vwapVal = vwapCandles.length ? vwap(vwapCandles) : null
 
   const prevDay = dailyCandles.length >= 2 ? dailyCandles[dailyCandles.length - 2] : null
@@ -206,15 +211,23 @@ export function calculateTechnical(
 ): TechnicalData {
   const closes = intradayCandles.map(c => c.close)
   const todayStart = getTodayStartUnix()
+
+  // Session-aware indicator frame. Regular-session candles drive EMAs/RSI/VWAP
+  // cross during and after regular hours (unchanged). Before the open, use
+  // TODAY's premarket candles (when there are enough to form the moving averages)
+  // so the indicators track the live premarket tape instead of anchoring to
+  // yesterday's close — the reason premarket setups sat pinned to stale levels.
   const regular = intradayCandles.filter(c => isRegularHours(c.time * 1000))
-  const regularCloses = regular.map(c => c.close)
+  const todayPremarket = intradayCandles.filter(c => c.time >= todayStart && isPremarket(c.time * 1000))
+  const frame = (isPremarket(Date.now()) && todayPremarket.length >= 9) ? todayPremarket : regular
+  const frameCloses = frame.map(c => c.close)
 
   // If livePrice is newer than the last candle close, append it so indicators are current
   const lastClose = closes[closes.length - 1] ?? null
   const effectivePrice = livePrice ?? lastClose
   const closesWithLive = livePrice != null && livePrice !== lastClose
-    ? [...regularCloses, livePrice]
-    : regularCloses
+    ? [...frameCloses, livePrice]
+    : frameCloses
 
   const vwapVal = sessionLevels.vwap
   const currentPrice = effectivePrice
@@ -224,7 +237,9 @@ export function calculateTechnical(
       ? ((currentPrice - vwapVal) / vwapVal) * 100
       : null
 
-  const dayHigh = sessionLevels.regularHigh
+  // Before the open there is no regular-session high yet — fall back to the
+  // premarket high so extension/roadmap logic still has a session ceiling.
+  const dayHigh = sessionLevels.regularHigh ?? sessionLevels.premarketHigh
   const distanceFromDayHighPct =
     dayHigh && currentPrice
       ? ((currentPrice - dayHigh) / dayHigh) * 100
@@ -276,12 +291,12 @@ export function calculateTechnical(
   const hhhl = isHigherHighsLows(highs, lows)
   const lhll = isLowerHighsLows(highs, lows)
 
-  // VWAP cross count
-  const vwapSer = vwapSeries(regular)
+  // VWAP cross count — over the active session frame (premarket before the open)
+  const vwapSer = vwapSeries(frame)
   let crosses = 0
-  for (let i = 1; i < regular.length && i < vwapSer.length; i++) {
-    const prevAbove = regular[i - 1].close > vwapSer[i - 1]
-    const currAbove = regular[i].close > vwapSer[i]
+  for (let i = 1; i < frame.length && i < vwapSer.length; i++) {
+    const prevAbove = frame[i - 1].close > vwapSer[i - 1]
+    const currAbove = frame[i].close > vwapSer[i]
     if (prevAbove !== currAbove) crosses++
   }
 

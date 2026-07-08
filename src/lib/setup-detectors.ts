@@ -101,11 +101,20 @@ export function rollingOver(candles: Candle[]): boolean {
   return lowerHighs && netDown
 }
 
+/** Fraction below the session high (positive when below). Prefers the session-correct
+ *  technical reading (regular high, or premarket high before the open); falls back to a
+ *  candle scan only when that's unavailable. */
+function offSessionHighPct(ctx: DetectionContext): number | null {
+  const d = ctx.technical.distanceFromDayHighPct
+  if (d != null) return -d / 100
+  const hi = sessionHigh(ctx.candles)
+  return hi > 0 ? (hi - ctx.price) / hi : null
+}
+
 /** Veto a long *bounce* trigger when price has already rolled over well off the session high. */
 export function longBounceRolledOver(ctx: DetectionContext): boolean {
-  const hi = sessionHigh(ctx.candles)
-  if (hi <= 0) return false
-  const offHigh = (hi - ctx.price) / hi
+  const offHigh = offSessionHighPct(ctx)
+  if (offHigh == null) return false
   return offHigh > ROLLOVER_OFF_HIGH_PCT && rollingOver(ctx.candles)
 }
 

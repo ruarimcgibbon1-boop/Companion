@@ -8,6 +8,7 @@ import {
   detectSetups, rollingOver, longBounceRolledOver, type DetectionContext,
 } from '../src/lib/setup-detectors'
 import { buildKeyLevels } from '../src/lib/levels-engine'
+import { calculateSessionLevels } from '../src/lib/technical'
 import type { Candle, SessionLevels, TechnicalData } from '../src/types'
 
 function bars(closes: number[]): Candle[] {
@@ -61,11 +62,38 @@ describe('longBounceRolledOver', () => {
   it('vetoes when price is >8% off the session high on lower highs (CLRO/JLHL pattern)', () => {
     // ran to 5.5 then bled to ~4.8 (≈13% off high) making lower highs
     const c = bars([5.0, 5.3, 5.5, 5.35, 5.15, 4.95, 4.8])
-    expect(longBounceRolledOver(ctx(c, 4.8))).toBe(true)
+    expect(longBounceRolledOver(ctx(c, 4.8, { technical: technical({ distanceFromDayHighPct: -13 }) }))).toBe(true)
   })
   it('does not veto a shallow pullback near the highs (SKIN/LUCY winners)', () => {
     const c = bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0])
-    expect(longBounceRolledOver(ctx(c, 5.0))).toBe(false)
+    expect(longBounceRolledOver(ctx(c, 5.0, { technical: technical({ distanceFromDayHighPct: -1 }) }))).toBe(false)
+  })
+  it('falls back to a candle scan when the day-high reading is unavailable', () => {
+    const c = bars([5.0, 5.3, 5.5, 5.35, 5.15, 4.95, 4.8])
+    expect(longBounceRolledOver(ctx(c, 4.8, { technical: technical({ distanceFromDayHighPct: null }) }))).toBe(true)
+  })
+})
+
+describe('premarket-anchored VWAP', () => {
+  // Timestamps for 08:00 ET *today* (EDT = -04:00 in July), robust to the machine's
+  // local timezone. These are today's premarket bars with NO regular-session bars.
+  function todayPremarketBars(closes: number[]): Candle[] {
+    const etDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date())
+    const base = Math.floor(new Date(`${etDate}T08:00:00-04:00`).getTime() / 1000)
+    return closes.map((c, i) => ({
+      time: base + i * 60,
+      open: c - 0.01, high: c + 0.02, low: c - 0.02, close: c, volume: 50_000,
+    }))
+  }
+
+  it('produces a VWAP from premarket candles when there is no regular session yet', () => {
+    const candles = todayPremarketBars([2.0, 2.1, 2.25, 2.3, 2.28, 2.35, 2.4])
+    const sl = calculateSessionLevels(candles, [])
+    // Before this change vwap was null in premarket (regular-only) — now it anchors to premarket.
+    expect(sl.vwap).not.toBeNull()
+    expect(sl.vwap!).toBeGreaterThan(2.0)
+    expect(sl.vwap!).toBeLessThan(2.4)
+    expect(sl.premarketHigh).toBeCloseTo(2.42, 1)
   })
 })
 
