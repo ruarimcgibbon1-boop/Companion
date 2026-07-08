@@ -123,6 +123,32 @@ describe('entry-on-trigger + extension drop', () => {
   })
 })
 
+describe('new momentum setups', () => {
+  it('detects a bull flag — sharp pole then a tight consolidation', () => {
+    const c = bars([3.98,4.08,4.20,4.30,4.42,4.50,4.56,4.60,4.62, 4.55,4.52,4.54,4.53,4.56])
+    expect(detectSetups(ctx(c, 4.56)).some(s => s.type === 'bull_flag')).toBe(true)
+  })
+
+  it('bull flag carries measured-move targets above the pole high', () => {
+    const c = bars([3.98,4.08,4.20,4.30,4.42,4.50,4.56,4.60,4.62, 4.55,4.52,4.54,4.53,4.56])
+    const bf = detectSetups(ctx(c, 4.56)).find(s => s.type === 'bull_flag')
+    expect(bf).toBeTruthy()
+    expect(bf!.targets.some(t => t.price > 4.64)).toBe(true)   // 1× measured move clears the pole high
+  })
+
+  it('detects a break of structure — rising swing highs over a higher low', () => {
+    const c = bars([4.00,4.06,4.15,4.08,4.02,4.12,4.28,4.20,4.14,4.24,4.40,4.32,4.26,4.36,4.52,4.46,4.50,4.54])
+    expect(detectSetups(ctx(c, 4.54)).some(s => s.type === 'break_of_structure')).toBe(true)
+  })
+
+  it('does not fire momentum setups in a clear downtrend', () => {
+    const c = bars([4.62,4.5,4.4,4.3,4.2,4.1,4.0,3.9,3.8,3.75,3.7,3.68,3.66,3.64])
+    const types = new Set(detectSetups(ctx(c, 3.64, { technical: technical({ trend5m: 'down' }) })).map(s => s.type))
+    expect(types.has('bull_flag')).toBe(false)
+    expect(types.has('break_of_structure')).toBe(false)
+  })
+})
+
 describe('minimum stop-width floor', () => {
   it('never emits a long setup whose stop is tighter than 1.5%', () => {
     // Tiny ATR would otherwise yield a razor-thin stop (the SEER 0.6% case)

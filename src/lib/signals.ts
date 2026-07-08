@@ -26,6 +26,8 @@ function px(n: number): string {
 function triggerConditionFor(type: SetupType, direction: 'long' | 'short'): string {
   switch (type) {
     case 'breakout': return 'a candle CLOSE above'
+    case 'bull_flag': return 'a break + hold above the flag high'
+    case 'break_of_structure': return 'a break of the prior swing high'
     case 'pullback': return 'a bounce + reclaim of'
     case 'ema9_bounce': return 'a hold + reclaim above'
     case 'ema21_bounce': return 'a higher low + reclaim above'

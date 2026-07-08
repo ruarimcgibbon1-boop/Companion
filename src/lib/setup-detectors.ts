@@ -117,6 +117,23 @@ function offSessionHighPct(ctx: DetectionContext): number | null {
   return hi > 0 ? (hi - ctx.price) / hi : null
 }
 
+/** Fractal swing pivots over a candle window: a high/low with `k` lower/higher bars on each side. */
+function pivots(cs: Candle[], k: number): { highs: { i: number; price: number }[]; lows: { i: number; price: number }[] } {
+  const highs: { i: number; price: number }[] = []
+  const lows: { i: number; price: number }[] = []
+  for (let i = k; i < cs.length - k; i++) {
+    let isHigh = true, isLow = true
+    for (let j = i - k; j <= i + k; j++) {
+      if (j === i) continue
+      if (cs[j].high >= cs[i].high) isHigh = false
+      if (cs[j].low <= cs[i].low) isLow = false
+    }
+    if (isHigh) highs.push({ i, price: cs[i].high })
+    if (isLow) lows.push({ i, price: cs[i].low })
+  }
+  return { highs, lows }
+}
+
 /** Veto a long *bounce* trigger when price has already rolled over well off the session high. */
 export function longBounceRolledOver(ctx: DetectionContext): boolean {
   const offHigh = offSessionHighPct(ctx)
@@ -186,6 +203,8 @@ interface BuildArgs {
   risks?: string[]
   /** When active, suppress the `triggered` state (no BUY logged) and surface the reason. */
   vetoTrigger?: { active: boolean; reason: string }
+  /** Synthetic targets (e.g. measured moves) merged with level-based targets — for breakouts to new highs that have no levels overhead. */
+  extraTargets?: number[]
 }
 
 function buildSetup(args: BuildArgs): DetectedSetup {
@@ -209,10 +228,24 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   if (direction === 'long' && entryRef - stopRef < minStopDist) stopRef = entryRef - minStopDist
   else if (direction === 'short' && stopRef - entryRef < minStopDist) stopRef = entryRef + minStopDist
 
-  const targets: SetupTarget[] = forward.slice(0, 3).map((l, i) => ({
-    price: l.midpoint,
-    label: `T${i + 1}${l.sourceLabels[0] ? ` (${l.sourceLabels[0]})` : ''}`,
-    rewardRisk: rr(entryRef, stopRef, l.midpoint),
+  // Candidate targets: ranked levels in the trade direction, plus any synthetic
+  // targets (measured moves) supplied by momentum setups. Keep those genuinely
+  // beyond price, nearest-first, deduped within 0.3%.
+  const cand: { price: number; label: string }[] = [
+    ...forward.map(l => ({ price: l.midpoint, label: l.sourceLabels[0] ?? '' })),
+    ...(args.extraTargets ?? []).map(p => ({ price: p, label: 'measured move' })),
+  ]
+  const dirLong = direction === 'long'
+  const picked: { price: number; label: string }[] = []
+  for (const o of cand
+    .filter(o => dirLong ? o.price > price * 1.001 : o.price < price * 0.999)
+    .sort((a, b) => dirLong ? a.price - b.price : b.price - a.price)) {
+    if (!picked.some(p => Math.abs(p.price - o.price) / o.price < 0.003)) picked.push(o)
+  }
+  const targets: SetupTarget[] = picked.slice(0, 3).map((o, i) => ({
+    price: o.price,
+    label: `T${i + 1}${o.label ? ` (${o.label})` : ''}`,
+    rewardRisk: rr(entryRef, stopRef, o.price),
   }))
   const bestRR = targets.length ? targets[0].rewardRisk : null
 
@@ -522,6 +555,120 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   })
 }
 
+function detectBullFlag(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles } = ctx
+  if (candles.length < 12) return null
+  if (t.trend5m === 'down') return null
+
+  const win = lastN(candles, 14)
+  const flagLen = 5
+  if (win.length < flagLen + 5) return null
+  const flag = win.slice(-flagLen)
+  const pole = win.slice(0, win.length - flagLen)
+
+  const poleLow = Math.min(...pole.map(c => c.low))
+  const poleHigh = Math.max(...pole.map(c => c.high))
+  const poleH = poleHigh - poleLow
+  const atrPct = (t.atr ?? price * 0.01) / price
+  // Need a real impulse: ≥5% or ≥3 ATR, and the high must come AFTER the low (up-pole).
+  if (poleH / poleLow < Math.max(0.05, atrPct * 3)) return null
+  const lowI = pole.reduce((bi, c, i, a) => (c.low < a[bi].low ? i : bi), 0)
+  const highI = pole.reduce((bi, c, i, a) => (c.high > a[bi].high ? i : bi), 0)
+  if (highI <= lowI) return null
+
+  const flagHigh = Math.max(...flag.map(c => c.high))
+  const flagLow = Math.min(...flag.map(c => c.low))
+  const retrace = (poleHigh - flagLow) / poleH          // how deep the flag pulled back
+  if (retrace > 0.55) return null                        // too deep → not a flag, a reversal
+  if (flagHigh - flagLow > poleH * 0.6) return null       // flag not tight enough
+  if (price < flagLow) return null                        // broke down out of the flag
+
+  const band = (t.atr ?? price * 0.01) * 0.2
+  const zoneLower = flagHigh - band
+  const zoneUpper = flagHigh + band
+  const invalidation = flagLow - Math.max(band, price * 0.004)
+
+  const last = candles[candles.length - 1]
+  const closedAbove = last.close > flagHigh
+  const triggered = closedAbove && volumeExpanding(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(flag)
+  const signals = (volumeContracting(flag) ? 1 : 0) + (closedAbove ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
+
+  return buildSetup({
+    ctx, type: 'bull_flag', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Bull flag — ${(poleH / poleLow * 100).toFixed(0)}% pole then a tight ${flagLen}-bar flag holding ${(100 - retrace * 100).toFixed(0)}% of the move. Break of $${flagHigh.toFixed(2)} continues it.`,
+    confirmation: [
+      `Break + hold above the flag high $${flagHigh.toFixed(2)}`,
+      'Volume expands on the breakout bar',
+      `Flag stays above its low $${flagLow.toFixed(2)}`,
+    ],
+    invalidation, testCount: 0,
+    scoringOverrides: {
+      volumeContractsIntoZone: volumeContracting(flag),
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      constructiveConsolidation: true,
+    },
+    confirmationSignals: signals, triggered, confirming,
+    extraTargets: [flagHigh + poleH, flagHigh + poleH * 1.618],   // 1× and 1.618× measured moves
+    notes: 'Momentum continuation — enter the break, not the drift down the flag.',
+    risks: retrace > 0.4 ? ['Deeper flag — momentum cooling, size down'] : [],
+  })
+}
+
+function detectBreakOfStructure(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles } = ctx
+  if (candles.length < 14) return null
+  if (t.trend5m === 'down') return null
+
+  const win = lastN(candles, 22)
+  const { highs, lows } = pivots(win, 2)
+  if (highs.length < 2 || lows.length < 1) return null
+
+  const lastSwingHigh = highs[highs.length - 1].price
+  const priorSwingHigh = highs[highs.length - 2].price
+  const lastSwingLow = lows[lows.length - 1].price
+  // Continuation only: an uptrend of rising swing highs, a recent higher low intact.
+  if (lastSwingHigh <= priorSwingHigh) return null
+  if (!makingHigherLows(candles)) return null
+  if (price < lastSwingLow) return null                       // structure already broken down
+  const distToSwing = (lastSwingHigh - price) / price
+  if (distToSwing > 0.03) return null                          // too far below the break level to be a trigger
+
+  const band = (t.atr ?? price * 0.01) * 0.25
+  const zoneLower = lastSwingHigh - band
+  const zoneUpper = lastSwingHigh + band
+  const invalidation = lastSwingLow - Math.max(band, price * 0.004)
+
+  const last = candles[candles.length - 1]
+  const closedAbove = last.close > lastSwingHigh
+  const triggered = closedAbove && volumeExpanding(candles) && makingHigherLows(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
+  const signals = (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
+
+  const range = lastSwingHigh - lastSwingLow
+
+  return buildSetup({
+    ctx, type: 'break_of_structure', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Break of structure — higher swing highs ($${priorSwingHigh.toFixed(2)} → $${lastSwingHigh.toFixed(2)}) over a higher low $${lastSwingLow.toFixed(2)}. Reclaiming $${lastSwingHigh.toFixed(2)} continues the trend.`,
+    confirmation: [
+      `Break of the prior swing high $${lastSwingHigh.toFixed(2)} on a close`,
+      'Volume expands on the break',
+      `Holds the higher low $${lastSwingLow.toFixed(2)} on any retest`,
+    ],
+    invalidation, testCount: highs.length,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      structureIntact: makingHigherLows(candles),
+    },
+    confirmationSignals: signals, triggered, confirming,
+    extraTargets: [lastSwingHigh + range, lastSwingHigh + range * 1.618],
+    notes: 'Trend continuation — buy the break of structure, invalid on loss of the higher low.',
+    risks: [],
+  })
+}
+
 function detectRejection(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, candles } = ctx
   const res = levelsAbove(ctx.levels, price).find(l => l.strength >= 50)
@@ -605,6 +752,8 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
     detectBreakout(ctx),
+    detectBullFlag(ctx),
+    detectBreakOfStructure(ctx),
     detectEmaBounce(ctx, 'ema9'),
     detectEmaBounce(ctx, 'ema21'),
     detectVwap(ctx),
