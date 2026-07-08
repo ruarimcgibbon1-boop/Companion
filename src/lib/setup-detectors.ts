@@ -272,6 +272,8 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     type,
     direction,
     state,
+    triggeredRaw: args.triggered,
+    qualityVetoed: vetoed,
     score: total,
     grade,
     breakdown,

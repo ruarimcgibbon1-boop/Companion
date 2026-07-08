@@ -5,7 +5,11 @@ import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
 import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord } from '@/types'
 
-const MONITOR_INTERVAL = 25_000  // 25s — scanner-wide sweep
+// Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
+// lands on a freshly-expired quote so price-driven triggers react as fast as the
+// upstream data allows. Going lower re-reads the same cached quote (no fresher
+// price) unless TTL.QUOTE is also shortened — which multiplies API calls.
+const MONITOR_INTERVAL = 15_000
 
 // ── Notification side-effects ───────────────────────────────────────────────
 
@@ -218,32 +222,38 @@ export function useMonitor() {
           logMap.set(setup.id, log)
           changedLogs.push(log)
 
+          // Buy Log: record EVERY long geometric trigger for end-of-day review —
+          // winners and losers alike, independent of the notification session gate
+          // and independent of the quality veto (which only shapes what the user is
+          // told to ACT on). Vetoed triggers are logged but `flagged` so they can be
+          // segmented at review. The per-symbol entry-cluster dedup still collapses
+          // the poll/detector spam so one idea logs once.
+          if (
+            setup.direction === 'long' && setup.triggeredRaw &&
+            !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, [...s.buySignals, ...newBuySignals])
+          ) {
+            newBuySignals.push({
+              id: `${setup.id}:triggered:${Math.floor(now / 1000)}`,
+              setupId: setup.id,
+              symbol: setup.symbol,
+              timestamp: now,
+              setupType: setup.type,
+              triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
+              entryLow: setup.zoneLower,
+              entryHigh: setup.zoneUpper,
+              invalidation: setup.invalidation,
+              stop: setup.stopReference,
+              targets: setup.targets.map(t => t.price),
+              score: setup.score,
+              grade: setup.grade,
+              rewardRisk: setup.rewardRisk,
+              priceAtSignal: r.price,
+              flagged: setup.qualityVetoed ?? false,
+            })
+          }
+
           if (alert) {
             newAlerts.push(alert)
-            // Record every actionable BUY indication for end-of-day review —
-            // but only the first per symbol+entry cluster (dedup the poll spam).
-            if (
-              alert.kind === 'triggered' && setup.direction === 'long' &&
-              !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, [...s.buySignals, ...newBuySignals])
-            ) {
-              newBuySignals.push({
-                id: alert.id,
-                setupId: setup.id,
-                symbol: setup.symbol,
-                timestamp: now,
-                setupType: setup.type,
-                triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
-                entryLow: setup.zoneLower,
-                entryHigh: setup.zoneUpper,
-                invalidation: setup.invalidation,
-                stop: setup.stopReference,
-                targets: setup.targets.map(t => t.price),
-                score: setup.score,
-                grade: setup.grade,
-                rewardRisk: setup.rewardRisk,
-                priceAtSignal: r.price,
-              })
-            }
             if (settings.browserNotifications && !alert.delayed) sendBrowserNotification(alert)
             if (settings.sound) playAlertSound(alert.kind)
           }

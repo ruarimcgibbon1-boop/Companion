@@ -128,6 +128,12 @@ export interface DetectedSetup {
   type: SetupType
   direction: SetupDirection
   state: SetupState
+  /** Raw geometric trigger, BEFORE any quality veto downgrades `state`. The Buy
+   *  Log records on this so it captures every signal for review; `state` still
+   *  drives what the user is told to act on. */
+  triggeredRaw?: boolean
+  /** A quality gate (e.g. rolled-over-off-high) fired — the signal is logged but flagged. */
+  qualityVetoed?: boolean
   score: number
   grade: SetupGrade
   breakdown: ScoreBreakdown
@@ -421,6 +427,8 @@ export interface BuySignalRecord {
   grade: SetupGrade
   rewardRisk: number | null
   priceAtSignal: number
+  /** A quality gate fired at trigger time (e.g. rolled over off the session high). Logged for review, not filtered out. */
+  flagged?: boolean
 }
 
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {

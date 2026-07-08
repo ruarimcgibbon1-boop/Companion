@@ -535,10 +535,10 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   const logById = useMemo(() => new Map(setupLogs.map(l => [l.id, l])), [setupLogs])
 
   const exportCsv = () => {
-    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'outcome', 'mfe_pct', 'mae_pct']
+    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'flagged', 'outcome', 'mfe_pct', 'mae_pct']
     const rows = buySignals.map(b => {
       const log = logById.get(b.setupId)
-      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
+      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, b.flagged ? 'flagged' : '', log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
     })
     const csv = [head.join(','), ...rows].join('\n')
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
