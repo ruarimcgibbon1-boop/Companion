@@ -3,7 +3,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
-import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord } from '@/types'
+import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType } from '@/types'
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -147,6 +147,24 @@ function isDuplicateBuy(sym: string, entryHigh: number, now: number, prior: BuyS
   return false
 }
 
+// After a long bounce on a symbol hits its invalidation, the *next* bounce on
+// that name is disproportionately another failure (2026-07-09: SKYQ/DCX/IOTR
+// each bounced again after failing and lost again — ~38% of the day's losses
+// were chop names re-bounced). Stand the symbol's bounce setups down for a
+// cooldown; momentum breakouts are unaffected (a name can break out after a
+// failed bounce).
+// 2h covers the observed same-session re-fire gaps (today's chop re-bounces were
+// 47–97 min after the first failure); the overnight gap keeps a prior-day failure
+// from carrying into a new session.
+const STANDDOWN_MS = 120 * 60 * 1000
+const BOUNCE_TYPES = new Set<SetupType>(['pullback', 'vwap_bounce', 'vwap_reclaim', 'ema9_bounce', 'ema21_bounce'])
+
+function recentlyFailedBounce(sym: string, now: number, states: SetupStateRecord[]): boolean {
+  return states.some(r =>
+    r.symbol === sym && r.state === 'failed' && BOUNCE_TYPES.has(r.type) &&
+    now - r.updatedAt < STANDDOWN_MS)
+}
+
 // ── Hook ────────────────────────────────────────────────────────────────────
 
 export function useMonitor() {
@@ -228,8 +246,11 @@ export function useMonitor() {
           // told to ACT on). Vetoed triggers are logged but `flagged` so they can be
           // segmented at review. The per-symbol entry-cluster dedup still collapses
           // the poll/detector spam so one idea logs once.
+          // Stand down a symbol's bounce setups after a bounce on it just failed.
+          const standDown = BOUNCE_TYPES.has(setup.type) &&
+            recentlyFailedBounce(setup.symbol, now, [...Object.values(s.setupStates), ...Object.values(setupStates)])
           if (
-            setup.direction === 'long' && setup.triggeredRaw &&
+            setup.direction === 'long' && setup.triggeredRaw && !standDown &&
             !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, [...s.buySignals, ...newBuySignals])
           ) {
             // Record the fill you'd get entering on the trigger, and an R/R honest

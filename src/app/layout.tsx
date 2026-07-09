@@ -18,8 +18,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${geistMono.variable} h-full dark`}>
-      <body className="h-full bg-[#0e1117] text-gray-100 antialiased">{children}</body>
+    // suppressHydrationWarning: browser extensions inject attributes (e.g.
+    // bis_register, __processed_*) onto <html>/<body> before React hydrates,
+    // which would otherwise log a hydration mismatch. This only relaxes the
+    // warning for these two elements' own attributes, not their descendants.
+    <html lang="en" className={`${geistMono.variable} h-full dark`} suppressHydrationWarning>
+      <body className="h-full bg-[#0e1117] text-gray-100 antialiased" suppressHydrationWarning>{children}</body>
     </html>
   );
 }

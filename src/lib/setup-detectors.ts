@@ -81,7 +81,10 @@ function volumeExpanding(candles: Candle[]): boolean {
 // high (CLRO 10.5 after a 9→12 run; JLHL 4.8 after topping 5.5; FISV 54.8 off
 // the top) produced the worst clusters of losers. Veto the *trigger* in those
 // conditions — the setup stays visible as a watch but won't log a BUY.
-const ROLLOVER_OFF_HIGH_PCT = 0.08   // ≥8% below the session high = extended round-trip
+// ≥5% below the session high on lower highs = rolling over. Tightened from 8%
+// after 2026-07-09, where several "bought the top" losers (SDOT after its blow-off,
+// etc.) sat 5–10% off the high and rolled but slipped the looser gate.
+const ROLLOVER_OFF_HIGH_PCT = 0.05
 // A stop tighter than this is noise on a low-float and gets shaken out before
 // the thesis plays (SEER's 0.6% scalp). We floor stop width — never tighten.
 const MIN_STOP_PCT = 0.015
