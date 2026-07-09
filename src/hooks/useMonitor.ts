@@ -277,6 +277,12 @@ export function useMonitor() {
               rewardRisk: rr,
               priceAtSignal: r.price,
               flagged: setup.qualityVetoed ?? false,
+              ctxTrend15m: r.technicals?.trend15m,
+              ctxDistVwapPct: r.technicals?.distanceFromVwapPct ?? null,
+              ctxDistDayHighPct: r.technicals?.distanceFromDayHighPct ?? null,
+              ctxRelVol: r.relativeVolume,
+              ctxHigherHighsLows: r.technicals?.higherHighsLows ?? null,
+              ctxAtrPct: r.technicals?.atrPct ?? null,
             })
           }
 

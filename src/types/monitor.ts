@@ -435,6 +435,15 @@ export interface BuySignalRecord {
   priceAtSignal: number
   /** A quality gate fired at trigger time (e.g. rolled over off the session high). Logged for review, not filtered out. */
   flagged?: boolean
+  // ── Diagnostic context at signal time — captured so winners vs losers can be
+  //    separated empirically at review (which trend/RVOL/position actually pays),
+  //    rather than guessing at gates. All optional/additive.
+  ctxTrend15m?: 'up' | 'down' | 'flat'
+  ctxDistVwapPct?: number | null      // + above VWAP, - below
+  ctxDistDayHighPct?: number | null   // ~0 = at HOD (top-buy), very negative = well below
+  ctxRelVol?: number | null
+  ctxHigherHighsLows?: boolean | null // constructive structure vs chop
+  ctxAtrPct?: number | null           // volatility, for stop-vs-noise analysis
 }
 
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {

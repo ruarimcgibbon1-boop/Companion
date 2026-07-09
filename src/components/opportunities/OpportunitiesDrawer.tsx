@@ -535,10 +535,11 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   const logById = useMemo(() => new Map(setupLogs.map(l => [l.id, l])), [setupLogs])
 
   const exportCsv = () => {
-    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'flagged', 'outcome', 'mfe_pct', 'mae_pct']
+    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'flagged', 'trend15m', 'dist_vwap_pct', 'dist_dayhigh_pct', 'rvol', 'hhll', 'atr_pct', 'outcome', 'mfe_pct', 'mae_pct']
+    const n1 = (v: number | null | undefined) => (v == null ? '' : v.toFixed(1))
     const rows = buySignals.map(b => {
       const log = logById.get(b.setupId)
-      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, b.flagged ? 'flagged' : '', log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
+      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, b.flagged ? 'flagged' : '', b.ctxTrend15m ?? '', n1(b.ctxDistVwapPct), n1(b.ctxDistDayHighPct), n1(b.ctxRelVol), b.ctxHigherHighsLows == null ? '' : (b.ctxHigherHighsLows ? 'HH' : 'no'), n1(b.ctxAtrPct), log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
     })
     const csv = [head.join(','), ...rows].join('\n')
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
