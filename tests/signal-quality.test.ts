@@ -70,7 +70,12 @@ describe('longBounceRolledOver', () => {
   })
   it('vetoes at the tightened 5% threshold (6% off high, rolling — was missed at 8%)', () => {
     const c = bars([5.3, 5.2, 5.1, 5.05, 5.0, 4.95, 4.9])
-    expect(longBounceRolledOver(ctx(c, 4.9, { technical: technical({ distanceFromDayHighPct: -6 }) }))).toBe(true)
+    expect(longBounceRolledOver(ctx(c, 4.9, { technical: technical({ distanceFromDayHighPct: -6, atr: 0.08 }) }))).toBe(true)
+  })
+  it('does NOT veto a high-ATR momentum name for a sub-1.5-ATR pullback (2026-07-10 JZXN)', () => {
+    // atr 0.4 on a ~4.9 price ≈ 8% ATR → 6% off high is <1 ATR, just breathing
+    const c = bars([5.3, 5.2, 5.1, 5.05, 5.0, 4.95, 4.9])
+    expect(longBounceRolledOver(ctx(c, 4.9, { technical: technical({ distanceFromDayHighPct: -6, atr: 0.4 }) }))).toBe(false)
   })
   it('falls back to a candle scan when the day-high reading is unavailable', () => {
     const c = bars([5.0, 5.3, 5.5, 5.35, 5.15, 4.95, 4.8])

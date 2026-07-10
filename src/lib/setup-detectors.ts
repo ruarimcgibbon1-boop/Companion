@@ -137,11 +137,21 @@ function pivots(cs: Candle[], k: number): { highs: { i: number; price: number }[
   return { highs, lows }
 }
 
+// The off-high distance that counts as "rolled over" scales with the name's own
+// volatility: a high-ATR momentum name (2026-07-10 JZXN, atr ~7%) that pulls
+// back <1.5 ATR is just breathing, not rolling over — the fixed 5% gate wrongly
+// flagged its winners. A quiet name still trips at the 5% floor.
+const ROLLOVER_MIN_ATR = 1.5
+
 /** Veto a long *bounce* trigger when price has already rolled over well off the session high. */
 export function longBounceRolledOver(ctx: DetectionContext): boolean {
   const offHigh = offSessionHighPct(ctx)
   if (offHigh == null) return false
-  return offHigh > ROLLOVER_OFF_HIGH_PCT && rollingOver(ctx.candles)
+  const atrFrac = ctx.technical.atr != null && ctx.price > 0 ? ctx.technical.atr / ctx.price : null
+  const threshold = atrFrac != null
+    ? Math.max(ROLLOVER_OFF_HIGH_PCT, atrFrac * ROLLOVER_MIN_ATR)
+    : ROLLOVER_OFF_HIGH_PCT
+  return offHigh > threshold && rollingOver(ctx.candles)
 }
 
 function cleanCandlesInto(candles: Candle[], direction: SetupDirection): boolean {
