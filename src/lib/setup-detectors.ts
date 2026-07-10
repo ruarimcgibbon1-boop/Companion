@@ -762,6 +762,17 @@ function ordinal(n: number): string {
 
 export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   if (ctx.price <= 0 || ctx.candles.length === 0) return []
+  // Data-integrity gate: if the quote price disagrees wildly with the candle
+  // tape, the two feeds are out of sync and every signal built on it is garbage
+  // (2026-07-10: DCX/IOTR/HAO/ELAB logged entries 11–47% outside the day's
+  // actual range). Only the egregious cases are blocked (>10%), so a genuine
+  // fast breakout tick above recent highs still trades.
+  const recent = lastN(ctx.candles, 20)
+  if (recent.length >= 5) {
+    const hi = Math.max(...recent.map(c => c.high))
+    const lo = Math.min(...recent.map(c => c.low))
+    if (hi > 0 && (ctx.price > hi * 1.1 || ctx.price < lo * 0.9)) return []
+  }
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
     detectBreakout(ctx),

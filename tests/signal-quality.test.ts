@@ -132,6 +132,17 @@ describe('entry-on-trigger + extension drop', () => {
   })
 })
 
+describe('data-integrity gate', () => {
+  it('builds no setups when the quote price is wildly outside the candle tape', () => {
+    const c = bars([1.09, 1.10, 1.11, 1.10, 1.12, 1.13, 1.11])   // tape ~1.07–1.15
+    expect(detectSetups(ctx(c, 1.55)).length).toBe(0)             // quote 1.55 = ~35% above (DCX/HAO case)
+  })
+  it('still trades a genuine fast tick just above recent highs', () => {
+    const c = bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0])
+    expect(detectSetups(ctx(c, 5.2)).length).toBeGreaterThan(0)   // 5.2 within 10% of the ~5.08 high
+  })
+})
+
 describe('new momentum setups', () => {
   it('detects a bull flag — sharp pole then a tight consolidation', () => {
     const c = bars([3.98,4.08,4.20,4.30,4.42,4.50,4.56,4.60,4.62, 4.55,4.52,4.54,4.53,4.56])
