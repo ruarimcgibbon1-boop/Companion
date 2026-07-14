@@ -177,29 +177,33 @@ function recentlyFailedBounce(sym: string, now: number, states: SetupStateRecord
 //   • or two banked wins stand it down too (gap C: stop pressing a name that's
 //     already paid out twice — the third+ fire is the late chase that gives it
 //     back).
-// A loss is precise: a setup we actually logged an entry for whose state has
-// since gone 'failed'. Wins count any setup on the name that banked a target.
+// The loss/win memory is read from the LATCHED setup LOG (outcome freezes once
+// it goes 'invalidated'/'target_hit'), not the live setup STATE. 2026-07-14 LEDS
+// showed why: it failed at 10:20/10:24, then ran back up so its setup re-armed
+// OUT of 'failed' — a live-state check lost the loss memory and the 11:24 chase
+// (−2.1%) slipped the cap 59 min later. The log outcome survives the re-arm, so
+// the cap now holds for the whole cooldown regardless of what the name does next.
 const SYMBOL_CAP_MS = 120 * 60 * 1000 // same session window as the bounce stand-down
 const SYMBOL_WIN_CAP = 2
 
 function symbolCapReached(
   sym: string,
   now: number,
-  states: SetupStateRecord[],
+  logs: SetupLog[],
   buys: BuySignalRecord[],
 ): boolean {
-  const failedRecently = new Set(
-    states
-      .filter(r => r.state === 'failed' && now - r.updatedAt < SYMBOL_CAP_MS)
-      .map(r => r.id),
+  // A loss: an entry we actually logged (present in `buys`) whose setup log has
+  // since latched to 'invalidated' within the cooldown.
+  const lostSetupIds = new Set(
+    logs
+      .filter(l => l.outcome === 'invalidated' && l.resolvedAt != null && now - l.resolvedAt < SYMBOL_CAP_MS)
+      .map(l => l.id),
   )
-  const hasLoss = buys.some(
-    b => b.symbol === sym && now - b.timestamp < SYMBOL_CAP_MS && failedRecently.has(b.setupId),
-  )
+  const hasLoss = buys.some(b => b.symbol === sym && lostSetupIds.has(b.setupId))
   if (hasLoss) return true
 
-  const wins = states.filter(
-    r => r.symbol === sym && r.targetsHitAlerted > 0 && now - r.updatedAt < SYMBOL_CAP_MS,
+  const wins = logs.filter(
+    l => l.symbol === sym && l.outcome === 'target_hit' && l.resolvedAt != null && now - l.resolvedAt < SYMBOL_CAP_MS,
   ).length
   return wins >= SYMBOL_WIN_CAP
 }
@@ -279,20 +283,21 @@ export function useMonitor() {
           logMap.set(setup.id, log)
           changedLogs.push(log)
 
-          // Buy Log: record EVERY long geometric trigger for end-of-day review —
-          // winners and losers alike, independent of the notification session gate
-          // and independent of the quality veto (which only shapes what the user is
-          // told to ACT on). Vetoed triggers are logged but `flagged` so they can be
-          // segmented at review. The per-symbol entry-cluster dedup still collapses
-          // the poll/detector spam so one idea logs once.
+          // Buy Log: record long geometric triggers for end-of-day review.
+          // Quality-vetoed (flagged) triggers are NO LONGER logged: across the
+          // 7/13–7/14 review every flagged entry that filled was a loss (7/14:
+          // 5/5 flagged = losers, −15.4% combined), so the veto graduates from
+          // "flag for review" to "drop". The per-symbol entry-cluster dedup still
+          // collapses the poll/detector spam so one idea logs once.
           // Stand down a symbol's bounce setups after a bounce on it just failed.
           const allStates = [...Object.values(s.setupStates), ...Object.values(setupStates)]
           const allBuys = [...s.buySignals, ...newBuySignals]
           const standDown = BOUNCE_TYPES.has(setup.type) &&
             recentlyFailedBounce(setup.symbol, now, allStates)
-          const capped = symbolCapReached(setup.symbol, now, allStates, allBuys)
+          const capped = symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys)
           if (
-            setup.direction === 'long' && setup.triggeredRaw && !standDown && !capped &&
+            setup.direction === 'long' && setup.triggeredRaw && !setup.qualityVetoed &&
+            !standDown && !capped &&
             !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, allBuys)
           ) {
             // Record the fill you'd get entering on the trigger, and an R/R honest
@@ -318,7 +323,8 @@ export function useMonitor() {
               grade: setup.grade,
               rewardRisk: rr,
               priceAtSignal: r.price,
-              flagged: setup.qualityVetoed ?? false,
+              flagged: false, // vetoed triggers are dropped above, so a logged entry is never flagged
+
               ctxTrend15m: r.technicals?.trend15m,
               ctxDistVwapPct: r.technicals?.distanceFromVwapPct ?? null,
               ctxDistDayHighPct: r.technicals?.distanceFromDayHighPct ?? null,
