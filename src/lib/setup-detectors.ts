@@ -143,6 +143,16 @@ function pivots(cs: Candle[], k: number): { highs: { i: number; price: number }[
 // flagged its winners. A quiet name still trips at the 5% floor.
 const ROLLOVER_MIN_ATR = 1.5
 
+// Past this multiple of the (already ATR-scaled) threshold, price is deep enough
+// off the high that the 4-bar rollingOver() confirmation becomes redundant — and,
+// worse, brittle: a single green bounce candle flips its net-down test and de-arms
+// the veto even as the name keeps bleeding. 2026-07-13 BRAI spiked to 11.33 on a
+// rejection wick then fell straight to 6.42; its worst late entries fired at ~17%
+// off that high (−5.7% / −4.5%) but a green print had cleared the flag. 1.5× keeps
+// the quiet-name floor at 7.5% (won't clip a clean shallow first pullback) while
+// flagging BRAI-style falling knives from ~16% down regardless of the last candle.
+const ROLLOVER_DEEP_MULT = 1.5
+
 /** Veto a long *bounce* trigger when price has already rolled over well off the session high. */
 export function longBounceRolledOver(ctx: DetectionContext): boolean {
   const offHigh = offSessionHighPct(ctx)
@@ -151,7 +161,8 @@ export function longBounceRolledOver(ctx: DetectionContext): boolean {
   const threshold = atrFrac != null
     ? Math.max(ROLLOVER_OFF_HIGH_PCT, atrFrac * ROLLOVER_MIN_ATR)
     : ROLLOVER_OFF_HIGH_PCT
-  return offHigh > threshold && rollingOver(ctx.candles)
+  if (offHigh <= threshold) return false
+  return offHigh > threshold * ROLLOVER_DEEP_MULT || rollingOver(ctx.candles)
 }
 
 function cleanCandlesInto(candles: Candle[], direction: SetupDirection): boolean {
@@ -421,7 +432,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
     confirmationSignals: signals,
     triggered,
     confirming,
-    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over ≥8% off session high on lower highs — bounce may be a falling knife' },
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over well off the session high — bounce may be a falling knife' },
     notes: `${depth[0].toUpperCase() + depth.slice(1)} pullback. Prioritise controlled selling; avoid buying large red candles.`,
     risks: t.lowerHighsLows ? ['Lower highs/lows forming — pullback may become a trend reversal'] : [],
   })
@@ -507,7 +518,7 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
     confirmationSignals: signals,
     triggered,
     confirming,
-    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over ≥8% off session high on lower highs — bounce may be a falling knife' },
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over well off the session high — bounce may be a falling knife' },
     notes: tests >= 3 ? `${label} tested ${tests}× — support weakening, reduce size.` : `Clean ${label} test — momentum reference intact.`,
     risks: tests >= 3 ? [`${label} tested ${tests}× — each retest weakens it`] : [],
   })
@@ -562,7 +573,7 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
     confirmationSignals: signals,
     triggered,
     confirming,
-    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over ≥8% off session high on lower highs — bounce may be a falling knife' },
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over well off the session high — bounce may be a falling knife' },
     notes: tests > 4 ? 'VWAP crossed many times — choppy, treat reclaims sceptically.' : 'Respecting VWAP so far this session.',
     risks: tests > 4 ? ['VWAP whipsawed repeatedly — low reliability'] : [],
   })

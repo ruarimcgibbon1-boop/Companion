@@ -81,6 +81,19 @@ describe('longBounceRolledOver', () => {
     const c = bars([5.0, 5.3, 5.5, 5.35, 5.15, 4.95, 4.8])
     expect(longBounceRolledOver(ctx(c, 4.8, { technical: technical({ distanceFromDayHighPct: null }) }))).toBe(true)
   })
+  it('vetoes deep off the high even on a green bounce candle (2026-07-13 BRAI)', () => {
+    // 17% off high (well past 1.5× the 5% threshold); last candle bounces up so
+    // rollingOver() is false — the old gate would de-arm here and re-fire the knife.
+    const c = bars([5.0, 4.9, 4.7, 4.6, 4.8])
+    expect(rollingOver(c)).toBe(false)
+    expect(longBounceRolledOver(ctx(c, 4.8, { technical: technical({ distanceFromDayHighPct: -17 }) }))).toBe(true)
+  })
+  it('does NOT deep-override a moderate pullback with a green last candle', () => {
+    // 6% off high: past the 5% threshold but short of the 7.5% deep floor, and not
+    // rolling over — a shallow bounce that must still be allowed to fire.
+    const c = bars([5.0, 4.9, 4.7, 4.6, 4.8])
+    expect(longBounceRolledOver(ctx(c, 4.8, { technical: technical({ distanceFromDayHighPct: -6 }) }))).toBe(false)
+  })
 })
 
 describe('premarket-anchored VWAP', () => {
