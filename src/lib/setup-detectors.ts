@@ -480,6 +480,77 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
   })
 }
 
+// Opening-range break / gap-and-go. The biggest movers declare themselves early:
+// an in-play, gapped name that holds above VWAP and breaks its opening-range high
+// on expanding volume runs to multiple targets (2026-07-14's winners — LEDS 09:35,
+// FCEL/EDBL/YYGH on their opening pushes — were all this shape, yet no detector
+// targeted it; we only had dip-buyers). The go/no-go filter is the lesson from the
+// losers: a gapper is a "go" ONLY while it holds VWAP. NXTC/SHPH had already lost
+// VWAP when we bought their "bounce" and knifed — this detector never fires there.
+function detectOpeningRangeBreak(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, sessionLevels: sl, candles } = ctx
+  const vwap = sl.vwap
+  const orHigh = sl.or15High ?? sl.or5High
+  const orLow = sl.or15High != null ? sl.or15Low : sl.or5Low
+  if (orHigh == null || vwap == null) return null
+
+  // Go/no-go: bullish and in control. Green on the day, holding above VWAP, and
+  // the 5-min trend not rolling over. Any of these failing = a fade, not a go.
+  if (price < vwap) return null
+  if (t.trend5m === 'down') return null
+  if (ctx.changePct <= 0) return null
+
+  // Break level = the opening-range high, unless the premarket high sits just
+  // above it (a gapper that held into the open) — then the PM high is the real
+  // resistance whose break confirms continuation.
+  const pmHigh = sl.premarketHigh
+  const breakLevel = pmHigh != null && pmHigh > orHigh && pmHigh < price * 1.03 ? pmHigh : orHigh
+  const band = (t.atr ?? price * 0.01) * 0.3
+  const zoneUpper = breakLevel
+  const zoneLower = breakLevel - Math.max(band, price * 0.003)
+  const invalidation = breakLevel - Math.max((t.atr ?? price * 0.01) * 0.5, price * 0.005)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
+  const triggered = closedAbove && price > zoneUpper && volumeExpanding(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
+  const rvol = t.relativeVolume ?? 0
+  const signals =
+    (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
+    (rvol >= 2 ? 1 : 0) + (price > vwap ? 1 : 0)
+
+  // Measured-move targets for a break into clean air (new HOD, no levels overhead):
+  // project the opening-range height above the break, 1× and 2×.
+  const orRange = orLow != null ? Math.max(orHigh - orLow, price * 0.01) : price * 0.02
+  const extraTargets = [breakLevel + orRange, breakLevel + orRange * 2]
+  const gapped = sl.previousClose != null && sl.openingPrint != null && sl.openingPrint > sl.previousClose * 1.02
+
+  return buildSetup({
+    ctx, type: 'opening_range_break', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Opening-range break${gapped ? ' (gap-and-go)' : ''} — holding above VWAP ($${vwap.toFixed(2)}) and breaking the ${sl.or15High != null ? '15' : '5'}-min range high ($${breakLevel.toFixed(2)}). RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle CLOSE above $${breakLevel.toFixed(2)} (not an intrabar tag)`,
+      'Volume expands on the break (≥1.3× recent average)',
+      'Holds above VWAP — no failed break back under it',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      unusualVolume: rvol > 3,
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: gapped
+      ? 'Gap-and-go: strongest when it never loses VWAP. First break has the cleanest odds.'
+      : 'Intraday range break — best early; demand volume and a VWAP hold.',
+    risks: rvol < 1.5 ? ['Light relative volume — breakout may not sustain'] : [],
+  })
+}
+
 function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): DetectedSetup | null {
   const { price, technical: t, candles } = ctx
   const ema = which === 'ema9' ? t.ema9 : t.ema20
@@ -811,6 +882,7 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
     detectBreakout(ctx),
+    detectOpeningRangeBreak(ctx),
     detectBullFlag(ctx),
     detectBreakOfStructure(ctx),
     detectEmaBounce(ctx, 'ema9'),

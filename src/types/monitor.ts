@@ -14,6 +14,7 @@
 export type SetupType =
   | 'pullback'
   | 'breakout'
+  | 'opening_range_break'
   | 'bull_flag'
   | 'break_of_structure'
   | 'ema9_bounce'
@@ -362,6 +363,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   setupTypes: {
     pullback: true,
     breakout: true,
+    opening_range_break: true,
     bull_flag: true,
     break_of_structure: true,
     ema9_bounce: true,
@@ -449,6 +451,7 @@ export interface BuySignalRecord {
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   pullback: 'Pullback',
   breakout: 'Breakout',
+  opening_range_break: 'Opening-Range Break',
   bull_flag: 'Bull Flag',
   break_of_structure: 'Break of Structure',
   ema9_bounce: '9 EMA Bounce',

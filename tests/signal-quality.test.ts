@@ -181,6 +181,28 @@ describe('detectVwap trend guard', () => {
   })
 })
 
+describe('opening-range break / gap-and-go', () => {
+  // Rising into a fresh HOD with an expanding final bar (session: or15High 5.0, premarketHigh 5.1).
+  const orb = bars([4.88, 4.9, 4.95, 5.0, 5.05, 5.1, 5.15]).map((c, i, a) =>
+    i === a.length - 1 ? { ...c, volume: 350_000 } : c)
+
+  it('fires a triggered opening_range_break when a green name breaks the range above VWAP on volume', () => {
+    const setups = detectSetups(ctx(orb, 5.15, { changePct: 6, technical: technical({ trend5m: 'up' }) }))
+    const s = setups.find(x => x.type === 'opening_range_break')
+    expect(s).toBeTruthy()
+    expect(s!.triggeredRaw).toBe(true)
+  })
+  it('does NOT fire once price has lost VWAP (a fade, not a go)', () => {
+    // same tape but VWAP anchored above the quote — price has lost VWAP
+    const setups = detectSetups(ctx(orb, 4.85, { changePct: 6, sessionLevels: session({ vwap: 5.0 }) }))
+    expect(setups.some(s => s.type === 'opening_range_break')).toBe(false)
+  })
+  it('does NOT fire when the name is red on the day', () => {
+    const setups = detectSetups(ctx(orb, 5.15, { changePct: -2 }))
+    expect(setups.some(s => s.type === 'opening_range_break')).toBe(false)
+  })
+})
+
 describe('new momentum setups', () => {
   it('detects a bull flag — sharp pole then a tight consolidation', () => {
     const c = bars([3.98,4.08,4.20,4.30,4.42,4.50,4.56,4.60,4.62, 4.55,4.52,4.54,4.53,4.56])
