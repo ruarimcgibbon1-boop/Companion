@@ -94,6 +94,10 @@ const MIN_STOP_PCT = 0.015
 // runnable triggers sat 0.6–2.4% above the zone; the dead 8–10% chases — PRME
 // EMA21, ELTX pullback — get dropped.)
 const MAX_TRIGGER_EXTENSION_PCT = 0.04
+// Sum of the last 5 bars' dollar volume below which a name is untradeable. Low
+// by design: it screens out dead tickers (few-hundred-share bars) without
+// touching genuine low-float runners, which clear it many times over.
+const MIN_RECENT_DOLLAR_VOL = 50_000
 
 function sessionHigh(candles: Candle[]): number {
   let h = 0
@@ -540,6 +544,15 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   const zoneLower = vwap - band
   const zoneUpper = vwap + band
   const above = price >= vwap
+  // A VWAP *bounce* only makes sense in an intraday uptrend. Alone among the
+  // long-bounce detectors, detectVwap had no trend filter, so it fired on any
+  // name near VWAP — including ones that had topped and were fading straight
+  // through it. 2026-07-14 was 53/54 vwap_bounces and most losers were exactly
+  // this: a "bounce" bought into a 5-min downtrend (GLOO/LHAI/NXTC/TRNR/SOBR/…).
+  // Match the guard every sibling has (detectEmaBounce/detectPullback). The
+  // reclaim-from-below subtype keeps its own volume-expansion gate, so only the
+  // above-VWAP bounce is filtered here.
+  if (above && t.trend5m === 'down') return null
   const type: SetupType = above ? 'vwap_bounce' : 'vwap_reclaim'
   const direction: SetupDirection = 'long'
   const invalidation = above ? zoneLower - band : vwap - band * 2
@@ -783,6 +796,17 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
     const hi = Math.max(...recent.map(c => c.high))
     const lo = Math.min(...recent.map(c => c.low))
     if (hi > 0 && (ctx.price > hi * 1.1 || ctx.price < lo * 0.9)) return []
+  }
+  // Liquidity floor: a name printing a few hundred shares a bar can't be filled,
+  // so a "signal" on it is noise that only pollutes the log. 2026-07-14 logged
+  // entries on WFF/AMPGZ/DCX/late-EDBL (recent $-vol well under $30k) that no one
+  // could trade. Require a small floor of recent dollar volume. Set deliberately
+  // low — real movers (even thin low-floats) clear it by orders of magnitude
+  // ($5M+ over 5 bars), so this only removes the truly dead, never a runner.
+  const liq = lastN(ctx.candles, 5)
+  if (liq.length >= 5) {
+    const dollarVol = liq.reduce((s, c) => s + c.volume * c.close, 0)
+    if (dollarVol < MIN_RECENT_DOLLAR_VOL) return []
   }
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),

@@ -156,6 +156,31 @@ describe('data-integrity gate', () => {
   })
 })
 
+describe('liquidity floor', () => {
+  it('builds no setups on an untradeable name (recent $-vol under the floor)', () => {
+    const thin = bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0]).map(c => ({ ...c, volume: 300 }))
+    expect(detectSetups(ctx(thin, 5.0)).length).toBe(0)          // ~300 sh × $5 × 5 bars ≈ $7.5k < $50k
+  })
+  it('still trades the same shape at normal volume', () => {
+    const liquid = bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0])  // 100k sh/bar default
+    expect(detectSetups(ctx(liquid, 5.0)).length).toBeGreaterThan(0)
+  })
+})
+
+describe('detectVwap trend guard', () => {
+  it('does not fire a vwap_bounce when the 5-min trend is down (fade, not a bounce)', () => {
+    // price sitting just above VWAP (4.9) but the immediate trend has rolled over
+    const c = bars([5.2, 5.1, 5.05, 5.0, 4.95, 4.92, 4.93])
+    const setups = detectSetups(ctx(c, 4.93, { technical: technical({ trend5m: 'down' }) }))
+    expect(setups.some(s => s.type === 'vwap_bounce')).toBe(false)
+  })
+  it('still fires a vwap_bounce when the trend is up', () => {
+    const c = bars([4.7, 4.8, 4.85, 4.88, 4.9, 4.92, 4.93])
+    const setups = detectSetups(ctx(c, 4.93, { technical: technical({ trend5m: 'up' }) }))
+    expect(setups.some(s => s.type === 'vwap_bounce')).toBe(true)
+  })
+})
+
 describe('new momentum setups', () => {
   it('detects a bull flag — sharp pole then a tight consolidation', () => {
     const c = bars([3.98,4.08,4.20,4.30,4.42,4.50,4.56,4.60,4.62, 4.55,4.52,4.54,4.53,4.56])
