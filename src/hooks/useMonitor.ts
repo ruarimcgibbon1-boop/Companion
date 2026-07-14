@@ -165,6 +165,45 @@ function recentlyFailedBounce(sym: string, now: number, states: SetupStateRecord
     now - r.updatedAt < STANDDOWN_MS)
 }
 
+// ── Per-symbol trade cap ─────────────────────────────────────────────────────
+// The failed-bounce stand-down above only arms on *bounce* failures and only
+// blocks *bounce* re-fires. 2026-07-13 BRAI slipped straight through it: BRAI
+// isn't a bounce name, it fired 6× as momentum, blew off to $11.33, and after
+// its 11:07 entry was flagged-then-failed the scanner still re-fired at 11:16
+// and 11:17 for −5.7% / −4.5%. So cap re-firing on the *symbol*, any setup type:
+//   • one losing entry — INCLUDING an entry we only flagged (qualityVetoed) —
+//     stands the whole name down (gap A: a flag that then hits its stop is still
+//     a loss and must arm the stand-down),
+//   • or two banked wins stand it down too (gap C: stop pressing a name that's
+//     already paid out twice — the third+ fire is the late chase that gives it
+//     back).
+// A loss is precise: a setup we actually logged an entry for whose state has
+// since gone 'failed'. Wins count any setup on the name that banked a target.
+const SYMBOL_CAP_MS = 120 * 60 * 1000 // same session window as the bounce stand-down
+const SYMBOL_WIN_CAP = 2
+
+function symbolCapReached(
+  sym: string,
+  now: number,
+  states: SetupStateRecord[],
+  buys: BuySignalRecord[],
+): boolean {
+  const failedRecently = new Set(
+    states
+      .filter(r => r.state === 'failed' && now - r.updatedAt < SYMBOL_CAP_MS)
+      .map(r => r.id),
+  )
+  const hasLoss = buys.some(
+    b => b.symbol === sym && now - b.timestamp < SYMBOL_CAP_MS && failedRecently.has(b.setupId),
+  )
+  if (hasLoss) return true
+
+  const wins = states.filter(
+    r => r.symbol === sym && r.targetsHitAlerted > 0 && now - r.updatedAt < SYMBOL_CAP_MS,
+  ).length
+  return wins >= SYMBOL_WIN_CAP
+}
+
 // ── Hook ────────────────────────────────────────────────────────────────────
 
 export function useMonitor() {
@@ -247,11 +286,14 @@ export function useMonitor() {
           // segmented at review. The per-symbol entry-cluster dedup still collapses
           // the poll/detector spam so one idea logs once.
           // Stand down a symbol's bounce setups after a bounce on it just failed.
+          const allStates = [...Object.values(s.setupStates), ...Object.values(setupStates)]
+          const allBuys = [...s.buySignals, ...newBuySignals]
           const standDown = BOUNCE_TYPES.has(setup.type) &&
-            recentlyFailedBounce(setup.symbol, now, [...Object.values(s.setupStates), ...Object.values(setupStates)])
+            recentlyFailedBounce(setup.symbol, now, allStates)
+          const capped = symbolCapReached(setup.symbol, now, allStates, allBuys)
           if (
-            setup.direction === 'long' && setup.triggeredRaw && !standDown &&
-            !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, [...s.buySignals, ...newBuySignals])
+            setup.direction === 'long' && setup.triggeredRaw && !standDown && !capped &&
+            !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, allBuys)
           ) {
             // Record the fill you'd get entering on the trigger, and an R/R honest
             // to that entry — not the (often unreachable) zone bottom.
