@@ -32,6 +32,7 @@ export interface DetectionContext {
   spreadPct: number | null
   changePct: number
   session: SessionType       // premarket detectors gate on this
+  minutesSinceOpen: number | null  // minutes past the 09:30 open (null outside RTH); gates the opening lockout
 }
 
 // ── Small candle utilities ──────────────────────────────────────────────────
@@ -148,6 +149,19 @@ function pivots(cs: Candle[], k: number): { highs: { i: number; price: number }[
 // back <1.5 ATR is just breathing, not rolling over — the fixed 5% gate wrongly
 // flagged its winners. A quiet name still trips at the 5% floor.
 const ROLLOVER_MIN_ATR = 1.5
+
+// The first minutes of RTH are a whipsaw graveyard for bounce entries: price is
+// finding its footing, VWAP/EMAs are noisy, and "bounces" get shaken out before
+// any real move. 2026-07-15's first 15 minutes were 3 wins / 10 losses (net
+// −12.6%, nearly the whole day's damage), while the day's best trade (NVVE +6.4%)
+// came at 09:47, just past the window. So lock OUT bounce *triggers* (they stay
+// visible as watches) for the opening window — the open belongs to breakouts, not
+// dip-buys. Momentum detectors (ORB/HOD/breakout) are unaffected.
+const OPEN_BOUNCE_LOCKOUT_MIN = 15
+
+function openBounceLockout(ctx: DetectionContext): boolean {
+  return ctx.session === 'regular' && ctx.minutesSinceOpen != null && ctx.minutesSinceOpen < OPEN_BOUNCE_LOCKOUT_MIN
+}
 
 // Past this multiple of the (already ATR-scaled) threshold, price is deep enough
 // off the high that the 4-bar rollingOver() confirmation becomes redundant — and,
@@ -413,7 +427,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const confirming = makingHigherLows(candles) && volumeContracting(candles)
   const reclaim = lastCandle ? lastCandle.close > zoneUpper : false
-  const triggered = reclaim && volumeExpanding(candles) && makingHigherLows(candles)
+  const triggered = reclaim && volumeExpanding(candles) && makingHigherLows(candles) && !openBounceLockout(ctx)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) +
     (volumeContracting(candles) ? 1 : 0) +
@@ -494,13 +508,20 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   if (session !== 'premarket') return null
   const pmHigh = sl.premarketHigh
   const prevClose = sl.previousClose
-  if (pmHigh == null || prevClose == null || prevClose <= 0 || candles.length < 3) return null
+  if (pmHigh == null || prevClose == null || prevClose <= 0 || candles.length < 4) return null
 
   // Real gapper in play, and holding above premarket VWAP (buyers in control).
   const gapPct = ((price - prevClose) / prevClose) * 100
   if (gapPct < PREMARKET_MIN_GAP_PCT) return null
   const vwap = sl.vwap
   if (vwap != null && price < vwap) return null
+
+  // Anti-spike: premarket "breakouts" are mostly a single print tagging the high
+  // then reversing (thin book) — those don't hold into the open. Demand that price
+  // was COILING near the premarket high first (a base), not spiking through it from
+  // far below. The bars before the break must have reached within ~3% of the high.
+  const priorHigh = Math.max(...candles.slice(0, -1).map(c => c.high))
+  if ((pmHigh - priorHigh) / pmHigh > 0.03) return null
 
   // Break level = the premarket high; clearing the prior-day high too is extra strength.
   const band = (t.atr ?? price * 0.01) * 0.3
@@ -712,7 +733,7 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
   const lastCandle = candles[candles.length - 1]
   const holding = lastCandle ? lastCandle.close > ema : false
   const confirming = (price >= zoneLower && price <= zoneUpper) && makingHigherLows(candles)
-  const triggered = holding && volumeExpanding(candles) && makingHigherLows(candles) && price > zoneUpper
+  const triggered = holding && volumeExpanding(candles) && makingHigherLows(candles) && price > zoneUpper && !openBounceLockout(ctx)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) + (holding ? 1 : 0) + (volumeContracting(candles) ? 1 : 0)
 
@@ -777,9 +798,9 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const reclaimed = lastCandle ? lastCandle.close > vwap : false
   const confirming = Math.abs(price - vwap) / vwap < (band / vwap) && makingHigherLows(candles)
-  const triggered = above
+  const triggered = (above
     ? reclaimed && makingHigherLows(candles) && volumeContracting(candles) && price > zoneUpper
-    : reclaimed && volumeExpanding(candles) && price > vwap
+    : reclaimed && volumeExpanding(candles) && price > vwap) && !openBounceLockout(ctx)
   const signals =
     (reclaimed ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0) +
     (above ? (volumeContracting(candles) ? 1 : 0) : (volumeExpanding(candles) ? 1 : 0))

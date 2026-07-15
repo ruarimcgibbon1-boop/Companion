@@ -46,7 +46,7 @@ function ctx(candles: Candle[], price: number, over: Partial<DetectionContext> =
   return {
     symbol: 'TEST', price, candles, sessionLevels: sl, technical: t, levels,
     catalystScore: 10, hasCatalyst: true, spreadPct: 0.15, changePct: 6,
-    session: 'regular', ...over,
+    session: 'regular', minutesSinceOpen: 60, ...over,
   }
 }
 
@@ -179,6 +179,25 @@ describe('detectVwap trend guard', () => {
     const c = bars([4.7, 4.8, 4.85, 4.88, 4.9, 4.92, 4.93])
     const setups = detectSetups(ctx(c, 4.93, { technical: technical({ trend5m: 'up' }) }))
     expect(setups.some(s => s.type === 'vwap_bounce')).toBe(true)
+  })
+})
+
+describe('opening-window bounce lockout', () => {
+  // Rising above a VWAP anchored below price, on CONTRACTING volume → a real
+  // vwap_bounce trigger when not locked out.
+  const vb = [4.80, 4.83, 4.86, 4.88, 4.90, 4.91, 4.93].map((c, i) => ({
+    time: 1_700_000_000 + i * 300, open: c - 0.005, high: c + 0.01, low: c - 0.005, close: c,
+    volume: 200_000 - i * 18_000, // contracting into the reclaim
+  }))
+  const over = { sessionLevels: session({ vwap: 4.85 }) }
+
+  it('does NOT trigger a bounce BUY in the first 15 minutes of RTH (open whipsaw)', () => {
+    const vbSetup = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 5 })).find(s => s.type === 'vwap_bounce')
+    if (vbSetup) expect(vbSetup.triggeredRaw).toBe(false) // still a visible watch, just no BUY
+  })
+  it('allows the bounce BUY once past the opening window', () => {
+    const setups = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20 }))
+    expect(setups.some(s => s.type === 'vwap_bounce' && s.triggeredRaw)).toBe(true)
   })
 })
 

@@ -68,6 +68,15 @@ export function isPremarket(ts: number, config = DEFAULT_SESSION_CONFIG): boolea
   return getSessionType(ts, config) === 'premarket'
 }
 
+/** Minutes elapsed since the 09:30 ET open, or null outside regular hours. */
+export function minutesSinceOpen(ts: number = Date.now(), config = DEFAULT_SESSION_CONFIG): number | null {
+  if (getSessionType(ts, config) !== 'regular') return null
+  const hhmm = etHHMM(ts)
+  const cur = Math.floor(hhmm / 100) * 60 + (hhmm % 100)
+  const open = Math.floor(config.regularStartHHMM / 100) * 60 + (config.regularStartHHMM % 100)
+  return cur - open
+}
+
 export function isRegularHours(ts: number, config = DEFAULT_SESSION_CONFIG): boolean {
   return getSessionType(ts, config) === 'regular'
 }

@@ -112,7 +112,7 @@ function makeContext(over: Partial<DetectionContext> = {}): DetectionContext {
   return {
     symbol: 'TEST', price: currentPrice, candles, sessionLevels: sl, technical, levels,
     catalystScore: 10, hasCatalyst: true, spreadPct: 0.15, changePct: 6,
-    session: 'regular', ...over,
+    session: 'regular', minutesSinceOpen: 60, ...over,
   }
 }
 
@@ -146,7 +146,7 @@ describe('setup detectors', () => {
     const sl = makeSessionLevels({ regularHigh: 5.05, or15High: 5.05, premarketHigh: 5.05 })
     const technical = makeTechnical({ atr: 0.06, distanceFromVwapPct: 3 })
     const levels = buildKeyLevels({ intraday: candles, daily: [], sessionLevels: sl, technical, currentPrice: 5.11 })
-    const setups = detectSetups({ symbol: 'BRK', price: 5.11, candles, sessionLevels: sl, technical, levels, catalystScore: 10, hasCatalyst: true, spreadPct: 0.1, changePct: 8, session: 'regular' })
+    const setups = detectSetups({ symbol: 'BRK', price: 5.11, candles, sessionLevels: sl, technical, levels, catalystScore: 10, hasCatalyst: true, spreadPct: 0.1, changePct: 8, session: 'regular', minutesSinceOpen: 60 })
     const breakout = setups.find(s => s.type === 'breakout')
     // A breakout setup should exist and be in an advanced state (triggered/confirming/at level)
     if (breakout) {
@@ -166,7 +166,7 @@ describe('setup detectors', () => {
     const sl = makeSessionLevels({ vwap: 4.9 })
     const technical = makeTechnical({ vwap: 4.9, trend5m: 'up', vwapCrossCount: 2 })
     const levels = buildKeyLevels({ intraday: candles, daily: [], sessionLevels: sl, technical, currentPrice: 4.96 })
-    const setups = detectSetups({ symbol: 'VW', price: 4.96, candles, sessionLevels: sl, technical, levels, catalystScore: 8, hasCatalyst: true, spreadPct: 0.15, changePct: 4, session: 'regular' })
+    const setups = detectSetups({ symbol: 'VW', price: 4.96, candles, sessionLevels: sl, technical, levels, catalystScore: 8, hasCatalyst: true, spreadPct: 0.15, changePct: 4, session: 'regular', minutesSinceOpen: 60 })
     const vwap = setups.find(s => s.type === 'vwap_bounce' || s.type === 'vwap_reclaim')
     expect(vwap).toBeTruthy()
   })

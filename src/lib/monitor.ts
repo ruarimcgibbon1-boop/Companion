@@ -17,7 +17,7 @@ import { calculateSessionLevels, calculateTechnical } from './technical'
 import { buildKeyLevels } from './levels-engine'
 import { detectSetups, type DetectionContext } from './setup-detectors'
 import { buildRoadmap } from './roadmap-engine'
-import { getSessionType } from './market-hours'
+import { getSessionType, minutesSinceOpen } from './market-hours'
 import { cache, cached, TTL } from './cache'
 
 function toCandles(raw: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>): Candle[] {
@@ -114,6 +114,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       spreadPct: null,     // real-time spread not available from this feed — honestly null
       changePct: quote?.changePercentage ?? 0,
       session: getSessionType(),
+      minutesSinceOpen: minutesSinceOpen(),
     }
     if (!hasCatalyst) missing.push('catalyst / news')
 
