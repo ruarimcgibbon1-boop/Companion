@@ -45,7 +45,8 @@ function ctx(candles: Candle[], price: number, over: Partial<DetectionContext> =
   const levels = buildKeyLevels({ intraday: candles, daily: [], sessionLevels: sl, technical: t, currentPrice: price })
   return {
     symbol: 'TEST', price, candles, sessionLevels: sl, technical: t, levels,
-    catalystScore: 10, hasCatalyst: true, spreadPct: 0.15, changePct: 6, ...over,
+    catalystScore: 10, hasCatalyst: true, spreadPct: 0.15, changePct: 6,
+    session: 'regular', ...over,
   }
 }
 
@@ -222,6 +223,28 @@ describe('HOD-break continuation', () => {
   it('does NOT fire when the 5-min trend is down', () => {
     const setups = detectSetups(ctx(laddered, 5.10, { technical: technical({ trend5m: 'down' }) }))
     expect(setups.some(s => s.type === 'hod_break')).toBe(false)
+  })
+})
+
+describe('premarket breakout', () => {
+  // Gapper pushing through its premarket high (session: premarketHigh 5.1, previousClose 4.7 → ~+9% gap).
+  const gapper = bars([4.9, 4.95, 5.0, 5.05, 5.1, 5.08, 5.15]).map((c, i, a) =>
+    i === a.length - 1 ? { ...c, volume: 400_000 } : c)
+
+  it('fires a triggered premarket_breakout on a gapper breaking the PM high above VWAP', () => {
+    const setups = detectSetups(ctx(gapper, 5.15, { session: 'premarket' }))
+    const s = setups.find(x => x.type === 'premarket_breakout')
+    expect(s).toBeTruthy()
+    expect(s!.triggeredRaw).toBe(true)
+  })
+  it('does NOT fire during regular hours (ORB owns the open)', () => {
+    const setups = detectSetups(ctx(gapper, 5.15, { session: 'regular' }))
+    expect(setups.some(s => s.type === 'premarket_breakout')).toBe(false)
+  })
+  it('does NOT fire without a real gap (previousClose near price)', () => {
+    // previousClose bumped to 5.10 → gap < 4%
+    const setups = detectSetups(ctx(gapper, 5.15, { session: 'premarket', sessionLevels: session({ previousClose: 5.10 }) }))
+    expect(setups.some(s => s.type === 'premarket_breakout')).toBe(false)
   })
 })
 

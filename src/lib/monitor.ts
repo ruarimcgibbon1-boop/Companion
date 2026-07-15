@@ -113,6 +113,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       hasCatalyst,
       spreadPct: null,     // real-time spread not available from this feed — honestly null
       changePct: quote?.changePercentage ?? 0,
+      session: getSessionType(),
     }
     if (!hasCatalyst) missing.push('catalyst / news')
 

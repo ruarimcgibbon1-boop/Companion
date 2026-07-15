@@ -14,6 +14,7 @@
 export type SetupType =
   | 'pullback'
   | 'breakout'
+  | 'premarket_breakout'
   | 'opening_range_break'
   | 'hod_break'
   | 'bull_flag'
@@ -364,6 +365,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   setupTypes: {
     pullback: true,
     breakout: true,
+    premarket_breakout: true,
     opening_range_break: true,
     hod_break: true,
     bull_flag: true,
@@ -453,6 +455,7 @@ export interface BuySignalRecord {
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   pullback: 'Pullback',
   breakout: 'Breakout',
+  premarket_breakout: 'Premarket Breakout',
   opening_range_break: 'Opening-Range Break',
   hod_break: 'HOD Break',
   bull_flag: 'Bull Flag',

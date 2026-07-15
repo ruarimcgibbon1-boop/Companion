@@ -18,6 +18,7 @@ import type {
 import { scoreSetup, type ScoringContext } from './scoring-matrix'
 import { approachThresholdPct } from './adaptive-threshold'
 import { deriveSignal } from './signals'
+import type { SessionType } from './market-hours'
 
 export interface DetectionContext {
   symbol: string
@@ -30,6 +31,7 @@ export interface DetectionContext {
   hasCatalyst: boolean
   spreadPct: number | null
   changePct: number
+  session: SessionType       // premarket detectors gate on this
 }
 
 // ── Small candle utilities ──────────────────────────────────────────────────
@@ -477,6 +479,77 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
     confirming,
     notes: res.touches >= 3 ? 'Multiple tests — higher false-breakout risk; demand volume + close.' : 'Fresh level — cleaner breakout odds.',
     risks: res.touches >= 3 ? ['Level tested repeatedly — false-breakout risk'] : [],
+  })
+}
+
+// Premarket breakout. The day's biggest movers usually set up before 09:30: a
+// name gapping on a catalyst that pushes through its premarket high while holding
+// premarket VWAP is the earliest read on a runner. This fires ONLY in premarket
+// (RTH hands off to the ORB detector at the open) and demands a real gap + a VWAP
+// hold, so it flags the in-play gappers and stays quiet on names drifting on air.
+const PREMARKET_MIN_GAP_PCT = 4 // must have gapped this much vs prior close to be "in play"
+
+function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, sessionLevels: sl, candles, session } = ctx
+  if (session !== 'premarket') return null
+  const pmHigh = sl.premarketHigh
+  const prevClose = sl.previousClose
+  if (pmHigh == null || prevClose == null || prevClose <= 0 || candles.length < 3) return null
+
+  // Real gapper in play, and holding above premarket VWAP (buyers in control).
+  const gapPct = ((price - prevClose) / prevClose) * 100
+  if (gapPct < PREMARKET_MIN_GAP_PCT) return null
+  const vwap = sl.vwap
+  if (vwap != null && price < vwap) return null
+
+  // Break level = the premarket high; clearing the prior-day high too is extra strength.
+  const band = (t.atr ?? price * 0.01) * 0.3
+  const zoneUpper = pmHigh
+  const zoneLower = pmHigh - Math.max(band, price * 0.006)
+  const invalidation = pmHigh - Math.max((t.atr ?? price * 0.01) * 0.5, price * 0.01)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > pmHigh : false
+  const rvol = t.relativeVolume ?? 0
+  // Premarket volume is thin — accept a bar-over-bar expansion OR elevated RVOL.
+  const volumeOk = volumeExpanding(candles) || rvol >= 1.5
+  const triggered = closedAbove && price > pmHigh && volumeOk
+  const confirming = price >= zoneLower && price <= zoneUpper
+  const pdh = sl.previousDayHigh
+  const signals =
+    (closedAbove ? 1 : 0) + (volumeOk ? 1 : 0) +
+    (vwap != null && price > vwap ? 1 : 0) + (pdh != null && price > pdh ? 1 : 0)
+
+  // Targets: prior-day high (the classic gap target) then measured moves off the gap.
+  const range = Math.max((t.atr ?? price * 0.02) * 2, price * 0.02)
+  const extraTargets: number[] = []
+  if (pdh != null && pdh > price * 1.002) extraTargets.push(pdh)
+  extraTargets.push(pmHigh + range, pmHigh + range * 2)
+
+  return buildSetup({
+    ctx, type: 'premarket_breakout', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Premarket breakout — gapped +${gapPct.toFixed(0)}% and pushing through the premarket high $${pmHigh.toFixed(2)}${vwap != null ? `, holding above PM VWAP $${vwap.toFixed(2)}` : ''}. RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle CLOSE above the premarket high $${pmHigh.toFixed(2)}`,
+      'Real volume behind the push (premarket is thin — demand bids)',
+      'Holds the gap and PM VWAP into the 09:30 open',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeOk,
+      unusualVolume: rvol > 3,
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: 'Premarket: thin liquidity and wide spreads — size down and expect slippage. Strongest when it holds the gap into the open.',
+    risks: [
+      'Premarket liquidity is thin — fills and stops are unreliable',
+      ...(rvol < 1.5 ? ['Light premarket volume — the gap may fade at the open'] : []),
+    ],
   })
 }
 
@@ -954,6 +1027,7 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
     detectBreakout(ctx),
+    detectPremarketBreakout(ctx),
     detectOpeningRangeBreak(ctx),
     detectHodBreak(ctx),
     detectBullFlag(ctx),
