@@ -203,6 +203,28 @@ describe('opening-range break / gap-and-go', () => {
   })
 })
 
+describe('HOD-break continuation', () => {
+  // Ran to ~5.02, coiled tight just under it for a few bars, then breaks on volume.
+  const laddered = bars([4.5, 4.7, 4.9, 5.0, 4.98, 5.0, 4.99, 5.10]).map((c, i, a) =>
+    i === a.length - 1 ? { ...c, volume: 350_000 } : c)
+
+  it('fires a triggered hod_break on a new-high push out of a tight base, on volume', () => {
+    const setups = detectSetups(ctx(laddered, 5.10, { technical: technical({ trend5m: 'up' }) }))
+    const s = setups.find(x => x.type === 'hod_break')
+    expect(s).toBeTruthy()
+    expect(s!.triggeredRaw).toBe(true)
+  })
+  it('does NOT fire on a vertical run into the high (no base = chase / blow-off)', () => {
+    const ramp = bars([4.0, 4.2, 4.4, 4.6, 4.8, 5.0, 5.1, 5.2]).map((c, i, a) =>
+      i === a.length - 1 ? { ...c, volume: 350_000 } : c)
+    expect(detectSetups(ctx(ramp, 5.2)).some(s => s.type === 'hod_break')).toBe(false)
+  })
+  it('does NOT fire when the 5-min trend is down', () => {
+    const setups = detectSetups(ctx(laddered, 5.10, { technical: technical({ trend5m: 'down' }) }))
+    expect(setups.some(s => s.type === 'hod_break')).toBe(false)
+  })
+})
+
 describe('new momentum setups', () => {
   it('detects a bull flag — sharp pole then a tight consolidation', () => {
     const c = bars([3.98,4.08,4.20,4.30,4.42,4.50,4.56,4.60,4.62, 4.55,4.52,4.54,4.53,4.56])

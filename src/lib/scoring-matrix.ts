@@ -56,6 +56,7 @@ const WEIGHTS: Record<SetupType, ScoreBreakdown> = {
   pullback:            w(20, 15, 13, 12, 8, 17, 10, 5),
   breakout:            w(22, 12, 18, 8, 9, 14, 12, 5),
   opening_range_break: w(14, 14, 20, 15, 10, 14, 8, 5),
+  hod_break:           w(16, 14, 19, 16, 8, 13, 9, 5),
   bull_flag:           w(14, 16, 18, 13, 8, 14, 12, 5),
   break_of_structure:  w(16, 15, 17, 15, 8, 13, 11, 5),
   ema9_bounce:         w(16, 16, 18, 14, 6, 14, 10, 6),

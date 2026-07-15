@@ -551,6 +551,78 @@ function detectOpeningRangeBreak(ctx: DetectionContext): DetectedSetup | null {
   })
 }
 
+// High-of-day break continuation. On a trend day a strong name makes a LADDER of
+// new highs — each break of the prior HOD after a tight base is a continuation
+// thrust. We only ever caught these on the pullback (and the ORB catches just the
+// first push), so the mid-trend breaks were missed entirely (HODO laddered
+// 1.25→1.85 on 2026-07-14 and we only got its dips). The tight-base requirement
+// doubles as the anti-blow-off filter: a vertical climax spike has no base under
+// its high, so it never qualifies — we break WITH the trend, not into the top tick.
+function detectHodBreak(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles } = ctx
+  if (candles.length < 6) return null
+  if (t.trend5m === 'down') return null
+
+  // The HOD to break = highest high EXCLUDING the current bar, so a push to a new
+  // high is a genuine break rather than just the running max.
+  const prior = candles.slice(0, -1)
+  const hod = Math.max(...prior.map(c => c.high))
+  if (!(hod > 0)) return null
+
+  // Require a tight base sitting just under the HOD — price coiled below the high,
+  // not a vertical run into it (a chase) or a blow-off spike (which has no base).
+  const atrFrac = (t.atr ?? price * 0.01) / price
+  const base = lastN(prior, 4)
+  const baseHigh = Math.max(...base.map(c => c.high))
+  const baseLow = Math.min(...base.map(c => c.low))
+  const tightBase = baseHigh > 0 && (baseHigh - baseLow) / baseHigh < Math.max(0.025, atrFrac * 1.5)
+  const baseNearHod = (hod - baseHigh) / hod < 0.02
+  if (!tightBase || !baseNearHod) return null
+
+  const band = (t.atr ?? price * 0.01) * 0.3
+  const zoneUpper = hod
+  const zoneLower = hod - Math.max(band, price * 0.004)
+  const invalidation = baseLow - Math.max((t.atr ?? price * 0.01) * 0.4, price * 0.004)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > hod : false
+  const rvol = t.relativeVolume ?? 0
+  const triggered = closedAbove && price > hod && volumeExpanding(candles) && makingHigherLows(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
+  const signals =
+    (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
+    (rvol >= 2 ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
+
+  // Measured-move targets: the base height projected above the break (a new HOD
+  // breaks into clean air with no levels overhead).
+  const baseRange = Math.max(baseHigh - baseLow, price * 0.01)
+  const extraTargets = [hod + baseRange, hod + baseRange * 2]
+
+  return buildSetup({
+    ctx, type: 'hod_break', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `High-of-day break — tight base under $${hod.toFixed(2)} then a push through it. Trend ${t.trend15m}, RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle CLOSE above the HOD $${hod.toFixed(2)} (not an intrabar tag)`,
+      'Volume expands on the break bar',
+      'Base holds — no failed break back under it',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      constructiveConsolidation: true,
+      unusualVolume: rvol > 3,
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: 'Continuation: buy the break with the trend, trail under each new base. Skips vertical blow-offs (no base).',
+    risks: rvol < 1.5 ? ['Light relative volume — new-high break may fail'] : [],
+  })
+}
+
 function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): DetectedSetup | null {
   const { price, technical: t, candles } = ctx
   const ema = which === 'ema9' ? t.ema9 : t.ema20
@@ -883,6 +955,7 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
     detectPullback(ctx),
     detectBreakout(ctx),
     detectOpeningRangeBreak(ctx),
+    detectHodBreak(ctx),
     detectBullFlag(ctx),
     detectBreakOfStructure(ctx),
     detectEmaBounce(ctx, 'ema9'),
