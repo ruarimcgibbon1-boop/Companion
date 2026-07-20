@@ -295,14 +295,19 @@ export function useMonitor() {
           const standDown = BOUNCE_TYPES.has(setup.type) &&
             recentlyFailedBounce(setup.symbol, now, allStates)
           const capped = symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys)
+          // The fill you'd actually get entering on the trigger — not the (often
+          // unreachable) zone bottom. Computed BEFORE the dedup because the dedup
+          // must compare like for like: it previously passed `zoneUpper` while the
+          // record stored `entryFill`, so once price ran above the zone the two
+          // differed by more than the 3% similarity window and nothing deduped.
+          // 2026-07-20 GMM logged 7 signals — ema9 three times in 28 seconds, plus
+          // ORB + ema21 + pullback all on the same 12:44:35 fill.
+          const fill = setup.entryFill ?? setup.zoneUpper
           if (
             setup.direction === 'long' && setup.triggeredRaw && !setup.qualityVetoed &&
             !standDown && !capped &&
-            !isDuplicateBuy(setup.symbol, setup.zoneUpper, now, allBuys)
+            !isDuplicateBuy(setup.symbol, fill, now, allBuys)
           ) {
-            // Record the fill you'd get entering on the trigger, and an R/R honest
-            // to that entry — not the (often unreachable) zone bottom.
-            const fill = setup.entryFill ?? setup.zoneUpper
             const t1 = setup.targets[0]?.price ?? null
             const rr = t1 != null && fill > setup.stopReference
               ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
