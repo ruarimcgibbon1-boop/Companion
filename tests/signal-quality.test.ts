@@ -189,11 +189,12 @@ describe('detectVwap trend guard', () => {
 })
 
 describe('opening-window bounce lockout', () => {
-  // Rising above a VWAP anchored below price, on CONTRACTING volume → a real
-  // vwap_bounce trigger when not locked out.
+  // Rising above a VWAP anchored below price: volume dries up INTO the pullback
+  // then SPIKES on the reclaim bar — the shape a real vwap_bounce requires.
+  const vbVols = [200_000, 180_000, 160_000, 140_000, 120_000, 100_000, 400_000]
   const vb = [4.80, 4.83, 4.86, 4.88, 4.90, 4.91, 4.93].map((c, i) => ({
     time: 1_700_000_000 + i * 300, open: c - 0.005, high: c + 0.01, low: c - 0.005, close: c,
-    volume: 200_000 - i * 18_000, // contracting into the reclaim
+    volume: vbVols[i],
   }))
   const over = { sessionLevels: session({ vwap: 4.85 }) }
 
@@ -204,6 +205,31 @@ describe('opening-window bounce lockout', () => {
   it('allows the bounce BUY once past the opening window', () => {
     const setups = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20 }))
     expect(setups.some(s => s.type === 'vwap_bounce' && s.triggeredRaw)).toBe(true)
+  })
+
+  it('does NOT trigger without a confirming volume surge on the bounce bar', () => {
+    // same shape but volume keeps declining through the reclaim — no confirmation
+    const noSurge = vb.map((c, i) => ({ ...c, volume: 200_000 - i * 18_000 }))
+    const s = detectSetups(ctx(noSurge, 4.93, { ...over, minutesSinceOpen: 20 })).find(x => x.type === 'vwap_bounce')
+    if (s) expect(s.triggeredRaw).toBe(false)
+  })
+
+  it('does NOT trigger a bounce on a dead-range name (ATR under the floor)', () => {
+    // atr 0.03 on ~4.93 ≈ 0.6% — too tight to respect the level
+    const s = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20, technical: technical({ atr: 0.03 }) }))
+      .find(x => x.type === 'vwap_bounce')
+    if (s) expect(s.triggeredRaw).toBe(false)
+  })
+
+  it('does NOT trigger a bounce on a chop day (VWAP crossed more than 3 times)', () => {
+    const s = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20, technical: technical({ vwapCrossCount: 6 }) }))
+      .find(x => x.type === 'vwap_bounce')
+    if (s) expect(s.triggeredRaw).toBe(false)
+  })
+
+  it('quarantines ema9_bounce triggers (still visible as a watch)', () => {
+    const setups = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20 }))
+    expect(setups.some(s => s.type === 'ema9_bounce' && s.triggeredRaw)).toBe(false)
   })
 })
 

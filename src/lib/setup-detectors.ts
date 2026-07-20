@@ -163,6 +163,45 @@ function openBounceLockout(ctx: DetectionContext): boolean {
   return ctx.session === 'regular' && ctx.minutesSinceOpen != null && ctx.minutesSinceOpen < OPEN_BOUNCE_LOCKOUT_MIN
 }
 
+// ── Bounce quality gates ─────────────────────────────────────────────────────
+// Bounces only pay on names that are actually MOVING. 2026-07-20 review (29
+// de-duplicated trades): ATR ≥3% won 75% (+4.10%/trade) while ATR <1.5% won 50%
+// but bled −0.67%/trade; price hugging VWAP (<2% away) won just 36% (−1.19%/
+// trade) versus 75% for names well clear of it. Published practice says the same
+// thing two ways — a "dead stock" in a tight range has too few participants to
+// respect the level, and a name crossing VWAP repeatedly has no trend at all, so
+// VWAP becomes a noise zone rather than a bounce zone. Both are chop; chop is
+// where this strategy bleeds.
+const BOUNCE_MIN_ATR_PCT = 0.015   // below this the range is too dead to pay
+const BOUNCE_MAX_VWAP_CROSSES = 3  // >3 crosses = chop day, don't buy dips
+
+function bounceQualityFail(ctx: DetectionContext): boolean {
+  const { price, technical: t } = ctx
+  const atrFrac = t.atr != null && price > 0 ? t.atr / price : null
+  if (atrFrac != null && atrFrac < BOUNCE_MIN_ATR_PCT) return true
+  if (t.vwapCrossCount > BOUNCE_MAX_VWAP_CROSSES) return true
+  return false
+}
+
+/** Every reason a long *bounce* trigger should be suppressed (setup stays visible). */
+function bounceBlocked(ctx: DetectionContext): boolean {
+  return openBounceLockout(ctx) || bounceQualityFail(ctx)
+}
+
+/** Volume dried up INTO the pullback — measured excluding the trigger bar, so a
+ *  big confirming bar doesn't mask the contraction that preceded it. */
+function volumeContractingBefore(candles: Candle[]): boolean {
+  return volumeContracting(candles.slice(0, -1))
+}
+
+// 2026-07-20: ema9_bounce was the worst performer by a wide margin — 25% win,
+// −3.80%/trade — and it failed precisely on the high-RVOL, high-ATR pumps the
+// gates above would still pass (ADVB rvol 18 lost −3.9%, ZYBT rvol 25 lost −8.0%).
+// Published practice agrees: the 9 EMA whips on small-cap news pumps because price
+// slices it every other candle. Quarantine its TRIGGERS — the setup stays visible
+// as a watch and keeps logging state, so we can keep measuring it. Flip to re-enable.
+const EMA9_BOUNCE_TRIGGERS_ENABLED = false
+
 // Past this multiple of the (already ATR-scaled) threshold, price is deep enough
 // off the high that the 4-bar rollingOver() confirmation becomes redundant — and,
 // worse, brittle: a single green bounce candle flips its net-down test and de-arms
@@ -427,7 +466,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const confirming = makingHigherLows(candles) && volumeContracting(candles)
   const reclaim = lastCandle ? lastCandle.close > zoneUpper : false
-  const triggered = reclaim && volumeExpanding(candles) && makingHigherLows(candles) && !openBounceLockout(ctx)
+  const triggered = reclaim && volumeExpanding(candles) && makingHigherLows(candles) && !bounceBlocked(ctx)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) +
     (volumeContracting(candles) ? 1 : 0) +
@@ -733,7 +772,9 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
   const lastCandle = candles[candles.length - 1]
   const holding = lastCandle ? lastCandle.close > ema : false
   const confirming = (price >= zoneLower && price <= zoneUpper) && makingHigherLows(candles)
-  const triggered = holding && volumeExpanding(candles) && makingHigherLows(candles) && price > zoneUpper && !openBounceLockout(ctx)
+  const triggered = holding && volumeExpanding(candles) && makingHigherLows(candles) &&
+    price > zoneUpper && !bounceBlocked(ctx) &&
+    (which === 'ema9' ? EMA9_BOUNCE_TRIGGERS_ENABLED : true)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) + (holding ? 1 : 0) + (volumeContracting(candles) ? 1 : 0)
 
@@ -798,9 +839,15 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const reclaimed = lastCandle ? lastCandle.close > vwap : false
   const confirming = Math.abs(price - vwap) / vwap < (band / vwap) && makingHigherLows(candles)
+  // The above-VWAP bounce previously asked only that volume CONTRACT into the
+  // zone — never that it confirm on the way out. Published practice is explicit
+  // that both halves are required: volume dries up on the pullback AND spikes on
+  // the bounce candle; without the surge it's a false signal. (The reclaim case
+  // already demanded expansion.)
   const triggered = (above
-    ? reclaimed && makingHigherLows(candles) && volumeContracting(candles) && price > zoneUpper
-    : reclaimed && volumeExpanding(candles) && price > vwap) && !openBounceLockout(ctx)
+    ? reclaimed && makingHigherLows(candles) && volumeContractingBefore(candles) &&
+      volumeExpanding(candles) && price > zoneUpper
+    : reclaimed && volumeExpanding(candles) && price > vwap) && !bounceBlocked(ctx)
   const signals =
     (reclaimed ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0) +
     (above ? (volumeContracting(candles) ? 1 : 0) : (volumeExpanding(candles) ? 1 : 0))
@@ -817,8 +864,8 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
     invalidation,
     testCount: tests,
     scoringOverrides: {
-      volumeContractsIntoZone: above && volumeContracting(candles),
-      volumeExpandsOnSignal: !above && volumeExpanding(candles),
+      volumeContractsIntoZone: above && volumeContractingBefore(candles),
+      volumeExpandsOnSignal: volumeExpanding(candles),
     },
     confirmationSignals: signals,
     triggered,
