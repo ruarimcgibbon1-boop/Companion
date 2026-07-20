@@ -264,7 +264,12 @@ export async function GET(request: Request) {
             : (q?.changePercentage ?? Number(g.changesPercentage ?? 0))
         }
 
-        const volume = pm?.volume ?? g.yfVolume ?? q?.volume ?? 0
+        // NOTE: `||` not `??` on purpose. The premarket candle sum comes back as 0
+        // (the Yahoo feed returns premarket bars with price but no volume), and `??`
+        // would treat that 0 as a real value — pinning every scanner row to vol 0 and
+        // rvol null, which silently broke the MinVol and High-RVOL filters. A zero
+        // here is always a data gap, so fall through to the quote's volume.
+        const volume = pm?.volume || g.yfVolume || q?.volume || 0
         // Prefer YF screener's 3-month average daily volume; fall back to FMP quote's.
         const avgVol = (g.yfAvgVolume && g.yfAvgVolume > 0) ? g.yfAvgVolume : (q?.averageVolume ?? 0)
         // Session-adjusted relative volume: today's volume vs the normal pace by this time.
