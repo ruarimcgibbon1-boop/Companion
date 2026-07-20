@@ -1042,8 +1042,15 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   // ($5M+ over 5 bars), so this only removes the truly dead, never a runner.
   const liq = lastN(ctx.candles, 5)
   if (liq.length >= 5) {
-    const dollarVol = liq.reduce((s, c) => s + c.volume * c.close, 0)
-    if (dollarVol < MIN_RECENT_DOLLAR_VOL) return []
+    // Some feeds (notably Yahoo premarket) return bars with price but volume 0.
+    // That's a DATA GAP, not illiquidity — gating on it silently blocked every
+    // setup on every symbol in premarket, which is why premarket_breakout could
+    // never fire. Only apply the floor when we actually have volume data.
+    const shareVol = liq.reduce((s, c) => s + c.volume, 0)
+    if (shareVol > 0) {
+      const dollarVol = liq.reduce((s, c) => s + c.volume * c.close, 0)
+      if (dollarVol < MIN_RECENT_DOLLAR_VOL) return []
+    }
   }
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
