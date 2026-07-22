@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getTopGainers, getMostActive, getBatchQuotes, getStockNews } from '@/lib/fmp-client'
+import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getSharesFloat } from '@/lib/fmp-client'
 import { getYFQuote, getYFScreener, getYFTrending, getYFCandles } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
 import { processNews } from '@/lib/news-engine'
@@ -18,6 +18,13 @@ function isExcluded(name: string, symbol: string, exchange?: string): boolean {
   const ex = (exchange ?? '').toUpperCase()
   if (ex === 'CRYPTO' || ex === 'FOREX' || ex === 'COMMODITY') return true
   return false
+}
+
+// FMP occasionally returns an implausibly small float for a micro-cap (a units
+// glitch, e.g. INLF at 4,263 shares). Anything under 10k isn't a real tradeable
+// float, so treat it as unknown rather than a fake "ultra low float" reading.
+function sanitizeFloat(v: number | null | undefined): number | null {
+  return v != null && v >= 10_000 ? v : null
 }
 
 function assignBadges(row: {
@@ -225,6 +232,18 @@ export async function GET(request: Request) {
       })
     )
 
+    // Float — a core "in play" dimension (low float = violent moves). Fetched from
+    // FMP shares-float, cached 6h since it changes only on filings. Some micro-caps
+    // return glitchy tiny values (e.g. INLF reported 4,263 shares); treat anything
+    // under 10k as bad data (null) rather than a fake ultra-low-float flag.
+    const floatMap = new Map<string, number | null>()
+    await Promise.allSettled(
+      symbols.map(async sym => {
+        const sf = await cached(`float:${sym}`, TTL.FLOAT, () => getSharesFloat(sym))
+        floatMap.set(sym, sanitizeFloat(sf?.floatShares ?? null))
+      })
+    )
+
     const rows: ScannerRow[] = universe
       .map((g: UniverseEntry, i: number) => {
         const q = quoteMap.get(g.symbol)
@@ -286,8 +305,13 @@ export async function GET(request: Request) {
         if (volume > 0 && volume < effectiveMinVolume) return null
         if (filters.minRelativeVolume > 0 && rvol !== null && rvol < filters.minRelativeVolume) return null
 
+        const float = floatMap.get(g.symbol) ?? null
+        // Only exclude on maxFloat when we actually know the float — never drop a
+        // name for missing data.
+        if (filters.maxFloat != null && float != null && float > filters.maxFloat) return null
+
         const catalystLabel = (newsMap.get(g.symbol) ?? 'No Recent Catalyst Found') as ScannerRow['catalystLabel']
-        const badges = assignBadges({ relativeVolume: rvol, changePct: absPct, catalystCategory: '', catalystLabel, float: null })
+        const badges = assignBadges({ relativeVolume: rvol, changePct: absPct, catalystCategory: '', catalystLabel, float })
 
         const premarketChange = pm ? pm.price - prevClose : null
         const premarketChangePct = pm && prevClose > 0 ? ((pm.price - prevClose) / prevClose) * 100 : null
@@ -300,7 +324,7 @@ export async function GET(request: Request) {
           changePct: inPremarket ? (premarketChangePct ?? changePct) : changePct,
           volume,
           relativeVolume: rvol,
-          float: null as number | null,
+          float,
           marketCap: g.yfMarketCap ?? q?.marketCap ?? null,
           exchange: g.exchange ?? '',
           catalystLabel,
