@@ -166,6 +166,15 @@ describe('liquidity floor', () => {
     const liquid = bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0])  // 100k sh/bar default
     expect(detectSetups(ctx(liquid, 5.0)).length).toBeGreaterThan(0)
   })
+  it('never emits a long target at or below the entry fill', () => {
+    // invariant: every target must be beyond the actual fill (2026-07-22 KUST/MWC/INM bug)
+    for (const p of [4.8, 5.0, 5.06]) {
+      for (const s of detectSetups(ctx(bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0]), p))) {
+        if (s.direction !== 'long') continue
+        for (const t of s.targets) expect(t.price).toBeGreaterThan(s.entryFill)
+      }
+    }
+  })
   it('does NOT block when the feed reports no volume at all (data gap, not illiquidity)', () => {
     // Yahoo premarket returns bars with price but volume 0 — gating on that
     // silently blocked every premarket setup on every symbol.

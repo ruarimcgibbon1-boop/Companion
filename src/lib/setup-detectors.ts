@@ -319,9 +319,15 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     ...(args.extraTargets ?? []).map(p => ({ price: p, label: 'measured move' })),
   ]
   const dirLong = direction === 'long'
+  // Targets must sit beyond the ACTUAL entry fill, not the current price. entryFill
+  // can be above price (a level-based zone the trigger closed through), so filtering
+  // on price let a "target" land between price and the fill — i.e. BELOW the entry.
+  // 2026-07-22 KUST/MWC/INM each logged a first target under their fill (negative
+  // rr), and one even booked a phantom +1.2% "win" hitting a target below entry.
+  const targetFloor = dirLong ? entryFill * 1.001 : entryFill * 0.999
   const picked: { price: number; label: string }[] = []
   for (const o of cand
-    .filter(o => dirLong ? o.price > price * 1.001 : o.price < price * 0.999)
+    .filter(o => dirLong ? o.price > targetFloor : o.price < targetFloor)
     .sort((a, b) => dirLong ? a.price - b.price : b.price - a.price)) {
     if (!picked.some(p => Math.abs(p.price - o.price) / o.price < 0.003)) picked.push(o)
   }
