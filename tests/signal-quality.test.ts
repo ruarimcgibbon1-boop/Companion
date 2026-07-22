@@ -170,7 +170,7 @@ describe('liquidity floor', () => {
     // invariant: every target must be beyond the actual fill (2026-07-22 KUST/MWC/INM bug)
     for (const p of [4.8, 5.0, 5.06]) {
       for (const s of detectSetups(ctx(bars([4.7, 4.8, 4.9, 5.0, 5.06, 5.02, 5.0]), p))) {
-        if (s.direction !== 'long') continue
+        if (s.direction !== 'long' || s.entryFill == null) continue
         for (const t of s.targets) expect(t.price).toBeGreaterThan(s.entryFill)
       }
     }

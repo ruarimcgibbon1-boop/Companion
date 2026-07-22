@@ -4,7 +4,10 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import type { ScannerRow } from '@/types'
 
-const SCAN_INTERVAL = 20_000 // 20s — keep the gainers column fresh
+const SCAN_INTERVAL = 20_000       // 20s — fast foreground refresh (pauses when the tab is hidden)
+const BACKGROUND_REFRESH = 300_000 // 5min — guaranteed full re-pull of the gainers universe, even
+                                   // when the tab is backgrounded, so the list is never more than
+                                   // ~5 min stale when you glance back to it.
 
 export function useScanner() {
   const {
@@ -16,6 +19,7 @@ export function useScanner() {
   } = useTradingStore()
 
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const bgTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
   const scan = useCallback(async (force = false) => {
@@ -57,11 +61,18 @@ export function useScanner() {
 
   useEffect(() => {
     scan()
-    timerRef.current = setInterval(scan, SCAN_INTERVAL)
+    timerRef.current = setInterval(() => scan(), SCAN_INTERVAL)
+    // Force a full re-pull on a fixed cadence regardless of tab visibility, so a
+    // backgrounded scanner still reflects the current gainers (the 20s poll above
+    // self-pauses when hidden). `force` bypasses both the hidden-tab guard and the
+    // server-side 20s cache.
+    bgTimerRef.current = setInterval(() => scan(true), BACKGROUND_REFRESH)
+    // On refocus, refresh immediately so there's no stale flash.
     const onVisible = () => { if (!document.hidden) scan() }
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
+      if (bgTimerRef.current) clearInterval(bgTimerRef.current)
       document.removeEventListener('visibilitychange', onVisible)
       abortRef.current?.abort()
     }
