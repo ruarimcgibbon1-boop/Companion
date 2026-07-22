@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server'
-import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getSharesFloat } from '@/lib/fmp-client'
+import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getPressReleases, getSharesFloat } from '@/lib/fmp-client'
 import { getYFQuote, getYFScreener, getYFTrending, getYFCandles } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
-import { processNews } from '@/lib/news-engine'
+import { processNews, getBestCatalystSummary } from '@/lib/news-engine'
 import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
 import { getSessionType, isPremarket } from '@/lib/market-hours'
 
@@ -222,15 +222,8 @@ export async function GET(request: Request) {
       }
     }
 
-    // News for top 8 only
-    const newsMap = new Map<string, string>()
-    await Promise.allSettled(
-      symbols.slice(0, 8).map(async sym => {
-        const news = await cached(`news:${sym}`, TTL.NEWS, () => getStockNews(sym, 5))
-        const processed = processNews(news, sym)
-        if (processed.length > 0) newsMap.set(sym, processed[0].quality)
-      })
-    )
+    // Catalyst is fetched AFTER ranking (below) — only for the rows we actually
+    // display — so every visible mover gets a news lookup, not just the first 8.
 
     // Float — a core "in play" dimension (low float = violent moves). Fetched from
     // FMP shares-float, cached 6h since it changes only on filings. Some micro-caps
@@ -310,9 +303,8 @@ export async function GET(request: Request) {
         // name for missing data.
         if (filters.maxFloat != null && float != null && float > filters.maxFloat) return null
 
-        const catalystLabel = (newsMap.get(g.symbol) ?? 'No Recent Catalyst Found') as ScannerRow['catalystLabel']
-        const badges = assignBadges({ relativeVolume: rvol, changePct: absPct, catalystCategory: '', catalystLabel, float })
-
+        // Catalyst + badges are attached after ranking (see below), so leave
+        // placeholders here.
         const premarketChange = pm ? pm.price - prevClose : null
         const premarketChangePct = pm && prevClose > 0 ? ((pm.price - prevClose) / prevClose) * 100 : null
 
@@ -327,11 +319,11 @@ export async function GET(request: Request) {
           float,
           marketCap: g.yfMarketCap ?? q?.marketCap ?? null,
           exchange: g.exchange ?? '',
-          catalystLabel,
+          catalystLabel: 'No Recent Catalyst Found' as const,
           catalystCategory: 'No Catalyst' as const,
           setupScore: 50,
           status: 'Developing' as const,
-          badges,
+          badges: [] as Badge[],
           lastUpdate: Date.now(),
           premarketChangePct,
           premarketChange,
@@ -346,6 +338,30 @@ export async function GET(request: Request) {
       .sort((a, b) => b.changePct - a.changePct)
       .slice(0, filters.maxResults)
       .map((r, i) => ({ ...r, rank: i + 1 }))
+
+    // Catalyst enrichment for the ranked rows only. Merge press-releases with the
+    // news feed (PR first — the original, freshest wire) so a gapper's actual
+    // headline drives the label, and derive the real category + quality via
+    // getBestCatalystSummary. Cached 3 min per symbol.
+    await Promise.allSettled(
+      rows.map(async r => {
+        const [pr, news] = await Promise.all([
+          cached(`pr:${r.symbol}`, TTL.NEWS, () => getPressReleases(r.symbol, 8)),
+          cached(`news:${r.symbol}`, TTL.NEWS, () => getStockNews(r.symbol, 8)),
+        ])
+        const processed = processNews([...pr, ...news], r.symbol)
+        const c = getBestCatalystSummary(processed)
+        r.catalystLabel = c.quality
+        r.catalystCategory = c.category
+        r.badges = assignBadges({
+          relativeVolume: r.relativeVolume,
+          changePct: Math.abs(r.changePct),
+          catalystCategory: c.category,
+          catalystLabel: c.quality,
+          float: r.float,
+        })
+      })
+    )
 
     return NextResponse.json({ rows, sessionType, timestamp: Date.now() })
   } catch (err) {
