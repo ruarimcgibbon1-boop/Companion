@@ -11,7 +11,7 @@
  */
 
 import type { Candle, MonitorResult, NewsItem } from '@/types'
-import { getQuote, getIntradayCandles, getDailyCandles } from './fmp-client'
+import { getQuote, getIntradayCandles, getDailyCandles, getFloatShares } from './fmp-client'
 import { getYFCandles, getYFQuote } from './yahoo-client'
 import { calculateSessionLevels, calculateTechnical } from './technical'
 import { buildKeyLevels } from './levels-engine'
@@ -101,6 +101,8 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
     const levels = buildKeyLevels({ intraday, daily, sessionLevels, technical, currentPrice: price })
 
     const { score: catalystScore, has: hasCatalyst } = cachedCatalystScore(sym)
+    // Float feeds the in-play gate. Shared 6h cache key with the scanner.
+    const float = await cached(`floatShares:${sym}`, TTL.FLOAT, () => getFloatShares(sym))
 
     const detCtx: DetectionContext = {
       symbol: sym,
@@ -115,6 +117,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       changePct: quote?.changePercentage ?? 0,
       session: getSessionType(),
       minutesSinceOpen: minutesSinceOpen(),
+      float,
     }
     if (!hasCatalyst) missing.push('catalyst / news')
 

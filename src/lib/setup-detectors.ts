@@ -33,6 +33,7 @@ export interface DetectionContext {
   changePct: number
   session: SessionType       // premarket detectors gate on this
   minutesSinceOpen: number | null  // minutes past the 09:30 open (null outside RTH); gates the opening lockout
+  float: number | null       // shares float (null when unknown); feeds the in-play gate
 }
 
 // ── Small candle utilities ──────────────────────────────────────────────────
@@ -189,7 +190,13 @@ function openBounceLockout(ctx: DetectionContext): boolean {
 // respect the level, and a name crossing VWAP repeatedly has no trend at all, so
 // VWAP becomes a noise zone rather than a bounce zone. Both are chop; chop is
 // where this strategy bleeds.
-const BOUNCE_MIN_ATR_PCT = 0.015   // below this the range is too dead to pay
+// The ATR floor was a blunt PROXY for "is this name actually moving?" — and on
+// low-volatility days it starved the book (2026-07-22 fired ~3 trades; 13/15
+// gainers were ATR-blocked midday). Now that the real "in play" dimensions are on
+// the signal path (RVOL + float + catalyst, per Warrior/Kev/Poarch), the ATR floor
+// drops to a thin backstop that only rejects a genuinely dead range, and the
+// in-play gate below does the real filtering.
+const BOUNCE_MIN_ATR_PCT = 0.010   // volatility backstop only (was 1.5%)
 const BOUNCE_MAX_VWAP_CROSSES = 3  // >3 crosses = chop day, don't buy dips
 
 function bounceQualityFail(ctx: DetectionContext): boolean {
@@ -200,9 +207,32 @@ function bounceQualityFail(ctx: DetectionContext): boolean {
   return false
 }
 
+// ── In-play gate (Warrior/Kev/Poarch: only trade names actually in play) ─────
+// A name is "in play" when there's real participation AND/OR a clear reason to
+// move. Deliberately lenient — any single strong tell passes — so it filters the
+// dead drifters without starving the book. RVOL is the proven discriminator
+// (2026-07-20: RVOL≥5 won 60%, RVOL 1–2 won 33%); float + catalyst + gap are the
+// corroborating pillars. Never blocks on missing data.
+const IN_PLAY_MIN_RVOL = 2            // strong participation clears the gate outright
+const IN_PLAY_MIN_GAP_PCT = 5         // a 5%+ mover is in play even on a soft RVOL reading
+const IN_PLAY_FLOAT_CEILING = 20_000_000
+const IN_PLAY_LOWFLOAT_MIN_RVOL = 1   // low floats move on less volume — normal pace is enough
+
+function inPlay(ctx: DetectionContext): boolean {
+  const rvol = ctx.technical.relativeVolume
+  if (rvol != null && rvol >= IN_PLAY_MIN_RVOL) return true
+  if (ctx.hasCatalyst) return true
+  if (Math.abs(ctx.changePct) >= IN_PLAY_MIN_GAP_PCT) return true
+  if (ctx.float != null && ctx.float < IN_PLAY_FLOAT_CEILING &&
+      (rvol == null || rvol >= IN_PLAY_LOWFLOAT_MIN_RVOL)) return true
+  // No participation signal at all and no data to judge on → don't block.
+  if (rvol == null && ctx.float == null) return true
+  return false
+}
+
 /** Every reason a long *bounce* trigger should be suppressed (setup stays visible). */
 function bounceBlocked(ctx: DetectionContext): boolean {
-  return openBounceLockout(ctx) || bounceQualityFail(ctx)
+  return openBounceLockout(ctx) || bounceQualityFail(ctx) || !inPlay(ctx)
 }
 
 /** Volume dried up INTO the pullback — measured excluding the trigger bar, so a

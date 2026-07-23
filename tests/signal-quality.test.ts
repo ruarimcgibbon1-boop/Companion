@@ -46,7 +46,7 @@ function ctx(candles: Candle[], price: number, over: Partial<DetectionContext> =
   return {
     symbol: 'TEST', price, candles, sessionLevels: sl, technical: t, levels,
     catalystScore: 10, hasCatalyst: true, spreadPct: 0.15, changePct: 6,
-    session: 'regular', minutesSinceOpen: 60, ...over,
+    session: 'regular', minutesSinceOpen: 60, float: 5_000_000, ...over,
   }
 }
 
@@ -240,6 +240,34 @@ describe('opening-window bounce lockout', () => {
   it('quarantines ema9_bounce triggers (still visible as a watch)', () => {
     const setups = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20 }))
     expect(setups.some(s => s.type === 'ema9_bounce' && s.triggeredRaw)).toBe(false)
+  })
+})
+
+describe('in-play gate', () => {
+  const over = { sessionLevels: session({ vwap: 4.85 }) }
+  // the winning vwap_bounce shape (pullback → green new-high on a volume spike)
+  const vbVols = [150_000, 200_000, 180_000, 140_000, 120_000, 100_000, 400_000]
+  const vb = [4.75, 4.85, 4.92, 4.90, 4.88, 4.87, 4.95].map((c, i) => ({
+    time: 1_700_000_000 + i * 300, open: c - 0.005, high: c + 0.01, low: c - 0.005, close: c, volume: vbVols[i],
+  }))
+  // A drifter is NOT in play: weak RVOL, no catalyst, high float, small change.
+  const dead = { minutesSinceOpen: 30, hasCatalyst: false, changePct: 2, float: 80_000_000, technical: technical({ relativeVolume: 0.6 }) }
+  const isVbTrig = (o: object) => detectSetups(ctx(vb, 4.95, { ...over, ...dead, ...o })).some(s => s.type === 'vwap_bounce' && s.triggeredRaw)
+
+  it('blocks a bounce on a dead drifter (weak RVOL, no catalyst, high float, small move)', () => {
+    expect(isVbTrig({})).toBe(false)
+  })
+  it('lets it through on strong RVOL alone', () => {
+    expect(isVbTrig({ technical: technical({ relativeVolume: 3 }) })).toBe(true)
+  })
+  it('lets it through on a catalyst alone', () => {
+    expect(isVbTrig({ hasCatalyst: true })).toBe(true)
+  })
+  it('lets it through on a real gap alone', () => {
+    expect(isVbTrig({ changePct: 9 })).toBe(true)
+  })
+  it('lets it through on low float with normal-pace volume', () => {
+    expect(isVbTrig({ float: 8_000_000, technical: technical({ relativeVolume: 1.2 }) })).toBe(true)
   })
 })
 

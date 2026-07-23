@@ -275,3 +275,12 @@ export async function getSharesFloat(symbol: string): Promise<FmpSharesFloat | n
     return null
   }
 }
+
+// Sanitized absolute float count, shared by the scanner and the signal path.
+// FMP occasionally returns an implausibly small value for a micro-cap (a units
+// glitch, e.g. INLF at 4,263 shares); anything under 10k isn't a real tradeable
+// float, so return null (unknown) rather than a fake ultra-low-float reading.
+export async function getFloatShares(symbol: string): Promise<number | null> {
+  const v = (await getSharesFloat(symbol))?.floatShares ?? null
+  return v != null && v >= 10_000 ? v : null
+}
