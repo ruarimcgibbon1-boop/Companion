@@ -63,6 +63,23 @@ function makingLowerHighs(candles: Candle[]): boolean {
   return highs[highs.length - 1] < highs[0]
 }
 
+// The confirmation entry every momentum trader teaches (Warrior micro-pullback,
+// Kev "wait for a buyer to step in"): don't buy the dip itself — buy the FIRST
+// candle that takes out the pullback's high after a 2–3 bar digestion. That flips
+// the entry from "price is back near the level" (catching a falling knife) to
+// "buyers have proven they're back". Requires: a real pullback in the recent bars,
+// then the current bar breaking above it and closing in its upper half.
+function newHighAfterPullback(candles: Candle[]): boolean {
+  const r = lastN(candles, 5)
+  if (r.length < 4) return false
+  const cur = r[r.length - 1]
+  const pb = r.slice(0, -1).slice(-3)                 // the up-to-3-bar pullback before `cur`
+  const pbHigh = Math.max(...pb.map(c => c.high))
+  const pulledBack = pb.some(c => c.close < c.open) || pb[pb.length - 1].low < pb[0].low
+  const closedStrong = cur.close >= cur.open // a green confirmation bar, not an upper-wick rejection
+  return pulledBack && cur.high > pbHigh && closedStrong
+}
+
 function volumeContracting(candles: Candle[]): boolean {
   const recent = lastN(candles, 6)
   if (recent.length < 4) return false
@@ -472,7 +489,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const confirming = makingHigherLows(candles) && volumeContracting(candles)
   const reclaim = lastCandle ? lastCandle.close > zoneUpper : false
-  const triggered = reclaim && volumeExpanding(candles) && makingHigherLows(candles) && !bounceBlocked(ctx)
+  const triggered = reclaim && volumeExpanding(candles) && newHighAfterPullback(candles) && !bounceBlocked(ctx)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) +
     (volumeContracting(candles) ? 1 : 0) +
@@ -778,7 +795,7 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
   const lastCandle = candles[candles.length - 1]
   const holding = lastCandle ? lastCandle.close > ema : false
   const confirming = (price >= zoneLower && price <= zoneUpper) && makingHigherLows(candles)
-  const triggered = holding && volumeExpanding(candles) && makingHigherLows(candles) &&
+  const triggered = holding && volumeExpanding(candles) && newHighAfterPullback(candles) &&
     price > zoneUpper && !bounceBlocked(ctx) &&
     (which === 'ema9' ? EMA9_BOUNCE_TRIGGERS_ENABLED : true)
   const signals =
@@ -851,9 +868,9 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   // the bounce candle; without the surge it's a false signal. (The reclaim case
   // already demanded expansion.)
   const triggered = (above
-    ? reclaimed && makingHigherLows(candles) && volumeContractingBefore(candles) &&
+    ? reclaimed && newHighAfterPullback(candles) && volumeContractingBefore(candles) &&
       volumeExpanding(candles) && price > zoneUpper
-    : reclaimed && volumeExpanding(candles) && price > vwap) && !bounceBlocked(ctx)
+    : reclaimed && newHighAfterPullback(candles) && volumeExpanding(candles) && price > vwap) && !bounceBlocked(ctx)
   const signals =
     (reclaimed ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0) +
     (above ? (volumeContracting(candles) ? 1 : 0) : (volumeExpanding(candles) ? 1 : 0))

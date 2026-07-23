@@ -198,10 +198,11 @@ describe('detectVwap trend guard', () => {
 })
 
 describe('opening-window bounce lockout', () => {
-  // Rising above a VWAP anchored below price: volume dries up INTO the pullback
-  // then SPIKES on the reclaim bar — the shape a real vwap_bounce requires.
-  const vbVols = [200_000, 180_000, 160_000, 140_000, 120_000, 100_000, 400_000]
-  const vb = [4.80, 4.83, 4.86, 4.88, 4.90, 4.91, 4.93].map((c, i) => ({
+  // Above a VWAP anchored below price: a run-up, a 3-bar pullback (volume drying
+  // up), then a green new-high confirmation bar on a volume spike — the full
+  // Warrior micro-pullback shape a real vwap_bounce now requires.
+  const vbVols = [150_000, 200_000, 180_000, 140_000, 120_000, 100_000, 400_000]
+  const vb = [4.75, 4.85, 4.92, 4.90, 4.88, 4.87, 4.95].map((c, i) => ({
     time: 1_700_000_000 + i * 300, open: c - 0.005, high: c + 0.01, low: c - 0.005, close: c,
     volume: vbVols[i],
   }))
@@ -239,6 +240,29 @@ describe('opening-window bounce lockout', () => {
   it('quarantines ema9_bounce triggers (still visible as a watch)', () => {
     const setups = detectSetups(ctx(vb, 4.93, { ...over, minutesSinceOpen: 20 }))
     expect(setups.some(s => s.type === 'ema9_bounce' && s.triggeredRaw)).toBe(false)
+  })
+})
+
+describe('confirmation-candle entry (buy the new high, not the dip)', () => {
+  const over = { sessionLevels: session({ vwap: 4.85 }) }
+  it('does NOT trigger on a monotonic rise with no pullback (a chase)', () => {
+    // straight up into VWAP — no digestion, no confirmation candle
+    const chase = [4.80, 4.83, 4.86, 4.89, 4.91, 4.93, 4.95].map((c, i) => ({
+      time: 1_700_000_000 + i * 300, open: c - 0.005, high: c + 0.01, low: c - 0.005, close: c,
+      volume: 100_000 + i * 40_000,
+    }))
+    const s = detectSetups(ctx(chase, 4.95, { ...over, minutesSinceOpen: 30 })).find(x => x.type === 'vwap_bounce')
+    if (s) expect(s.triggeredRaw).toBe(false)
+  })
+  it('does NOT trigger when the confirmation bar closes red (upper-wick rejection)', () => {
+    // pullback then a bar that pokes a new high but closes red
+    const rej = [
+      { c: 4.75, o: 4.745 }, { c: 4.90, o: 4.80 }, { c: 4.88, o: 4.90 },
+      { c: 4.86, o: 4.88 }, { c: 4.85, o: 4.86 }, { c: 4.86, o: 4.855 },
+      { c: 4.88, o: 4.96 }, // new intrabar high (4.98) but closes red, below open
+    ].map((b, i) => ({ time: 1_700_000_000 + i * 300, open: b.o, high: Math.max(b.c, b.o) + 0.02, low: Math.min(b.c, b.o) - 0.005, close: b.c, volume: i === 6 ? 400_000 : 120_000 }))
+    const s = detectSetups(ctx(rej, 4.88, { ...over, minutesSinceOpen: 30 })).find(x => x.type === 'vwap_bounce')
+    if (s) expect(s.triggeredRaw).toBe(false)
   })
 })
 
