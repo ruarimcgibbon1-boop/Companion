@@ -386,16 +386,87 @@ describe('new momentum setups', () => {
   })
 })
 
-describe('minimum stop-width floor', () => {
-  it('never emits a long setup whose stop is tighter than 1.5%', () => {
-    // Tiny ATR would otherwise yield a razor-thin stop (the SEER 0.6% case)
+describe('stop-width floors', () => {
+  // Strength entries (breaks/reclaims) trail the stop up to the breakout pivot —
+  // ~1.3 ATR under the fill — so they are intentionally tighter than the 1.5%
+  // bounce floor. Mean-reversion bounces keep the 1.5% noise floor.
+  const STRENGTH = new Set([
+    'breakout', 'bull_flag', 'break_of_structure', 'opening_range_break',
+    'vwap_reclaim', 'level_reclaim',
+  ])
+
+  it('bounce/pullback longs never carry a stop tighter than 1.5% (SEER noise floor)', () => {
     const c = bars([4.9, 4.95, 5.0, 5.02, 5.0, 5.01, 5.0])
     const setups = detectSetups(ctx(c, 5.0, { technical: technical({ atr: 0.005 }) }))
-    const longs = setups.filter(s => s.direction === 'long')
-    expect(longs.length).toBeGreaterThan(0)
-    for (const s of longs) {
-      const stopDist = s.zoneUpper - s.invalidation
-      expect(stopDist).toBeGreaterThanOrEqual(5.0 * 0.015 - 1e-9)
+    const bounces = setups.filter(s => s.direction === 'long' && !STRENGTH.has(s.type))
+    for (const s of bounces) {
+      expect(s.entryFill - s.invalidation).toBeGreaterThanOrEqual(5.0 * 0.015 - 1e-9)
+    }
+  })
+
+  it('strength longs use a volatility-aware pivot stop, floored so it is never razor-thin', () => {
+    // Tiny ATR would otherwise yield a razor-thin stop (the SEER 0.6% case); the
+    // 0.4%-of-fill floor binds here and keeps the stop well clear of noise.
+    const c = bars([4.9, 4.95, 5.0, 5.02, 5.0, 5.01, 5.0])
+    const setups = detectSetups(ctx(c, 5.0, { technical: technical({ atr: 0.005 }) }))
+    const strength = setups.filter(s => s.direction === 'long' && STRENGTH.has(s.type))
+    expect(strength.length).toBeGreaterThan(0)
+    for (const s of strength) {
+      const stopDist = s.entryFill - s.invalidation
+      // pivot = max(1.3 × ATR, 0.4% of fill); with ATR 0.005 the % floor wins.
+      expect(stopDist).toBeGreaterThanOrEqual(Math.max(1.3 * 0.005, s.entryFill * 0.004) - 1e-9)
+      expect(stopDist).toBeGreaterThan(0.005) // never merely the razor-thin ATR
+    }
+  })
+})
+
+describe('breakout R/R geometry (2026-07-23 NVEC regression)', () => {
+  // Enter a break on the confirmed new high but fill ABOVE the trigger (a chase):
+  // the stop must trail up to the breakout pivot, not sit at the far base low,
+  // and R/R must be rated against a meaningful target — not a bp-away noise level.
+  // Before the fix this logged as a benched 0.1R; now it is a real, tradeable setup.
+  function risingBreak(): Candle[] {
+    const closes = [4.85, 4.88, 4.90, 4.92, 4.95, 4.98, 5.02, 5.06, 5.10, 5.14, 5.18]
+    return closes.map((c, i) => ({
+      time: 1_700_000_000 + i * 300,
+      open: c - 0.01, high: c + 0.02, low: c - 0.02, close: c,
+      // last bar's volume expands (>1.3× avg) so the break confirms
+      volume: i === closes.length - 1 ? 400_000 : 100_000,
+    }))
+  }
+
+  const c = risingBreak()
+  // premarketHigh below the OR high so the break level is the OR high (5.0),
+  // leaving the fill (5.18) a realistic ~3.6% above the trigger.
+  const setups = detectSetups(ctx(c, 5.18, {
+    technical: technical({ atr: 0.05, distanceFromDayHighPct: 0 }),
+    sessionLevels: session({ premarketHigh: 4.9, vwap: 5.0 }),
+  }))
+  const strength = setups.filter(s =>
+    s.direction === 'long' &&
+    ['opening_range_break', 'break_of_structure', 'breakout'].includes(s.type))
+
+  it('produces a strength setup on the chased break', () => {
+    expect(strength.length).toBeGreaterThan(0)
+  })
+
+  it('trails the stop to the pivot (~1.3 ATR under the fill), not the base low', () => {
+    for (const s of strength) {
+      const risk = s.entryFill - s.invalidation
+      // pivot risk ≈ 0.065 (1.3 × 0.05); the old base-low stop would be ~4% (~0.2).
+      expect(risk).toBeLessThan(s.entryFill * 0.02) // well under the 4% base-low risk
+      expect(risk).toBeGreaterThan(0.005)           // still clear of noise
+    }
+  })
+
+  it('rates R/R against a meaningful target and clears the 1.5 buy gate', () => {
+    for (const s of strength) {
+      expect(s.rewardRisk).not.toBeNull()
+      expect(s.rewardRisk!).toBeGreaterThanOrEqual(1.5)
+      // no target sits within the min-reward floor of the fill (no bp-away noise)
+      for (const t of s.targets) {
+        expect(t.price - s.entryFill).toBeGreaterThan(s.entryFill * 0.003)
+      }
     }
   })
 })

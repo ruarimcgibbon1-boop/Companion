@@ -108,7 +108,28 @@ function volumeExpanding(candles: Candle[]): boolean {
 const ROLLOVER_OFF_HIGH_PCT = 0.05
 // A stop tighter than this is noise on a low-float and gets shaken out before
 // the thesis plays (SEER's 0.6% scalp). We floor stop width — never tighten.
+// (Bounce/pullback setups only; strength entries use the pivot stop below.)
 const MIN_STOP_PCT = 0.015
+// Strength-entry stop model. When you enter on a CONFIRMED break/reclaim (a new
+// high), the stop belongs at the breakout pivot — ~a volatility unit under the
+// ACTUAL fill — not at the far base low. On a chased fill (price ran past the
+// trigger) the base-low stop balloons risk into a sub-0.1R trade that the R/R
+// gate then benches (NVEC 2026-07-23: fill 130.60, base stop 126.15 → 0.1R).
+const STOP_ATR_MULT = 1.3        // pivot stop sits ~1.3 ATR under the fill
+const MIN_STOP_FLOOR_PCT = 0.004 // absolute stop-width floor when ATR is missing/tiny
+// The setups you enter on strength — the stop trails up to the pivot for these.
+// Mean-reversion bounces keep their structural stop under the level they bounce from.
+const STRENGTH_ENTRY_TYPES: SetupType[] = [
+  'breakout', 'bull_flag', 'break_of_structure', 'opening_range_break',
+  'vwap_reclaim', 'level_reclaim',
+]
+// A target only a few basis points beyond the fill is noise, not a target: it
+// tanks R/R and books phantom "wins" (KUST/MWC/INM 2026-07-22). The first RATED
+// target must clear a meaningful reward — ≥ this fraction of the risk, or a small
+// % of price, whichever is larger — so trivial levels are skipped for the measured
+// move behind them.
+const MIN_T1_REWARD_R = 0.8
+const MIN_T1_REWARD_PCT = 0.004
 // A long "bounce" whose price has already run well above its entry zone is a
 // chase, not a bounce: the zone is unfillable and entering at the trigger means
 // a wide stop for a tiny first target. Don't let it fire a BUY. (2026-07-08's
@@ -351,12 +372,25 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // so a resting limit misses them — the real entry is here.
   const entryFill = direction === 'long' ? Math.max(zoneUpper, price) : Math.min(zoneLower, price)
 
-  // Minimum stop-width floor: widen a degenerate sub-MIN_STOP_PCT stop so we never
-  // emit a scalp that noise stops out (SEER 0.6%, 2026-07-06). Only ever widens.
-  const minStopDist = price * MIN_STOP_PCT
+  // Stop placement. Strength entries (breaks/reclaims confirmed by a new high)
+  // trail the stop up to the breakout pivot — ~STOP_ATR_MULT ATR under the ACTUAL
+  // fill — so a chased fill doesn't inherit the far base-low stop and a 0.1R trade.
+  // We only ever TIGHTEN toward the pivot; never loosen past the structural
+  // invalidation. Bounces keep their structural stop (with the legacy noise floor).
   let stopRef = invalidation
-  if (direction === 'long' && entryRef - stopRef < minStopDist) stopRef = entryRef - minStopDist
-  else if (direction === 'short' && stopRef - entryRef < minStopDist) stopRef = entryRef + minStopDist
+  if (STRENGTH_ENTRY_TYPES.includes(type)) {
+    const atr = t.atr != null && t.atr > 0 ? t.atr : entryFill * MIN_STOP_FLOOR_PCT
+    const stopDist = Math.max(atr * STOP_ATR_MULT, entryFill * MIN_STOP_FLOOR_PCT)
+    const pivotStop = direction === 'long' ? entryFill - stopDist : entryFill + stopDist
+    stopRef = direction === 'long' ? Math.max(invalidation, pivotStop) : Math.min(invalidation, pivotStop)
+  } else {
+    // Minimum stop-width floor: widen a degenerate sub-MIN_STOP_PCT stop so we never
+    // emit a scalp that noise stops out (SEER 0.6%, 2026-07-06). Only ever widens.
+    const minStopDist = price * MIN_STOP_PCT
+    if (direction === 'long' && entryRef - stopRef < minStopDist) stopRef = entryRef - minStopDist
+    else if (direction === 'short' && stopRef - entryRef < minStopDist) stopRef = entryRef + minStopDist
+  }
+  const riskDist = Math.abs(entryFill - stopRef)
 
   // Candidate targets: ranked levels in the trade direction, plus any synthetic
   // targets (measured moves) supplied by momentum setups. Keep those genuinely
@@ -371,7 +405,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // on price let a "target" land between price and the fill — i.e. BELOW the entry.
   // 2026-07-22 KUST/MWC/INM each logged a first target under their fill (negative
   // rr), and one even booked a phantom +1.2% "win" hitting a target below entry.
-  const targetFloor = dirLong ? entryFill * 1.001 : entryFill * 0.999
+  // The first rated target must clear a meaningful reward beyond the fill (see
+  // MIN_T1_REWARD_R) — a level a few bps away is noise that tanks R/R and books
+  // phantom wins. Skip those in favour of the measured move behind them.
+  const minReward = Math.max(riskDist * MIN_T1_REWARD_R, entryFill * MIN_T1_REWARD_PCT)
+  const targetFloor = dirLong ? entryFill + minReward : entryFill - minReward
   const picked: { price: number; label: string }[] = []
   for (const o of cand
     .filter(o => dirLong ? o.price > targetFloor : o.price < targetFloor)
@@ -381,7 +419,7 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   const targets: SetupTarget[] = picked.slice(0, 3).map((o, i) => ({
     price: o.price,
     label: `T${i + 1}${o.label ? ` (${o.label})` : ''}`,
-    rewardRisk: rr(entryRef, stopRef, o.price),
+    rewardRisk: rr(entryFill, stopRef, o.price),
   }))
   const bestRR = targets.length ? targets[0].rewardRisk : null
 
