@@ -457,6 +457,26 @@ export interface BuySignalRecord {
   pnlFullyClosed?: boolean
 }
 
+// ── Signal funnel (per-sweep instrumentation) ───────────────────────────────
+// Counts where candidates die each monitor sweep, so a "0 signals" day is
+// legible: scanned → detected → cleared floor → triggered → logged, with the
+// drop reason at each stage. Ephemeral (latest sweep only), not persisted.
+export interface MonitorFunnel {
+  timestamp: number
+  scanned: number             // symbols in the monitor universe this sweep
+  symbolsWithSetups: number   // symbols that produced ≥1 raw setup
+  rawSetups: number           // total setups detected across the universe
+  belowFloor: number          // dropped by the score/level display floor
+  tracked: number             // setups that cleared the floor (entered the state machine)
+  byState: Partial<Record<SetupState, number>>  // geometry state among tracked
+  triggered: number           // long setups with triggeredRaw among tracked
+  droppedVeto: number         // triggered longs dropped by the quality veto (flagged)
+  droppedStandDown: number    // …by the failed-bounce stand-down
+  droppedCapped: number       // …by the per-symbol cap
+  droppedDup: number          // …by the entry-cluster dedup
+  logged: number              // buys actually logged this sweep
+}
+
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   pullback: 'Pullback',
   breakout: 'Breakout',

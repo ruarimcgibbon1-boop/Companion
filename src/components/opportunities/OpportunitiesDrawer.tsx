@@ -645,14 +645,48 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
 
 // ── Review ──────────────────────────────────────────────────────────────────
 
+function FunnelCard() {
+  const f = useTradingStore(s => s.monitorFunnel)
+  if (!f) return null
+  const st = f.byState
+  const arrow = <span className="text-gray-700">→</span>
+  return (
+    <div className="text-[11px] bg-gray-900/60 border border-gray-800 rounded-lg p-3">
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="font-semibold text-gray-400">Live signal funnel</span>
+        <span className="text-gray-600">latest sweep · {dataAge(f.timestamp)}</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-gray-300">
+        <span>{f.scanned} scanned</span>{arrow}
+        <span>{f.symbolsWithSetups} with setups</span>{arrow}
+        <span>{f.rawSetups} detected</span>{arrow}
+        <span className="text-gray-500">{f.tracked} tracked</span>{arrow}
+        <span className={f.triggered ? 'text-amber-300' : 'text-gray-500'}>{f.triggered} triggered</span>{arrow}
+        <span className={f.logged ? 'text-emerald-400 font-semibold' : 'text-gray-500'}>{f.logged} logged</span>
+      </div>
+      {f.triggered > 0 && f.logged < f.triggered && (
+        <div className="mt-1 text-[10px] text-gray-500">
+          Triggered but dropped: <span className="text-red-400/80">veto {f.droppedVeto}</span> · stand-down {f.droppedStandDown} · capped {f.droppedCapped} · dup {f.droppedDup}
+        </div>
+      )}
+      <div className="mt-1 text-[10px] text-gray-600">
+        States: identified {st.identified ?? 0} · approaching {st.approaching ?? 0} · at-level {st.at_level ?? 0} · confirming {st.confirming ?? 0} · triggered {st.triggered ?? 0}
+        {f.belowFloor > 0 ? ` · (${f.belowFloor} below floor)` : ''}
+      </div>
+    </div>
+  )
+}
+
 function ReviewTab() {
   const logs = useTradingStore(s => s.setupLogs)
+  const funnel = useTradingStore(s => s.monitorFunnel)
   const stats = useMemo(() => computeReview(logs), [logs])
 
-  if (logs.length === 0) return <div className="text-center text-gray-600 text-sm py-16">No setups logged yet. As the engine identifies and tracks setups, their outcomes accumulate here for calibration.</div>
+  if (logs.length === 0 && !funnel) return <div className="text-center text-gray-600 text-sm py-16">No setups logged yet. As the engine identifies and tracks setups, their outcomes accumulate here for calibration.</div>
 
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4">
+      <FunnelCard />
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
         <Stat label="Entered / tracked" value={`${stats.entered} / ${stats.total}`} />
         <Stat label="Resolved" value={String(stats.resolved)} />

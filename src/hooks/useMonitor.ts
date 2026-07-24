@@ -3,7 +3,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
-import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType } from '@/types'
+import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel } from '@/types'
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -251,18 +251,30 @@ export function useMonitor() {
       const newAlerts: MonitorAlert[] = []
       const newBuySignals: BuySignalRecord[] = []
 
+      // Signal funnel: count where candidates die this sweep, so a 0-signal day
+      // is legible (scanned → detected → cleared floor → triggered → logged).
+      const funnel: MonitorFunnel = {
+        timestamp: now, scanned: results.length, symbolsWithSetups: 0, rawSetups: 0,
+        belowFloor: 0, tracked: 0, byState: {}, triggered: 0,
+        droppedVeto: 0, droppedStandDown: 0, droppedCapped: 0, droppedDup: 0, logged: 0,
+      }
+
       for (const r of results) {
         keyLevels[r.symbol] = r.levels
         roadmaps[r.symbol] = r.roadmap
         meta[r.symbol] = r.integrity
         symbolSetups[r.symbol] = r.setups
+        if (r.setups.length > 0) funnel.symbolsWithSetups++
+        funnel.rawSetups += r.setups.length
 
         for (const setup of r.setups) {
           allSetups.push(setup)
 
           // Only track/alert setups that clear the display floor.
           const meetsLevel = (setup.breakdown.levelQuality / 20) * 100 >= settings.minLevelStrength * 0.2 || setup.confidence >= settings.minLevelStrength
-          if (setup.score < 55 && !meetsLevel) continue
+          if (setup.score < 55 && !meetsLevel) { funnel.belowFloor++; continue }
+          funnel.tracked++
+          funnel.byState[setup.state] = (funnel.byState[setup.state] ?? 0) + 1
 
           const prevRec = setupStates[setup.id] ?? s.setupStates[setup.id] ?? null
           const { record, alert } = transition({
@@ -303,40 +315,48 @@ export function useMonitor() {
           // 2026-07-20 GMM logged 7 signals — ema9 three times in 28 seconds, plus
           // ORB + ema21 + pullback all on the same 12:44:35 fill.
           const fill = setup.entryFill ?? setup.zoneUpper
-          if (
-            setup.direction === 'long' && setup.triggeredRaw && !setup.qualityVetoed &&
-            !standDown && !capped &&
-            !isDuplicateBuy(setup.symbol, fill, now, allBuys)
-          ) {
-            const t1 = setup.targets[0]?.price ?? null
-            const rr = t1 != null && fill > setup.stopReference
-              ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
-              : setup.rewardRisk
-            newBuySignals.push({
-              id: `${setup.id}:triggered:${Math.floor(now / 1000)}`,
-              setupId: setup.id,
-              symbol: setup.symbol,
-              timestamp: now,
-              setupType: setup.type,
-              triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
-              entryLow: setup.zoneLower,
-              entryHigh: fill,
-              invalidation: setup.invalidation,
-              stop: setup.stopReference,
-              targets: setup.targets.map(t => t.price),
-              score: setup.score,
-              grade: setup.grade,
-              rewardRisk: rr,
-              priceAtSignal: r.price,
-              flagged: false, // vetoed triggers are dropped above, so a logged entry is never flagged
+          // Classify every triggered long: logged, or which gate dropped it — so
+          // the funnel shows whether triggers are firing but getting eaten. The
+          // BUY is logged only in the clean (else) branch — same gate as before.
+          if (setup.direction === 'long' && setup.triggeredRaw) {
+            funnel.triggered++
+            const dup = isDuplicateBuy(setup.symbol, fill, now, allBuys)
+            if (setup.qualityVetoed) funnel.droppedVeto++
+            else if (standDown) funnel.droppedStandDown++
+            else if (capped) funnel.droppedCapped++
+            else if (dup) funnel.droppedDup++
+            else {
+              funnel.logged++
+              const t1 = setup.targets[0]?.price ?? null
+              const rr = t1 != null && fill > setup.stopReference
+                ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
+                : setup.rewardRisk
+              newBuySignals.push({
+                id: `${setup.id}:triggered:${Math.floor(now / 1000)}`,
+                setupId: setup.id,
+                symbol: setup.symbol,
+                timestamp: now,
+                setupType: setup.type,
+                triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
+                entryLow: setup.zoneLower,
+                entryHigh: fill,
+                invalidation: setup.invalidation,
+                stop: setup.stopReference,
+                targets: setup.targets.map(t => t.price),
+                score: setup.score,
+                grade: setup.grade,
+                rewardRisk: rr,
+                priceAtSignal: r.price,
+                flagged: false, // vetoed triggers are dropped above, so a logged entry is never flagged
 
-              ctxTrend15m: r.technicals?.trend15m,
-              ctxDistVwapPct: r.technicals?.distanceFromVwapPct ?? null,
-              ctxDistDayHighPct: r.technicals?.distanceFromDayHighPct ?? null,
-              ctxRelVol: r.relativeVolume,
-              ctxHigherHighsLows: r.technicals?.higherHighsLows ?? null,
-              ctxAtrPct: r.technicals?.atrPct ?? null,
-            })
+                ctxTrend15m: r.technicals?.trend15m,
+                ctxDistVwapPct: r.technicals?.distanceFromVwapPct ?? null,
+                ctxDistDayHighPct: r.technicals?.distanceFromDayHighPct ?? null,
+                ctxRelVol: r.relativeVolume,
+                ctxHigherHighsLows: r.technicals?.higherHighsLows ?? null,
+                ctxAtrPct: r.technicals?.atrPct ?? null,
+              })
+            }
           }
 
           if (alert) {
@@ -353,7 +373,7 @@ export function useMonitor() {
         .sort((a, b) => b.score - a.score)
         .slice(0, 60)
 
-      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, now })
+      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, funnel, now })
     } catch {
       /* network error — keep last state */
     } finally {

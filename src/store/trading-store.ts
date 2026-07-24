@@ -14,6 +14,7 @@ import type {
   PriceRoadmap,
   SetupStateRecord,
   MonitorAlert,
+  MonitorFunnel,
   NotificationSettings,
   SetupLog,
   DataIntegrity,
@@ -50,6 +51,7 @@ interface MonitorSweep {
   alerts: MonitorAlert[]
   buySignals: BuySignalRecord[]
   ranked: DetectedSetup[]
+  funnel: MonitorFunnel
   now: number
 }
 
@@ -90,6 +92,7 @@ interface TradingStore {
 
   // ── Always-on monitoring ──
   monitoredSetups: DetectedSetup[]                 // live — best setups across the universe
+  monitorFunnel: MonitorFunnel | null              // live — latest sweep's signal funnel (ephemeral)
   symbolSetups: Record<string, DetectedSetup[]>    // live — every setup per symbol (unfiltered)
   keyLevels: Record<string, KeyLevel[]>            // live — per symbol (for chart overlays)
   roadmaps: Record<string, PriceRoadmap>           // live — per symbol
@@ -192,6 +195,7 @@ export const useTradingStore = create<TradingStore>()(
       positions: [],
 
       monitoredSetups: [],
+      monitorFunnel: null,
       symbolSetups: {},
       keyLevels: {},
       roadmaps: {},
@@ -299,6 +303,7 @@ export const useTradingStore = create<TradingStore>()(
             ? [...p.buySignals.filter(b => !s.buySignals.some(e => e.id === b.id)), ...s.buySignals].slice(0, 300)
             : s.buySignals,
           monitoredSetups: p.ranked,
+          monitorFunnel: p.funnel,
           lastMonitorTime: p.now,
         }
       }),
