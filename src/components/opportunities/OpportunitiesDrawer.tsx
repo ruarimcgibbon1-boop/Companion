@@ -628,11 +628,15 @@ function ReviewTab() {
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4">
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
-        <Stat label="Setups logged" value={String(stats.total)} />
+        <Stat label="Entered / tracked" value={`${stats.entered} / ${stats.total}`} />
         <Stat label="Resolved" value={String(stats.resolved)} />
         <Stat label="Hit T1" value={`${stats.winRate}%`} good />
         <Stat label="Avg MFE / MAE" value={`+${fmt(stats.avgMfe, 1)}% / ${fmt(stats.avgMae, 1)}%`} />
       </div>
+
+      <p className="text-[11px] text-gray-500">
+        Performance below is over <span className="text-gray-300">entered (triggered)</span> setups only — watches that never triggered are excluded, so per-type win-rates reflect trades you&apos;d actually take.
+      </p>
 
       <ReviewTable title="By setup type" rows={stats.byType} />
       <ReviewTable title="By score range" rows={stats.byScore} />
@@ -641,7 +645,7 @@ function ReviewTab() {
 
       <div className="text-[11px] text-gray-500 bg-gray-900/60 border border-gray-800 rounded-lg p-3">
         <p className="font-semibold text-gray-400 mb-1">Calibration read-out</p>
-        <p>False-breakout frequency: <span className="text-gray-300">{stats.falseBreakoutPct}%</span> of breakout setups invalidated after triggering.</p>
+        <p>False-breakout frequency: <span className="text-gray-300">{stats.falseBreakoutPct}%</span> of breakout entries invalidated after triggering.</p>
         <p>Most reliable setup type by T1 hit-rate: <span className="text-gray-300">{stats.bestType}</span>.</p>
         <p className="mt-1 text-gray-600">These outcomes are the basis for tuning the scoring weights from real results rather than assumptions.</p>
       </div>
@@ -683,15 +687,21 @@ function ReviewTable({ title, rows }: { title: string; rows: { label: string; n:
 
 interface Bucket { label: string; n: number; win: number; mfe: number; mae: number }
 function computeReview(logs: SetupLog[]) {
-  const resolved = logs.filter(l => l.outcome !== 'open')
-  const wins = logs.filter(l => l.outcome === 'target_hit')
+  // Performance is judged over ENTERED trades only. The log tracks every setup
+  // that clears the display floor — hundreds of watches (identified/approaching)
+  // per handful of real triggers — so counting all of them swamps every per-type
+  // win-rate with setups that were never bought. triggeredAt is set the moment a
+  // setup reaches the (non-vetoed) triggered state, i.e. the trades you'd take.
+  const entered = logs.filter(l => l.triggeredAt != null)
+  const resolved = entered.filter(l => l.outcome !== 'open')
+  const wins = entered.filter(l => l.outcome === 'target_hit')
   const winRate = resolved.length ? Math.round((wins.length / resolved.length) * 100) : 0
-  const avgMfe = avg(logs.map(l => l.maxFavorablePct))
-  const avgMae = avg(logs.map(l => l.maxAdversePct))
+  const avgMfe = avg(entered.map(l => l.maxFavorablePct))
+  const avgMae = avg(entered.map(l => l.maxAdversePct))
 
   const bucketize = (keyFn: (l: SetupLog) => string): Bucket[] => {
     const map = new Map<string, SetupLog[]>()
-    for (const l of logs) {
+    for (const l of entered) {
       const k = keyFn(l)
       if (!map.has(k)) map.set(k, [])
       map.get(k)!.push(l)
@@ -706,18 +716,18 @@ function computeReview(logs: SetupLog[]) {
   const byType = bucketize(l => SETUP_TYPE_LABELS[l.type])
   const byScore = bucketize(l => l.score >= 85 ? '85+' : l.score >= 75 ? '75–84' : l.score >= 65 ? '65–74' : '<65')
   const bySession = bucketize(l => l.sessionAtId)
-  const emaVwap = logs.filter(l => l.type.includes('ema') || l.type.includes('vwap'))
+  const emaVwap = entered.filter(l => l.type.includes('ema') || l.type.includes('vwap'))
   const byTest = [
     testBucket('First test', emaVwap.filter(l => l.testCount <= 1)),
     testBucket('Repeat test', emaVwap.filter(l => l.testCount >= 2)),
   ].filter(b => b.n > 0)
 
-  const breakouts = logs.filter(l => l.type === 'breakout' && l.triggeredAt)
+  const breakouts = entered.filter(l => l.type === 'breakout')
   const falseBreakouts = breakouts.filter(l => l.outcome === 'invalidated')
   const falseBreakoutPct = breakouts.length ? Math.round((falseBreakouts.length / breakouts.length) * 100) : 0
   const bestType = byType.filter(b => b.n >= 2).sort((a, b) => b.win - a.win)[0]?.label ?? '—'
 
-  return { total: logs.length, resolved: resolved.length, winRate, avgMfe, avgMae, byType, byScore, bySession, byTest, falseBreakoutPct, bestType }
+  return { total: logs.length, entered: entered.length, resolved: resolved.length, winRate, avgMfe, avgMae, byType, byScore, bySession, byTest, falseBreakoutPct, bestType }
 }
 function testBucket(label: string, ls: SetupLog[]): Bucket {
   const res = ls.filter(l => l.outcome !== 'open')
