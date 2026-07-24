@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Candle } from '@/types'
 import { useTradingStore } from '@/store/trading-store'
-import { resolveOpenLogs } from '@/lib/eod-resolver'
+import { resolveOpenLogs, resolveBuyPnl } from '@/lib/eod-resolver'
 
 async function fetchDayCandles(symbol: string): Promise<Candle[]> {
   const res = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&interval=5min`)
@@ -19,11 +19,24 @@ async function fetchDayCandles(symbol: string): Promise<Candle[]> {
   return (data.candles ?? []) as Candle[]
 }
 
+// Fetch each symbol at most once per resolve pass — the log resolver and the P/L
+// resolver both want the same day tape.
+function makeCachedFetch(): (symbol: string) => Promise<Candle[]> {
+  const cache = new Map<string, Promise<Candle[]>>()
+  return (symbol: string) => {
+    let p = cache.get(symbol)
+    if (!p) { p = fetchDayCandles(symbol); cache.set(symbol, p) }
+    return p
+  }
+}
+
 type Status = 'idle' | 'running' | 'done' | 'error'
 
 export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
   const openCount = useTradingStore(s => s.setupLogs.filter(l => l.outcome === 'open').length)
+  const unpricedCount = useTradingStore(s => s.buySignals.filter(b => b.pnlPct == null).length)
   const upsertSetupLog = useTradingStore(s => s.upsertSetupLog)
+  const updateBuySignal = useTradingStore(s => s.updateBuySignal)
   const [status, setStatus] = useState<Status>('idle')
   const [lastResolved, setLastResolved] = useState(0)
   const inFlight = useRef(false)
@@ -33,20 +46,28 @@ export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
     inFlight.current = true
     setStatus('running')
     try {
-      // Read the freshest logs at call time, not a stale closure.
-      const logs = useTradingStore.getState().setupLogs
-      const resolved = await resolveOpenLogs(logs, Date.now(), fetchDayCandles)
-      for (const l of resolved) upsertSetupLog(l)
-      setLastResolved(resolved.length)
+      // Read the freshest state at call time, not a stale closure.
+      const { setupLogs, buySignals } = useTradingStore.getState()
+      const now = Date.now()
+      const fetchCandles = makeCachedFetch()
+
+      const resolvedLogs = await resolveOpenLogs(setupLogs, now, fetchCandles)
+      for (const l of resolvedLogs) upsertSetupLog(l)
+
+      const pricedBuys = await resolveBuyPnl(buySignals, now, fetchCandles)
+      for (const b of pricedBuys) updateBuySignal(b.id, { pnlPct: b.pnlPct, pnlFullyClosed: b.pnlFullyClosed })
+
+      const total = resolvedLogs.length + pricedBuys.length
+      setLastResolved(total)
       setStatus('done')
-      return resolved.length
+      return total
     } catch {
       setStatus('error')
       return 0
     } finally {
       inFlight.current = false
     }
-  }, [upsertSetupLog])
+  }, [upsertSetupLog, updateBuySignal])
 
   const autoRan = useRef(false)
   useEffect(() => {
@@ -55,5 +76,5 @@ export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
     void resolveNow()
   }, [auto, resolveNow])
 
-  return { resolveNow, status, lastResolved, openCount }
+  return { resolveNow, status, lastResolved, openCount, unpricedCount, pendingCount: openCount + unpricedCount }
 }

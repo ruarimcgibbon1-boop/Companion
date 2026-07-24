@@ -450,6 +450,11 @@ export interface BuySignalRecord {
   ctxRelVol?: number | null
   ctxHigherHighsLows?: boolean | null // constructive structure vs chop
   ctxAtrPct?: number | null           // volatility, for stop-vs-noise analysis
+  // ── Realized P/L (filled by the EOD resolver, scaled-out model) ──────────────
+  /** Realized return % for the trade under the scale-out rule (½ T1, ½ T2, breakeven stop after T1, remainder marked at the close). Null until the day closes and it's resolved. */
+  pnlPct?: number | null
+  /** False when a remainder was still held at the close (marked-to-close, not a clean exit). */
+  pnlFullyClosed?: boolean
 }
 
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {

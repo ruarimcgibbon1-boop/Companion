@@ -154,6 +154,7 @@ interface TradingStore {
   markAllMonitorAlertsRead: () => void
   clearMonitorAlerts: () => void
   clearBuySignals: () => void
+  updateBuySignal: (id: string, patch: Partial<BuySignalRecord>) => void
   upsertSetupLog: (log: SetupLog) => void
   updateNotificationSettings: (patch: Partial<NotificationSettings>) => void
   addSearchedSymbol: (sym: string) => void
@@ -315,6 +316,9 @@ export const useTradingStore = create<TradingStore>()(
       })),
       clearMonitorAlerts: () => set({ monitorAlerts: [] }),
       clearBuySignals: () => set({ buySignals: [] }),
+      updateBuySignal: (id, patch) => set(s => ({
+        buySignals: s.buySignals.map(b => b.id === id ? { ...b, ...patch } : b),
+      })),
       upsertSetupLog: (log) => set(s => {
         const idx = s.setupLogs.findIndex(l => l.id === log.id)
         if (idx >= 0) {

@@ -9,7 +9,7 @@
  * first-touch binary rule, backfilling the real MFE/MAE.
  */
 
-import type { Candle, SetupLog } from '@/types'
+import type { Candle, SetupLog, BuySignalRecord } from '@/types'
 import { getSessionType } from './market-hours'
 
 // ── Day helpers ──────────────────────────────────────────────────────────────
@@ -106,6 +106,86 @@ export function resolveLogAgainstCandles(log: SetupLog, candles: Candle[]): Setu
   }
 }
 
+// ── Scaled-out realized P/L ──────────────────────────────────────────────────
+
+// Scale-out schedule: sell this fraction at T1, the remainder at T2. Breakeven
+// stop moves under the remainder once T1 books. Tunable knobs.
+const SCALE_T1_FRACTION = 0.5
+const BREAKEVEN_AFTER_T1 = true
+
+export interface PnlLeg { fraction: number; exitPrice: number; reason: 'T1' | 'T2' | 'stop' | 'breakeven' | 'close' }
+export interface PnlResult { pnlPct: number; legs: PnlLeg[]; fullyClosed: boolean }
+
+/**
+ * Realized P/L for a long entry under the scale-out rule, replayed against the
+ * day's candle tape:
+ *   - sell SCALE_T1_FRACTION at T1, move the stop to breakeven (entry) on the rest;
+ *   - sell the remainder at T2;
+ *   - the stop (initial invalidation before T1, breakeven after) exits whatever is
+ *     still held if hit — checked ADVERSE-FIRST within a bar (intrabar order unknown);
+ *   - anything still held at the close is marked-to-close (fullyClosed = false).
+ * Returns null if there are no candles on the entry's day. `entry`, `stop`,
+ * `targets` are the actual fill / stop / target ladder from the BuySignalRecord.
+ */
+export function scaledPnl(
+  entry: number,
+  stop: number,
+  targets: number[],
+  candles: Candle[],
+  signalMs: number,
+): PnlResult | null {
+  if (entry <= 0) return null
+  const signalSec = Math.floor(signalMs / 1000)
+  const day = candles
+    .filter(c => c.time >= signalSec && sameEtDay(c.time * 1000, signalMs))
+    .sort((a, b) => a.time - b.time)
+  if (day.length === 0) return null
+
+  const t1 = targets[0] ?? null
+  const t2 = targets[1] ?? null
+  const legs: PnlLeg[] = []
+  let held = 1
+  let curStop = stop
+  let t1Done = false
+  let pnlFrac = 0 // sum of fraction × per-share-return
+
+  const bookAt = (fraction: number, price: number, reason: PnlLeg['reason']) => {
+    pnlFrac += fraction * ((price - entry) / entry)
+    legs.push({ fraction, exitPrice: price, reason })
+    held -= fraction
+  }
+
+  for (const c of day) {
+    // Adverse first: the stop (initial, or breakeven after T1) takes priority.
+    if (c.low <= curStop) {
+      bookAt(held, curStop, t1Done ? 'breakeven' : 'stop')
+      held = 0
+      break
+    }
+    if (!t1Done && t1 != null && c.high >= t1) {
+      bookAt(SCALE_T1_FRACTION, t1, 'T1')
+      t1Done = true
+      if (BREAKEVEN_AFTER_T1) curStop = entry
+      // a strong bar can clear T2 in the same candle it took T1
+      if (t2 != null && c.high >= t2 && held > 0) { bookAt(held, t2, 'T2'); held = 0; break }
+      continue
+    }
+    if (t1Done && t2 != null && c.high >= t2) {
+      bookAt(held, t2, 'T2')
+      held = 0
+      break
+    }
+  }
+
+  let fullyClosed = true
+  if (held > 1e-9) {
+    bookAt(held, day[day.length - 1].close, 'close')
+    fullyClosed = false
+  }
+
+  return { pnlPct: pnlFrac * 100, legs, fullyClosed }
+}
+
 // ── Batch orchestration ──────────────────────────────────────────────────────
 
 /**
@@ -142,4 +222,40 @@ export async function resolveOpenLogs(
     }
   }
   return resolved
+}
+
+/**
+ * Compute realized (scaled-out) P/L for every buy signal whose day has closed and
+ * that hasn't been priced yet. Buy signals are long-only. Fetches once per symbol
+ * (caller supplies the fetch). Returns only the records that gained a pnlPct.
+ */
+export async function resolveBuyPnl(
+  buys: BuySignalRecord[],
+  now: number,
+  fetchCandles: (symbol: string) => Promise<Candle[]>,
+): Promise<BuySignalRecord[]> {
+  const stale = buys.filter(b => b.pnlPct == null && isDayClosed(b.timestamp, now))
+  if (stale.length === 0) return []
+
+  const bySymbol = new Map<string, BuySignalRecord[]>()
+  for (const b of stale) {
+    const g = bySymbol.get(b.symbol)
+    if (g) g.push(b)
+    else bySymbol.set(b.symbol, [b])
+  }
+
+  const priced: BuySignalRecord[] = []
+  for (const [symbol, group] of bySymbol) {
+    let candles: Candle[] = []
+    try {
+      candles = await fetchCandles(symbol)
+    } catch {
+      continue // leave unpriced; a transient fetch failure isn't a P/L
+    }
+    for (const b of group) {
+      const r = scaledPnl(b.entryHigh, b.stop, b.targets, candles, b.timestamp)
+      if (r) priced.push({ ...b, pnlPct: r.pnlPct, pnlFullyClosed: r.fullyClosed })
+    }
+  }
+  return priced
 }

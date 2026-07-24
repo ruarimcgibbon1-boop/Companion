@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed } from '../src/lib/eod-resolver'
-import type { Candle, SetupLog } from '../src/types'
+import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed, scaledPnl, resolveBuyPnl } from '../src/lib/eod-resolver'
+import type { Candle, SetupLog, BuySignalRecord } from '../src/types'
 
 // 2026-07-23 13:00 ET ≈ 17:00 UTC (EDT = UTC-4). A weekday.
 const DAY_ET_1PM = Date.UTC(2026, 6, 23, 17, 0, 0)
@@ -123,6 +123,93 @@ describe('resolveOpenLogs — batch', () => {
     const midSession = Date.UTC(2026, 6, 23, 18, 0, 0) // 14:00 ET same day
     let called = false
     await resolveOpenLogs([log()], midSession, async () => { called = true; return [] })
+    expect(called).toBe(false)
+  })
+})
+
+describe('scaledPnl — ½ T1, ½ T2, breakeven after T1', () => {
+  // entry 100, stop 98 (2% risk), T1 102 (+2%), T2 105 (+5%).
+  const entry = 100, stop = 98, targets = [102, 105]
+  const run = (cs: Candle[]) => scaledPnl(entry, stop, targets, cs, DAY_ET_1PM)
+
+  it('books ½ at T1 and ½ at T2 for a full winner', () => {
+    const r = run([
+      candle([17, 5], 100, 102.5, 100.2, 102),   // hits T1
+      candle([17, 10], 102, 105.2, 101.5, 105),  // hits T2
+    ])!
+    expect(r.pnlPct).toBeCloseTo(0.5 * 2 + 0.5 * 5, 6) // 3.5%
+    expect(r.fullyClosed).toBe(true)
+  })
+
+  it('takes a full loss at the stop when it hits before T1', () => {
+    const r = run([candle([17, 5], 100, 100.5, 97.5, 98)])!
+    expect(r.pnlPct).toBeCloseTo(-2, 6)
+    expect(r.legs[0].reason).toBe('stop')
+  })
+
+  it('breakeven-stops the remainder after T1 (half the T1 gain, not a loss)', () => {
+    const r = run([
+      candle([17, 5], 100, 102.3, 100.2, 102),   // T1 → book ½ +2%, stop to 100
+      candle([17, 10], 101, 101.5, 99.5, 100),   // dips to breakeven → book ½ at 0%
+    ])!
+    expect(r.pnlPct).toBeCloseTo(1, 6) // 0.5*2 + 0.5*0
+    expect(r.legs.some(l => l.reason === 'breakeven')).toBe(true)
+  })
+
+  it('marks the remainder to the close when neither T2 nor breakeven is hit', () => {
+    const r = run([
+      candle([17, 5], 100, 102.3, 100.2, 102),   // T1
+      candle([17, 10], 102, 103, 100.5, 103),    // drifts, closes 103
+    ])!
+    expect(r.pnlPct).toBeCloseTo(0.5 * 2 + 0.5 * 3, 6) // 2.5%
+    expect(r.fullyClosed).toBe(false)
+  })
+
+  it('scores a bar straddling stop and T1 as the adverse (stop) outcome', () => {
+    const r = run([candle([17, 5], 100, 103, 97, 100)])! // both 98 and 102 tagged
+    expect(r.pnlPct).toBeCloseTo(-2, 6)
+  })
+
+  it('books both legs when one bar clears T1 and T2', () => {
+    const r = run([candle([17, 5], 100, 106, 100.5, 105)])!
+    expect(r.pnlPct).toBeCloseTo(3.5, 6)
+    expect(r.fullyClosed).toBe(true)
+  })
+
+  it('returns null with no candles on the day', () => {
+    expect(run([])).toBeNull()
+  })
+})
+
+describe('resolveBuyPnl — batch', () => {
+  const now = Date.UTC(2026, 6, 24, 14, 0, 0) // next day: closed
+  function buy(over: Partial<BuySignalRecord> = {}): BuySignalRecord {
+    return {
+      id: 'x', setupId: 'x', symbol: 'AAA', timestamp: DAY_ET_1PM, setupType: 'opening_range_break',
+      triggerPrice: 100, entryLow: 99.5, entryHigh: 100, invalidation: 98, stop: 98,
+      targets: [102, 105], score: 60, grade: 'B', rewardRisk: 2, priceAtSignal: 100, ...over,
+    }
+  }
+
+  it('prices only unpriced, day-closed buys and skips the rest', async () => {
+    const fetches: string[] = []
+    const fetchCandles = async (s: string) => {
+      fetches.push(s)
+      return [candle([17, 5], 100, 102.5, 100.2, 102), candle([17, 10], 102, 105.2, 101.5, 105)]
+    }
+    const priced = await resolveBuyPnl([
+      buy({ id: 'a' }),
+      buy({ id: 'b', pnlPct: 1.2 }),          // already priced → skipped
+    ], now, fetchCandles)
+    expect(fetches).toEqual(['AAA'])
+    expect(priced.map(b => b.id)).toEqual(['a'])
+    expect(priced[0].pnlPct).toBeCloseTo(3.5, 6)
+  })
+
+  it('skips buys whose day has not closed', async () => {
+    const midSession = Date.UTC(2026, 6, 23, 18, 0, 0)
+    let called = false
+    await resolveBuyPnl([buy()], midSession, async () => { called = true; return [] })
     expect(called).toBe(false)
   })
 })

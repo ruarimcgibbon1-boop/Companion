@@ -7,7 +7,7 @@ import { dataAge } from '@/lib/market-hours'
 import { GRADE_DESCRIPTIONS } from '@/lib/scoring-matrix'
 import {
   SETUP_TYPE_LABELS, SETUP_STATE_LABELS,
-  type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType,
+  type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType, type BuySignalRecord,
 } from '@/types'
 
 type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'roadmap' | 'signals' | 'buylog' | 'review' | 'settings'
@@ -533,15 +533,16 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   const roadmaps = useTradingStore(s => s.roadmaps)
   const selectSymbol = useTradingStore(s => s.selectSymbol)
   const clear = useTradingStore(s => s.clearBuySignals)
-  const { resolveNow, status, lastResolved, openCount } = useEodResolution()
+  const { resolveNow, status, lastResolved, pendingCount } = useEodResolution()
   const logById = useMemo(() => new Map(setupLogs.map(l => [l.id, l])), [setupLogs])
+  const pnl = useMemo(() => computeBuyPnl(buySignals), [buySignals])
 
   const exportCsv = () => {
-    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'flagged', 'trend15m', 'dist_vwap_pct', 'dist_dayhigh_pct', 'rvol', 'hhll', 'atr_pct', 'outcome', 'mfe_pct', 'mae_pct']
+    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'flagged', 'trend15m', 'dist_vwap_pct', 'dist_dayhigh_pct', 'rvol', 'hhll', 'atr_pct', 'outcome', 'mfe_pct', 'mae_pct', 'pnl_pct', 'pnl_closed']
     const n1 = (v: number | null | undefined) => (v == null ? '' : v.toFixed(1))
     const rows = buySignals.map(b => {
       const log = logById.get(b.setupId)
-      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, b.flagged ? 'flagged' : '', b.ctxTrend15m ?? '', n1(b.ctxDistVwapPct), n1(b.ctxDistDayHighPct), n1(b.ctxRelVol), b.ctxHigherHighsLows == null ? '' : (b.ctxHigherHighsLows ? 'HH' : 'no'), n1(b.ctxAtrPct), log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
+      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, b.flagged ? 'flagged' : '', b.ctxTrend15m ?? '', n1(b.ctxDistVwapPct), n1(b.ctxDistDayHighPct), n1(b.ctxRelVol), b.ctxHigherHighsLows == null ? '' : (b.ctxHigherHighsLows ? 'HH' : 'no'), n1(b.ctxAtrPct), log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? '', b.pnlPct == null ? '' : b.pnlPct.toFixed(2), b.pnlPct == null ? '' : (b.pnlFullyClosed === false ? 'open_at_close' : 'closed')].join(',')
     })
     const csv = [head.join(','), ...rows].join('\n')
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
@@ -560,16 +561,35 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
         <div className="flex gap-2">
           <button
             onClick={() => resolveNow()}
-            disabled={status === 'running' || openCount === 0}
-            title="Replay closed-day tapes and resolve any outcomes still marked open"
+            disabled={status === 'running' || pendingCount === 0}
+            title="Replay closed-day tapes: resolve open outcomes and price the scaled-out P/L"
             className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40"
           >
-            {status === 'running' ? 'Resolving…' : `Resolve open${openCount ? ` (${openCount})` : ''}`}
+            {status === 'running' ? 'Resolving…' : `Resolve open${pendingCount ? ` (${pendingCount})` : ''}`}
           </button>
           <button onClick={exportCsv} disabled={!buySignals.length} className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40">Export CSV</button>
           <button onClick={clear} disabled={!buySignals.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
         </div>
       </div>
+
+      {pnl.n > 0 && (
+        <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-900/30">
+          <div className="flex items-center gap-4 text-[11px]">
+            <span className="text-gray-500">Realized P/L <span className="text-gray-600">(½ T1 · ½ T2 · b/e stop)</span></span>
+            <span className={pnl.net >= 0 ? 'text-emerald-400' : 'text-red-400'}>Net <b>{pnl.net >= 0 ? '+' : ''}{pnl.net.toFixed(1)}%</b></span>
+            <span className={pnl.avg >= 0 ? 'text-emerald-400/90' : 'text-red-400/90'}>Avg {pnl.avg >= 0 ? '+' : ''}{pnl.avg.toFixed(2)}%/trade</span>
+            <span className="text-gray-400">Green {pnl.winRate}%</span>
+            <span className="text-gray-600">{pnl.n} priced{pnl.pending > 0 ? ` · ${pnl.pending} pending` : ''}</span>
+          </div>
+          {pnl.byType.length > 1 && (
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] text-gray-500">
+              {pnl.byType.map(t => (
+                <span key={t.label}>{t.label} <span className={t.net >= 0 ? 'text-emerald-400/80' : 'text-red-400/80'}>{t.net >= 0 ? '+' : ''}{t.net.toFixed(1)}%</span> <span className="text-gray-600">({t.n})</span></span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {buySignals.length === 0 ? (
         <div className="text-center text-gray-600 text-sm py-16">
@@ -599,7 +619,13 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
                 <span className="text-[11px] text-right text-emerald-400/90">{b.targets.slice(0, 2).map(t => `$${fmt(t)}`).join(' ') || '—'}</span>
                 <span className="text-[11px] text-right text-gray-300">{b.score}</span>
                 <div className="text-right">
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${oc.cls}`}>{oc.label}</span>
+                  {b.pnlPct != null ? (
+                    <span className={`text-[11px] font-semibold ${b.pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {b.pnlPct >= 0 ? '+' : ''}{b.pnlPct.toFixed(1)}%{b.pnlFullyClosed === false ? '*' : ''}
+                    </span>
+                  ) : (
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${oc.cls}`}>{oc.label}</span>
+                  )}
                   <div className="text-[10px] mt-0.5">
                     {log ? (
                       <span className="text-gray-500">+{log.maxFavorablePct.toFixed(1)}% / {log.maxAdversePct.toFixed(1)}%</span>
@@ -735,6 +761,25 @@ function testBucket(label: string, ls: SetupLog[]): Bucket {
   return { label, n: ls.length, win: res.length ? (w.length / res.length) * 100 : 0, mfe: avg(ls.map(l => l.maxFavorablePct)), mae: avg(ls.map(l => l.maxAdversePct)) }
 }
 function avg(xs: number[]): number { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0 }
+
+// Realized scaled-out P/L summary over the buy signals that have been priced.
+function computeBuyPnl(buys: BuySignalRecord[]) {
+  const priced = buys.filter(b => b.pnlPct != null)
+  const pending = buys.filter(b => b.pnlPct == null).length
+  const pcts = priced.map(b => b.pnlPct as number)
+  const net = pcts.reduce((a, b) => a + b, 0)
+  const wins = pcts.filter(p => p > 0).length
+  const byTypeMap = new Map<string, number[]>()
+  for (const b of priced) {
+    const k = SETUP_TYPE_LABELS[b.setupType]
+    if (!byTypeMap.has(k)) byTypeMap.set(k, [])
+    byTypeMap.get(k)!.push(b.pnlPct as number)
+  }
+  const byType = [...byTypeMap.entries()]
+    .map(([label, ps]) => ({ label, n: ps.length, net: ps.reduce((a, b) => a + b, 0), avg: avg(ps) }))
+    .sort((a, b) => b.net - a.net)
+  return { n: priced.length, pending, net, avg: avg(pcts), winRate: priced.length ? Math.round((wins / priced.length) * 100) : 0, byType }
+}
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
