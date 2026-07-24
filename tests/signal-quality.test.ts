@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
-  detectSetups, rollingOver, longBounceRolledOver, type DetectionContext,
+  detectSetups, rollingOver, longBounceRolledOver, volumeExpanding, type DetectionContext,
 } from '../src/lib/setup-detectors'
 import { buildKeyLevels } from '../src/lib/levels-engine'
 import { calculateSessionLevels } from '../src/lib/technical'
@@ -49,6 +49,35 @@ function ctx(candles: Candle[], price: number, over: Partial<DetectionContext> =
     session: 'regular', minutesSinceOpen: 60, float: 5_000_000, ...over,
   }
 }
+
+describe('volumeExpanding', () => {
+  const vbars = (vols: number[]): Candle[] =>
+    vols.map((v, i) => ({ time: 1_700_000_000 + i * 300, open: 5, high: 5.1, low: 4.9, close: 5, volume: v }))
+
+  it('confirms sustained-volume continuation (thrust above the recent lull)', () => {
+    // A mid-trend break: the break bar beats the immediate prior bars by >20%,
+    // even though it is NOT an outsized spike vs a long trending average.
+    // prior avg 265k, last 350k > 318k → confirms.
+    expect(volumeExpanding(vbars([300_000, 280_000, 260_000, 240_000, 250_000, 260_000, 350_000]))).toBe(true)
+  })
+
+  it('rejects a break on fading volume', () => {
+    expect(volumeExpanding(vbars([300_000, 280_000, 260_000, 250_000, 240_000, 230_000, 210_000]))).toBe(false)
+  })
+
+  it('rejects flat volume (no expansion on the break)', () => {
+    expect(volumeExpanding(vbars([200_000, 200_000, 200_000, 200_000, 200_000, 200_000, 200_000]))).toBe(false)
+  })
+
+  it('is not fooled by an inflated long-run average the way a 20-bar baseline was', () => {
+    // A huge spike 12 bars back sits OUTSIDE the 8-bar lookback, so the recent
+    // thrust (220k vs a ~150k lull) still confirms — a 20-bar mean would have
+    // been dragged up by that early spike and rejected it.
+    expect(volumeExpanding(vbars([
+      2_000_000, 150_000, 150_000, 150_000, 150_000, 150_000, 150_000, 150_000, 150_000, 150_000, 150_000, 220_000,
+    ]))).toBe(true)
+  })
+})
 
 describe('rollingOver', () => {
   it('flags a lower-highs down-leg', () => {

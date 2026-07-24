@@ -89,12 +89,23 @@ function volumeContracting(candles: Candle[]): boolean {
   return secondHalf < firstHalf * 0.9
 }
 
-function volumeExpanding(candles: Candle[]): boolean {
-  const recent = lastN(candles, 20)
-  if (recent.length < 5) return false
-  const avg = recent.reduce((s, c) => s + c.volume, 0) / recent.length
+// Volume confirmation — the single gate on EVERY momentum trigger, so its
+// calibration sets breadth across the whole stack. "Expanding" means the break
+// bar carries more volume than the bars IMMEDIATELY before it. The old 20-bar
+// average penalised CONTINUATION breaks: mid-trend that average is already
+// inflated by the move, so a real thrust rarely cleared 1.3× it and HOD/BOS
+// triggers starved (2026-07-23: only 3 setups all day). Compare to the recent
+// lull at a lower multiple instead — still rejects a break on fading/dead
+// volume, but admits the sustained-volume continuation we kept missing.
+const VOLUME_EXPANSION_MULT = 1.2
+const VOLUME_EXPANSION_LOOKBACK = 8
+export function volumeExpanding(candles: Candle[]): boolean {
+  const recent = lastN(candles, VOLUME_EXPANSION_LOOKBACK)
+  if (recent.length < 4) return false
   const last = recent[recent.length - 1]
-  return last.volume > avg * 1.3
+  const prior = recent.slice(0, -1)
+  const avg = prior.reduce((s, c) => s + c.volume, 0) / prior.length
+  return avg > 0 && last.volume > avg * VOLUME_EXPANSION_MULT
 }
 
 // ── Long-bounce quality gates (from the 2026-07-06/07 trade review) ──────────
