@@ -398,9 +398,9 @@ describe('stop-width floors', () => {
   it('bounce/pullback longs never carry a stop tighter than 1.5% (SEER noise floor)', () => {
     const c = bars([4.9, 4.95, 5.0, 5.02, 5.0, 5.01, 5.0])
     const setups = detectSetups(ctx(c, 5.0, { technical: technical({ atr: 0.005 }) }))
-    const bounces = setups.filter(s => s.direction === 'long' && !STRENGTH.has(s.type))
+    const bounces = setups.filter(s => s.direction === 'long' && s.entryFill != null && !STRENGTH.has(s.type))
     for (const s of bounces) {
-      expect(s.entryFill - s.invalidation).toBeGreaterThanOrEqual(5.0 * 0.015 - 1e-9)
+      expect(s.entryFill! - s.invalidation).toBeGreaterThanOrEqual(5.0 * 0.015 - 1e-9)
     }
   })
 
@@ -409,12 +409,12 @@ describe('stop-width floors', () => {
     // 0.4%-of-fill floor binds here and keeps the stop well clear of noise.
     const c = bars([4.9, 4.95, 5.0, 5.02, 5.0, 5.01, 5.0])
     const setups = detectSetups(ctx(c, 5.0, { technical: technical({ atr: 0.005 }) }))
-    const strength = setups.filter(s => s.direction === 'long' && STRENGTH.has(s.type))
+    const strength = setups.filter(s => s.direction === 'long' && s.entryFill != null && STRENGTH.has(s.type))
     expect(strength.length).toBeGreaterThan(0)
     for (const s of strength) {
-      const stopDist = s.entryFill - s.invalidation
+      const stopDist = s.entryFill! - s.invalidation
       // pivot = max(1.3 × ATR, 0.4% of fill); with ATR 0.005 the % floor wins.
-      expect(stopDist).toBeGreaterThanOrEqual(Math.max(1.3 * 0.005, s.entryFill * 0.004) - 1e-9)
+      expect(stopDist).toBeGreaterThanOrEqual(Math.max(1.3 * 0.005, s.entryFill! * 0.004) - 1e-9)
       expect(stopDist).toBeGreaterThan(0.005) // never merely the razor-thin ATR
     }
   })
@@ -443,7 +443,7 @@ describe('breakout R/R geometry (2026-07-23 NVEC regression)', () => {
     sessionLevels: session({ premarketHigh: 4.9, vwap: 5.0 }),
   }))
   const strength = setups.filter(s =>
-    s.direction === 'long' &&
+    s.direction === 'long' && s.entryFill != null &&
     ['opening_range_break', 'break_of_structure', 'breakout'].includes(s.type))
 
   it('produces a strength setup on the chased break', () => {
@@ -452,10 +452,10 @@ describe('breakout R/R geometry (2026-07-23 NVEC regression)', () => {
 
   it('trails the stop to the pivot (~1.3 ATR under the fill), not the base low', () => {
     for (const s of strength) {
-      const risk = s.entryFill - s.invalidation
+      const risk = s.entryFill! - s.invalidation
       // pivot risk ≈ 0.065 (1.3 × 0.05); the old base-low stop would be ~4% (~0.2).
-      expect(risk).toBeLessThan(s.entryFill * 0.02) // well under the 4% base-low risk
-      expect(risk).toBeGreaterThan(0.005)           // still clear of noise
+      expect(risk).toBeLessThan(s.entryFill! * 0.02) // well under the 4% base-low risk
+      expect(risk).toBeGreaterThan(0.005)            // still clear of noise
     }
   })
 
@@ -465,7 +465,7 @@ describe('breakout R/R geometry (2026-07-23 NVEC regression)', () => {
       expect(s.rewardRisk!).toBeGreaterThanOrEqual(1.5)
       // no target sits within the min-reward floor of the fill (no bp-away noise)
       for (const t of s.targets) {
-        expect(t.price - s.entryFill).toBeGreaterThan(s.entryFill * 0.003)
+        expect(t.price - s.entryFill!).toBeGreaterThan(s.entryFill! * 0.003)
       }
     }
   })

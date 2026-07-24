@@ -7,6 +7,7 @@ import { TradeJournal } from '@/components/journal/TradeJournal'
 import { OpportunitiesDrawer } from '@/components/opportunities/OpportunitiesDrawer'
 import { ContinuationDrawer } from '@/components/continuation/ContinuationDrawer'
 import { useMonitor } from '@/hooks/useMonitor'
+import { useEodResolution } from '@/hooks/useEodResolution'
 import { useTradingStore } from '@/store/trading-store'
 
 export function TopBar() {
@@ -20,6 +21,9 @@ export function TopBar() {
 
   // Always-on monitoring engine — runs app-wide, independent of the selected ticker.
   useMonitor()
+  // Reconcile any open outcomes from sessions that have since closed (the app
+  // wasn't live through their close), so the Buy Log reflects the real tape.
+  useEodResolution({ auto: true })
   const setupCount = useTradingStore(s => s.monitoredSetups.filter(su => su.score >= 75).length)
   const unreadSignals = useTradingStore(s => s.monitorAlerts.filter(a => !a.read).length)
 

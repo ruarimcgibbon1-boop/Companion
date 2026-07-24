@@ -2,6 +2,7 @@
 
 import { useState, useMemo } from 'react'
 import { useTradingStore } from '@/store/trading-store'
+import { useEodResolution } from '@/hooks/useEodResolution'
 import { dataAge } from '@/lib/market-hours'
 import { GRADE_DESCRIPTIONS } from '@/lib/scoring-matrix'
 import {
@@ -532,6 +533,7 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   const roadmaps = useTradingStore(s => s.roadmaps)
   const selectSymbol = useTradingStore(s => s.selectSymbol)
   const clear = useTradingStore(s => s.clearBuySignals)
+  const { resolveNow, status, lastResolved, openCount } = useEodResolution()
   const logById = useMemo(() => new Map(setupLogs.map(l => [l.id, l])), [setupLogs])
 
   const exportCsv = () => {
@@ -551,8 +553,19 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
-        <span className="text-[11px] text-gray-500">{buySignals.length} buy signals logged · newest first · timestamps in ET</span>
+        <span className="text-[11px] text-gray-500">
+          {buySignals.length} buy signals logged · newest first · timestamps in ET
+          {status === 'done' && lastResolved > 0 && <span className="text-emerald-400"> · resolved {lastResolved}</span>}
+        </span>
         <div className="flex gap-2">
+          <button
+            onClick={() => resolveNow()}
+            disabled={status === 'running' || openCount === 0}
+            title="Replay closed-day tapes and resolve any outcomes still marked open"
+            className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40"
+          >
+            {status === 'running' ? 'Resolving…' : `Resolve open${openCount ? ` (${openCount})` : ''}`}
+          </button>
           <button onClick={exportCsv} disabled={!buySignals.length} className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40">Export CSV</button>
           <button onClick={clear} disabled={!buySignals.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
         </div>
