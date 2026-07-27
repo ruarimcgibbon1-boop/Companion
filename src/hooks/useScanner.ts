@@ -23,8 +23,10 @@ export function useScanner() {
   const abortRef = useRef<AbortController | null>(null)
 
   const scan = useCallback(async (force = false) => {
-    // Skip background polling when the tab is hidden (a forced/manual scan still runs).
-    if (!force && typeof document !== 'undefined' && document.hidden) return
+    // Keeps polling even when the tab is hidden, so the monitor it feeds never
+    // runs against a stale/empty universe in a backgrounded session (that combo
+    // printed 0 signals on 2026-07-24/27). Browsers throttle background timers to
+    // ~once/minute, so this stays cheap; `force` still bypasses the server cache.
     abortRef.current?.abort()
     abortRef.current = new AbortController()
 
@@ -62,10 +64,9 @@ export function useScanner() {
   useEffect(() => {
     scan()
     timerRef.current = setInterval(() => scan(), SCAN_INTERVAL)
-    // Force a full re-pull on a fixed cadence regardless of tab visibility, so a
-    // backgrounded scanner still reflects the current gainers (the 20s poll above
-    // self-pauses when hidden). `force` bypasses both the hidden-tab guard and the
-    // server-side 20s cache.
+    // The 20s poll keeps running when hidden (throttled to ~1/min by the browser);
+    // this slower forced re-pull additionally bypasses the server-side 20s cache
+    // so a long-backgrounded scanner still gets a guaranteed fresh universe.
     bgTimerRef.current = setInterval(() => scan(true), BACKGROUND_REFRESH)
     // On refocus, refresh immediately so there's no stale flash.
     const onVisible = () => { if (!document.hidden) scan() }

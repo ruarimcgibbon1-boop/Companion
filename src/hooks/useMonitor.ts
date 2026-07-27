@@ -216,8 +216,12 @@ export function useMonitor() {
 
   const runSweep = useCallback(async () => {
     if (inFlight.current) return
-    // Pause when the tab is backgrounded — no point sweeping what nobody's watching.
-    if (typeof document !== 'undefined' && document.hidden) return
+    // Runs even when the tab is backgrounded — this is an always-on alerting
+    // engine, so it MUST keep detecting (and firing browser notifications) while
+    // you're looking elsewhere. Previously it paused on document.hidden, which
+    // meant a Companion sitting in a background tab did zero sweeps all session
+    // and printed 0 signals (2026-07-24/27). Browsers throttle background timers
+    // to ~once/minute on their own, which is plenty for signal detection.
     const store = useTradingStore.getState()
     const symbols = gatherUniverse()
     if (symbols.length === 0) return
@@ -392,7 +396,8 @@ export function useMonitor() {
   useEffect(() => {
     runSweep()
     timerRef.current = setInterval(runSweep, MONITOR_INTERVAL)
-    // Re-sweep immediately when the tab regains focus (it was paused while hidden).
+    // Re-sweep immediately on refocus so you see fresh data the instant you look
+    // back (the background interval is throttled to ~1/min, so this closes the gap).
     const onVisible = () => { if (!document.hidden) runSweep() }
     document.addEventListener('visibilitychange', onVisible)
     return () => {
