@@ -10,13 +10,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Candle } from '@/types'
 import { useTradingStore } from '@/store/trading-store'
-import { resolveOpenLogs, resolveBuyPnl } from '@/lib/eod-resolver'
+import { resolveOpenLogs, resolveBuyPnl, normalizeCandles } from '@/lib/eod-resolver'
 
 async function fetchDayCandles(symbol: string): Promise<Candle[]> {
   const res = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&interval=5min`)
   if (!res.ok) throw new Error(`candles ${symbol}: ${res.status}`)
   const data = await res.json()
-  return (data.candles ?? []) as Candle[]
+  // /api/candles returns candles keyed by `date` (ISO), not `time` (unix sec);
+  // normalizeCandles converts them so the resolver actually matches the day.
+  return normalizeCandles(data.candles)
 }
 
 // Fetch each symbol at most once per resolve pass — the log resolver and the P/L

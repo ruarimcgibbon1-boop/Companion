@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed, scaledPnl, resolveBuyPnl } from '../src/lib/eod-resolver'
+import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed, scaledPnl, resolveBuyPnl, normalizeCandles } from '../src/lib/eod-resolver'
 import type { Candle, SetupLog, BuySignalRecord } from '../src/types'
 
 // 2026-07-23 13:00 ET ≈ 17:00 UTC (EDT = UTC-4). A weekday.
@@ -211,5 +211,35 @@ describe('resolveBuyPnl — batch', () => {
     let called = false
     await resolveBuyPnl([buy()], midSession, async () => { called = true; return [] })
     expect(called).toBe(false)
+  })
+})
+
+describe('normalizeCandles — /api/candles date→time', () => {
+  it('derives unix-second time from an ISO date string', () => {
+    const iso = '2026-07-28T10:45:00-04:00'
+    const [c] = normalizeCandles([{ date: iso, open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 }])
+    expect(c.time).toBe(Math.floor(new Date(iso).getTime() / 1000))
+    expect(c).toMatchObject({ open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 })
+  })
+
+  it('passes through candles that already carry a numeric time', () => {
+    const [c] = normalizeCandles([{ time: 1785250000, open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 }])
+    expect(c.time).toBe(1785250000)
+  })
+
+  it('drops rows with neither time nor date, and non-arrays', () => {
+    expect(normalizeCandles([{ open: 1, high: 2, low: 0.5, close: 1.5 }])).toEqual([])
+    expect(normalizeCandles(null)).toEqual([])
+    expect(normalizeCandles(undefined)).toEqual([])
+  })
+
+  it('feeds the resolver so a date-keyed tape actually resolves (the prod bug)', () => {
+    // Same-day ISO candles at/after a 13:00 ET signal, tagging T1 132.
+    const raw = [
+      { date: '2026-07-23T13:00:00-04:00', open: 130, high: 130.5, low: 129.8, close: 130.4, volume: 1 },
+      { date: '2026-07-23T13:05:00-04:00', open: 130.4, high: 132.2, low: 130.2, close: 132, volume: 1 },
+    ]
+    const r = resolveLogAgainstCandles(log(), normalizeCandles(raw))
+    expect(r!.outcome).toBe('target_hit') // was 'expired'/null before the fix (time undefined)
   })
 })

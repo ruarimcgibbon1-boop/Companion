@@ -27,6 +27,34 @@ export function sameEtDay(a: number, b: number): boolean {
 }
 
 /**
+ * Normalize candles from /api/candles into the resolver's shape. The route returns
+ * Yahoo/FMP candles keyed by `date` (ISO ET string), NOT the `time` (unix seconds)
+ * the resolver filters on — so a raw cast matched ZERO candles and silently
+ * resolved nothing (every outcome stuck 'open', every pnl blank). Accepts either
+ * shape and drops rows that carry neither a usable time nor date.
+ */
+export function normalizeCandles(raw: unknown): Candle[] {
+  if (!Array.isArray(raw)) return []
+  const out: Candle[] = []
+  for (const c of raw) {
+    if (!c || typeof c !== 'object') continue
+    const o = c as Record<string, unknown>
+    const time = typeof o.time === 'number'
+      ? o.time
+      : typeof o.date === 'string'
+      ? Math.floor(new Date(o.date).getTime() / 1000)
+      : NaN
+    if (!Number.isFinite(time)) continue
+    out.push({
+      time,
+      open: Number(o.open), high: Number(o.high), low: Number(o.low),
+      close: Number(o.close), volume: Number(o.volume ?? 0),
+    })
+  }
+  return out
+}
+
+/**
  * Is the trading day of `ts` fully over as of `now`? A prior ET date is always
  * closed; today's date is closed only once we're past the 16:00 regular close
  * (afterhours / overnight / weekend). This keeps the resolver from prematurely
