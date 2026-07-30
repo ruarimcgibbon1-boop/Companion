@@ -642,7 +642,12 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
 // premarket VWAP is the earliest read on a runner. This fires ONLY in premarket
 // (RTH hands off to the ORB detector at the open) and demands a real gap + a VWAP
 // hold, so it flags the in-play gappers and stays quiet on names drifting on air.
-const PREMARKET_MIN_GAP_PCT = 4 // must have gapped this much vs prior close to be "in play"
+// Premarket access thresholds — loosened 2026-07-29 to arm more early gappers
+// (was gap 4% / coil 3%). The PM-VWAP hold below is kept as the quality gate, so
+// this widens breadth without re-admitting fading names. NOTE: premarket fills are
+// thin — treat the resulting P/L with a slippage haircut, not at face value.
+const PREMARKET_MIN_GAP_PCT = 2    // gap vs prior close to count as "in play" (was 4)
+const PREMARKET_MAX_COIL_PCT = 0.05 // prior bars must have based within this % of the PM high (was 0.03)
 
 function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, sessionLevels: sl, candles, session } = ctx
@@ -662,7 +667,7 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   // was COILING near the premarket high first (a base), not spiking through it from
   // far below. The bars before the break must have reached within ~3% of the high.
   const priorHigh = Math.max(...candles.slice(0, -1).map(c => c.high))
-  if ((pmHigh - priorHigh) / pmHigh > 0.03) return null
+  if ((pmHigh - priorHigh) / pmHigh > PREMARKET_MAX_COIL_PCT) return null
 
   // Break level = the premarket high; clearing the prior-day high too is extra strength.
   const band = (t.atr ?? price * 0.01) * 0.3
