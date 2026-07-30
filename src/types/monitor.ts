@@ -470,6 +470,7 @@ export interface MonitorFunnel {
   tracked: number             // setups that cleared the floor (entered the state machine)
   byState: Partial<Record<SetupState, number>>  // geometry state among tracked
   triggered: number           // long setups with triggeredRaw among tracked
+  droppedSession: number      // …dropped as untradeable (after-hours / overnight)
   droppedVeto: number         // triggered longs dropped by the quality veto (flagged)
   droppedStandDown: number    // …by the failed-bounce stand-down
   droppedCapped: number       // …by the per-symbol cap

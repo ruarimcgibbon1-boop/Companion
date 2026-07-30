@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed, scaledPnl, resolveBuyPnl, normalizeCandles } from '../src/lib/eod-resolver'
+import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed, scaledPnl, resolveBuyPnl, normalizeCandles, slippageForSession } from '../src/lib/eod-resolver'
 import type { Candle, SetupLog, BuySignalRecord } from '../src/types'
 
 // 2026-07-23 13:00 ET ≈ 17:00 UTC (EDT = UTC-4). A weekday.
@@ -203,7 +203,9 @@ describe('resolveBuyPnl — batch', () => {
     ], now, fetchCandles)
     expect(fetches).toEqual(['AAA'])
     expect(priced.map(b => b.id)).toEqual(['a'])
-    expect(priced[0].pnlPct).toBeCloseTo(3.5, 6)
+    // Winner (~3.5% clean) with the RTH slippage haircut applied by resolveBuyPnl.
+    expect(priced[0].pnlPct).toBeGreaterThan(3.0)
+    expect(priced[0].pnlPct).toBeLessThan(3.5)
   })
 
   it('skips buys whose day has not closed', async () => {
@@ -241,5 +243,40 @@ describe('normalizeCandles — /api/candles date→time', () => {
     ]
     const r = resolveLogAgainstCandles(log(), normalizeCandles(raw))
     expect(r!.outcome).toBe('target_hit') // was 'expired'/null before the fix (time undefined)
+  })
+})
+
+describe('slippage haircut', () => {
+  const entry = 100, stop = 98, targets = [102, 105]
+  const winner = [
+    candle([17, 5], 100, 102.5, 100.2, 102),
+    candle([17, 10], 102, 105.2, 101.5, 105),
+  ]
+
+  it('reduces P/L vs a clean fill and always costs (never improves)', () => {
+    const clean = scaledPnl(entry, stop, targets, winner, DAY_ET_1PM, 0)!
+    const hair = scaledPnl(entry, stop, targets, winner, DAY_ET_1PM, 0.005)!
+    expect(hair.pnlPct).toBeLessThan(clean.pnlPct)
+    expect(clean.pnlPct).toBeCloseTo(3.5, 6)
+  })
+
+  it('turns a clean-fill breakeven into a small loss (round-trip cost)', () => {
+    // T1 then breakeven stop: 0% clean, but slippage makes both fills worse.
+    const cs = [
+      candle([17, 5], 100, 102.3, 100.2, 102),  // T1
+      candle([17, 10], 101, 101.5, 99.5, 100),  // dips to breakeven
+    ]
+    const clean = scaledPnl(entry, stop, targets, cs, DAY_ET_1PM, 0)!
+    const hair = scaledPnl(entry, stop, targets, cs, DAY_ET_1PM, 0.005)!
+    expect(clean.pnlPct).toBeCloseTo(1, 6)
+    expect(hair.pnlPct).toBeLessThan(1)
+  })
+
+  it('charges more slippage in extended hours than regular', () => {
+    const rth = slippageForSession('regular')
+    const pm = slippageForSession('premarket')
+    const ah = slippageForSession('afterhours')
+    expect(pm).toBeGreaterThan(rth)
+    expect(ah).toBeGreaterThan(rth)
   })
 })

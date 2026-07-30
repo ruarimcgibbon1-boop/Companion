@@ -10,7 +10,7 @@
  */
 
 import type { Candle, SetupLog, BuySignalRecord } from '@/types'
-import { getSessionType } from './market-hours'
+import { getSessionType, type SessionType } from './market-hours'
 
 // ── Day helpers ──────────────────────────────────────────────────────────────
 
@@ -141,6 +141,17 @@ export function resolveLogAgainstCandles(log: SetupLog, candles: Candle[]): Setu
 const SCALE_T1_FRACTION = 0.5
 const BREAKEVEN_AFTER_T1 = true
 
+// Slippage haircut (per side, as a fraction of price): the resolver fills at the
+// exact level, but real fills are worse — you pay up on entry and give up on the
+// exit. Premarket/after-hours books are thin, so the haircut is far bigger there.
+// Applied to entry AND every exit leg, so a round-trip costs ~2×. Tunable; without
+// this, premarket P/L reads far rosier than it will ever trade.
+const SLIPPAGE_RTH = 0.0015      // 0.15%/side in regular hours
+const SLIPPAGE_EXTENDED = 0.005  // 0.5%/side premarket / after-hours (thin)
+export function slippageForSession(s: SessionType): number {
+  return s === 'regular' ? SLIPPAGE_RTH : SLIPPAGE_EXTENDED
+}
+
 export interface PnlLeg { fraction: number; exitPrice: number; reason: 'T1' | 'T2' | 'stop' | 'breakeven' | 'close' }
 export interface PnlResult { pnlPct: number; legs: PnlLeg[]; fullyClosed: boolean }
 
@@ -161,6 +172,7 @@ export function scaledPnl(
   targets: number[],
   candles: Candle[],
   signalMs: number,
+  slippagePct = 0,
 ): PnlResult | null {
   if (entry <= 0) return null
   const signalSec = Math.floor(signalMs / 1000)
@@ -177,8 +189,13 @@ export function scaledPnl(
   let t1Done = false
   let pnlFrac = 0 // sum of fraction × per-share-return
 
+  // Fill worse than the level: pay up on entry, give up on every exit. Detection
+  // still uses the raw levels (the market really touched them); only the FILL is
+  // haircut. Legs keep the raw level for readability; the P/L uses the effective fill.
+  const entryEff = entry * (1 + slippagePct)
   const bookAt = (fraction: number, price: number, reason: PnlLeg['reason']) => {
-    pnlFrac += fraction * ((price - entry) / entry)
+    const exitEff = price * (1 - slippagePct)
+    pnlFrac += fraction * ((exitEff - entryEff) / entryEff)
     legs.push({ fraction, exitPrice: price, reason })
     held -= fraction
   }
@@ -281,7 +298,8 @@ export async function resolveBuyPnl(
       continue // leave unpriced; a transient fetch failure isn't a P/L
     }
     for (const b of group) {
-      const r = scaledPnl(b.entryHigh, b.stop, b.targets, candles, b.timestamp)
+      const slip = slippageForSession(getSessionType(b.timestamp))
+      const r = scaledPnl(b.entryHigh, b.stop, b.targets, candles, b.timestamp, slip)
       if (r) priced.push({ ...b, pnlPct: r.pnlPct, pnlFullyClosed: r.fullyClosed })
     }
   }

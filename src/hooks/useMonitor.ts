@@ -260,7 +260,7 @@ export function useMonitor() {
       const funnel: MonitorFunnel = {
         timestamp: now, scanned: results.length, symbolsWithSetups: 0, rawSetups: 0,
         belowFloor: 0, tracked: 0, byState: {}, triggered: 0,
-        droppedVeto: 0, droppedStandDown: 0, droppedCapped: 0, droppedDup: 0, logged: 0,
+        droppedSession: 0, droppedVeto: 0, droppedStandDown: 0, droppedCapped: 0, droppedDup: 0, logged: 0,
       }
 
       for (const r of results) {
@@ -325,7 +325,12 @@ export function useMonitor() {
           if (setup.direction === 'long' && setup.triggeredRaw) {
             funnel.triggered++
             const dup = isDuplicateBuy(setup.symbol, fill, now, allBuys)
-            if (setup.qualityVetoed) funnel.droppedVeto++
+            // After-close gate: a trigger printed once the market's shut (or
+            // overnight) is untradeable — you can't act on it, and it fired off the
+            // closing print (2026-07-29 logged 3 at 16:01). Premarket + regular stay.
+            const tradeable = r.integrity.session === 'premarket' || r.integrity.session === 'regular'
+            if (!tradeable) funnel.droppedSession++
+            else if (setup.qualityVetoed) funnel.droppedVeto++
             else if (standDown) funnel.droppedStandDown++
             else if (capped) funnel.droppedCapped++
             else if (dup) funnel.droppedDup++
