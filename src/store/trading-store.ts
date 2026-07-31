@@ -15,6 +15,7 @@ import type {
   SetupStateRecord,
   MonitorAlert,
   MonitorFunnel,
+  PatternHit,
   NotificationSettings,
   SetupLog,
   DataIntegrity,
@@ -46,6 +47,7 @@ interface MonitorSweep {
   roadmaps: Record<string, PriceRoadmap>
   meta: Record<string, DataIntegrity>
   symbolSetups: Record<string, DetectedSetup[]>
+  symbolPatterns: Record<string, PatternHit[] | undefined>
   setupStates: Record<string, SetupStateRecord>
   logs: SetupLog[]
   alerts: MonitorAlert[]
@@ -94,6 +96,7 @@ interface TradingStore {
   monitoredSetups: DetectedSetup[]                 // live — best setups across the universe
   monitorFunnel: MonitorFunnel | null              // live — latest sweep's signal funnel (ephemeral)
   symbolSetups: Record<string, DetectedSetup[]>    // live — every setup per symbol (unfiltered)
+  symbolPatterns: Record<string, PatternHit[] | undefined>  // live — candlestick pattern hits per symbol
   keyLevels: Record<string, KeyLevel[]>            // live — per symbol (for chart overlays)
   roadmaps: Record<string, PriceRoadmap>           // live — per symbol
   monitorMeta: Record<string, DataIntegrity>       // live — per symbol data integrity
@@ -197,6 +200,7 @@ export const useTradingStore = create<TradingStore>()(
       monitoredSetups: [],
       monitorFunnel: null,
       symbolSetups: {},
+      symbolPatterns: {},
       keyLevels: {},
       roadmaps: {},
       monitorMeta: {},
@@ -295,6 +299,7 @@ export const useTradingStore = create<TradingStore>()(
           roadmaps: { ...s.roadmaps, ...p.roadmaps },
           monitorMeta: { ...s.monitorMeta, ...p.meta },
           symbolSetups: { ...s.symbolSetups, ...p.symbolSetups },
+          symbolPatterns: { ...s.symbolPatterns, ...p.symbolPatterns },
           setupStates,
           setupLogs,
           monitorAlerts: p.alerts.length ? [...p.alerts, ...s.monitorAlerts].slice(0, 100) : s.monitorAlerts,

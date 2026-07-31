@@ -16,6 +16,7 @@ import { getYFCandles, getYFQuote } from './yahoo-client'
 import { calculateSessionLevels, calculateTechnical } from './technical'
 import { buildKeyLevels } from './levels-engine'
 import { detectSetups, type DetectionContext } from './setup-detectors'
+import { detectCandlePatterns } from './candlestick-patterns'
 import { buildRoadmap } from './roadmap-engine'
 import { getSessionType, minutesSinceOpen } from './market-hours'
 import { cache, cached, TTL } from './cache'
@@ -124,6 +125,14 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
     const setups = detectSetups(detCtx)
     const roadmap = buildRoadmap(sym, price, levels)
 
+    // Candlestick pattern scan (surfaced for the top-gainer universe). Location =
+    // pulled back near VWAP / 9EMA; trend = intraday uptrend. Filters make a hammer
+    // at support on volume read differently from one floating mid-range.
+    const ema9Dist = technical.ema9 != null && technical.ema9 > 0 ? Math.abs((price - technical.ema9) / technical.ema9) * 100 : 99
+    const atSupport = Math.abs(technical.distanceFromVwapPct ?? 99) < 1.5 || ema9Dist < 1
+    const uptrend = technical.trend5m === 'up' || technical.higherHighsLows === true
+    const patterns = detectCandlePatterns(intraday, { atSupport, uptrend })
+
     // Data integrity — freshest underlying data point.
     const freshestMs = Math.max(candleTs, quoteTs, yfQuote ? Date.now() - 30_000 : 0)
     const ageMs = Date.now() - freshestMs
@@ -143,6 +152,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       catalyst: hasCatalyst ? (cache.get<NewsItem[]>(`news:${sym}`)?.[0]?.quality ?? 'Catalyst') : 'No catalyst data',
       levels,
       setups,
+      patterns,
       roadmap,
       integrity: {
         marketDataTimestamp: freshestMs,

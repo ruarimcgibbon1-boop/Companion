@@ -7,10 +7,11 @@ import { dataAge } from '@/lib/market-hours'
 import { GRADE_DESCRIPTIONS } from '@/lib/scoring-matrix'
 import {
   SETUP_TYPE_LABELS, SETUP_STATE_LABELS,
-  type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType, type BuySignalRecord,
+  PATTERN_LABELS,
+  type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType, type BuySignalRecord, type PatternHit,
 } from '@/types'
 
-type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'roadmap' | 'signals' | 'buylog' | 'review' | 'settings'
+type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'patterns' | 'roadmap' | 'signals' | 'buylog' | 'review' | 'settings'
 
 const GRADE_COLOR: Record<SetupGrade, string> = {
   'A+': 'text-emerald-300 bg-emerald-900/40 border-emerald-700',
@@ -50,10 +51,12 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
 
   const watchlistCount = useTradingStore(s => s.watchlist.length)
   const buySignalCount = useTradingStore(s => s.buySignals.length)
+  const patternCount = useTradingStore(s => Object.values(s.symbolPatterns).reduce((n, p) => n + (p?.length ?? 0), 0))
   const TABS: { id: Tab; label: string; badge?: number }[] = [
     { id: 'opportunities', label: 'Opportunities' },
     { id: 'watchlist', label: `Watchlist${watchlistCount ? ` (${watchlistCount})` : ''}` },
     { id: 'approaching', label: 'Approaching' },
+    { id: 'patterns', label: `Patterns${patternCount ? ` (${patternCount})` : ''}` },
     { id: 'roadmap', label: 'Roadmap' },
     { id: 'signals', label: 'Signals', badge: unread },
     { id: 'buylog', label: `Buy Log${buySignalCount ? ` (${buySignalCount})` : ''}` },
@@ -93,6 +96,7 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
         {tab === 'opportunities' && <OpportunitiesTab onPick={onClose} />}
         {tab === 'watchlist' && <WatchlistTab onPick={onClose} />}
         {tab === 'approaching' && <ApproachingTab onPick={onClose} />}
+        {tab === 'patterns' && <PatternsTab onPick={onClose} />}
         {tab === 'roadmap' && <RoadmapTab />}
         {tab === 'signals' && <SignalsTab onPick={onClose} />}
         {tab === 'buylog' && <BuyLogTab onPick={onClose} />}
@@ -674,6 +678,71 @@ function FunnelCard() {
         {f.belowFloor > 0 ? ` · (${f.belowFloor} below floor)` : ''}
       </div>
     </div>
+  )
+}
+
+// ── Pattern Scan (top-10 gainers) ────────────────────────────────────────────
+
+const TOP_GAINERS_N = 10
+
+function PatternsTab({ onPick }: { onPick: () => void }) {
+  const scannerRows = useTradingStore(s => s.scannerRows)
+  const symbolPatterns = useTradingStore(s => s.symbolPatterns)
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+
+  // The day's top gainers = the scanner ranked by change, top N.
+  const top = useMemo(() =>
+    [...scannerRows].sort((a, b) => b.changePct - a.changePct).slice(0, TOP_GAINERS_N),
+    [scannerRows])
+
+  const rows = top
+    .map(g => ({ g, hits: (symbolPatterns[g.symbol] ?? []).slice().sort((a, b) => b.strength - a.strength) }))
+    .filter(r => r.hits.length > 0)
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="px-4 py-2 border-b border-gray-800">
+        <span className="text-[11px] text-gray-500">
+          Bullish candlestick patterns on the day&apos;s top {TOP_GAINERS_N} gainers · scored by location (at support), volume, and trend
+        </span>
+      </div>
+      {rows.length === 0 ? (
+        <div className="text-center text-gray-600 text-sm py-16 px-6">
+          No patterns on the top gainers right now. As a gainer forms a hammer, engulfing, morning star, or three-white-soldiers — especially pulled back to support on volume — it shows here.
+        </div>
+      ) : (
+        <div className="flex-1 overflow-y-auto divide-y divide-gray-800/60">
+          {rows.map(({ g, hits }) => (
+            <button key={g.symbol} onClick={() => { selectSymbol(g.symbol); onPick() }}
+              className="w-full text-left px-4 py-2.5 hover:bg-gray-800/40 flex items-start gap-3">
+              <div className="w-20 flex-shrink-0">
+                <div className="text-xs font-bold text-white">{g.symbol}</div>
+                <div className="text-[11px] font-mono text-green-400">+{g.changePct.toFixed(0)}%</div>
+              </div>
+              <div className="flex flex-wrap gap-1.5 min-w-0">
+                {hits.map((h, i) => <PatternChip key={i} hit={h} />)}
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PatternChip({ hit }: { hit: PatternHit }) {
+  const strong = hit.strength >= 75
+  const mid = hit.strength >= 55
+  const cls = strong ? 'text-emerald-300 bg-emerald-900/40 border-emerald-800'
+    : mid ? 'text-yellow-300 bg-yellow-900/30 border-yellow-900'
+    : 'text-gray-400 bg-gray-800/60 border-gray-700'
+  return (
+    <span className={`text-[11px] px-2 py-0.5 rounded border ${cls}`} title={`strength ${hit.strength}`}>
+      {PATTERN_LABELS[hit.pattern]}
+      <span className="font-mono text-[10px] opacity-80"> {hit.strength}</span>
+      {hit.atSupport && <span className="text-[9px] ml-1 opacity-70">@supp</span>}
+      {hit.volumeConfirmed && <span className="text-[9px] ml-0.5 opacity-70">·vol</span>}
+    </span>
   )
 }
 

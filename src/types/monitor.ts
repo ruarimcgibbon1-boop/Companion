@@ -268,7 +268,30 @@ export interface MonitorResult {
   roadmap: PriceRoadmap
   integrity: DataIntegrity
   technicals?: ContinuationTechnicals
+  /** Bullish candlestick patterns detected on this symbol now (top-gainer scan). */
+  patterns?: PatternHit[]
   error?: string
+}
+
+// ── Candlestick pattern scan (top-gainer universe) ──────────────────────────
+export type CandlePattern =
+  | 'hammer'
+  | 'bullish_engulfing'
+  | 'morning_star'
+  | 'three_white_soldiers'
+
+export interface PatternHit {
+  pattern: CandlePattern
+  atSupport: boolean       // formed at a pullback low / near support
+  volumeConfirmed: boolean // above-average volume on the signal candle
+  strength: number         // 0–100: base + location + volume + trend
+}
+
+export const PATTERN_LABELS: Record<CandlePattern, string> = {
+  hammer: 'Hammer',
+  bullish_engulfing: 'Bullish Engulfing',
+  morning_star: 'Morning Star',
+  three_white_soldiers: 'Three White Soldiers',
 }
 
 // ── State machine record (persisted for restart restoration) ────────────────

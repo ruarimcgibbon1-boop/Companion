@@ -249,6 +249,7 @@ export function useMonitor() {
       const roadmaps: Record<string, typeof results[number]['roadmap']> = {}
       const meta: Record<string, typeof results[number]['integrity']> = {}
       const symbolSetups: Record<string, DetectedSetup[]> = {}
+      const symbolPatterns: Record<string, typeof results[number]['patterns']> = {}
       const setupStates: Record<string, SetupStateRecord> = {}
       const logMap = new Map(s.setupLogs.map(l => [l.id, l]))
       const changedLogs: SetupLog[] = []
@@ -268,6 +269,7 @@ export function useMonitor() {
         roadmaps[r.symbol] = r.roadmap
         meta[r.symbol] = r.integrity
         symbolSetups[r.symbol] = r.setups
+        if (r.patterns && r.patterns.length > 0) symbolPatterns[r.symbol] = r.patterns
         if (r.setups.length > 0) funnel.symbolsWithSetups++
         funnel.rawSetups += r.setups.length
 
@@ -382,7 +384,7 @@ export function useMonitor() {
         .sort((a, b) => b.score - a.score)
         .slice(0, 60)
 
-      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, funnel, now })
+      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, symbolPatterns, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, funnel, now })
     } catch {
       /* network error — keep last state */
     } finally {
