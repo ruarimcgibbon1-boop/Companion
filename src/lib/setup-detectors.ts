@@ -131,7 +131,7 @@ const MIN_STOP_FLOOR_PCT = 0.004 // absolute stop-width floor when ATR is missin
 // The setups you enter on strength — the stop trails up to the pivot for these.
 // Mean-reversion bounces keep their structural stop under the level they bounce from.
 const STRENGTH_ENTRY_TYPES: SetupType[] = [
-  'breakout', 'bull_flag', 'break_of_structure', 'opening_range_break',
+  'breakout', 'bull_flag', 'break_of_structure', 'opening_range_break', 'opening_drive',
   'vwap_reclaim', 'level_reclaim',
 ]
 // A target only a few basis points beyond the fill is noise, not a target: it
@@ -147,6 +147,26 @@ const MIN_T1_REWARD_PCT = 0.004
 // runnable triggers sat 0.6–2.4% above the zone; the dead 8–10% chases — PRME
 // EMA21, ELTX pullback — get dropped.)
 const MAX_TRIGGER_EXTENSION_PCT = 0.04
+// Genuine runners (the day's top gainers) blow through the break level faster than
+// a bar can confirm, landing >4% past it — so the flat cap made us refuse exactly
+// the moves we most want (CYCU/NUWE 2026-07-30). Widen the cap for a strength entry
+// on a real runner (high RVOL + high ATR + big day move) so it can still trigger a
+// bit further past the level. This IS more chasing — the slippage haircut keeps the
+// measured P/L honest, and momentum_pullback still catches what runs past even this.
+const MAX_TRIGGER_EXTENSION_MOMENTUM = 0.09
+const RUNNER_MIN_RVOL = 5
+const RUNNER_MIN_ATR_PCT = 3
+const RUNNER_MIN_CHANGE_PCT = 20
+
+function maxTriggerExtension(ctx: DetectionContext, type: SetupType): number {
+  if (!STRENGTH_ENTRY_TYPES.includes(type)) return MAX_TRIGGER_EXTENSION_PCT
+  const t = ctx.technical
+  const rvol = t.relativeVolume ?? 0
+  const atrPct = t.atr != null && ctx.price > 0 ? (t.atr / ctx.price) * 100 : 0
+  const runner = rvol >= RUNNER_MIN_RVOL && atrPct >= RUNNER_MIN_ATR_PCT &&
+    Math.abs(ctx.changePct) >= RUNNER_MIN_CHANGE_PCT
+  return runner ? MAX_TRIGGER_EXTENSION_MOMENTUM : MAX_TRIGGER_EXTENSION_PCT
+}
 // Sum of the last 5 bars' dollar volume below which a name is untradeable. Low
 // by design: it screens out dead tickers (few-hundred-share bars) without
 // touching genuine low-float runners, which clear it many times over.
@@ -481,10 +501,13 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // Observed (instantaneous) state from geometry + evidence.
   // A vetoed trigger cannot advance to `triggered` (so it logs no BUY) but stays visible.
   const vetoed = args.vetoTrigger?.active ?? false
-  // An over-extended long bounce is a chase, not a fillable trigger — drop it entirely.
+  // An over-extended long bounce is a chase, not a fillable trigger — drop it
+  // entirely. The cap widens for a strength entry on a genuine runner (see
+  // maxTriggerExtension) so the day's top gainers aren't refused for running fast.
+  const maxExt = maxTriggerExtension(ctx, type)
   const extended = direction === 'long'
-    ? price > zoneUpper * (1 + MAX_TRIGGER_EXTENSION_PCT)
-    : price < zoneLower * (1 - MAX_TRIGGER_EXTENSION_PCT)
+    ? price > zoneUpper * (1 + maxExt)
+    : price < zoneLower * (1 - maxExt)
   const rawTrigger = args.triggered && !extended
   const inZone = price >= zoneLower && price <= zoneUpper
   let state: SetupState
@@ -804,6 +827,72 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
 // targeted it; we only had dip-buyers). The go/no-go filter is the lesson from the
 // losers: a gapper is a "go" ONLY while it holds VWAP. NXTC/SHPH had already lost
 // VWAP when we bought their "bounce" and knifed — this detector never fires there.
+// The opening drive — the first 10% move of the day, before an opening range even
+// exists. ORB can't fire until or5High is set (~09:35) and by 09:45 it switches to
+// the wider 15-min range, so a name that tops early (NUWE peaked 09:40, 2026-07-30)
+// is missed. This covers 09:30–09:45: a gapper in play driving through its premarket
+// high (or prior-day high) on the open push, holding VWAP. Hands off to ORB after.
+const OPENING_DRIVE_WINDOW_MIN = 15
+
+function detectOpeningDrive(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, sessionLevels: sl, candles, session } = ctx
+  if (session !== 'regular') return null
+  if (ctx.minutesSinceOpen == null || ctx.minutesSinceOpen >= OPENING_DRIVE_WINDOW_MIN) return null
+
+  const vwap = sl.vwap
+  if (!inPlay(ctx)) return null
+  if (ctx.changePct <= 0) return null           // green on the day
+  if (vwap != null && price < vwap) return null  // holding VWAP
+  if (t.trend5m === 'down') return null
+
+  // The level a fresh gapper must clear to keep running: its premarket high, else PDH.
+  const pmHigh = sl.premarketHigh
+  const pdh = sl.previousDayHigh
+  const breakLevel = pmHigh ?? pdh
+  if (breakLevel == null) return null
+  if (price > breakLevel * 1.05) return null     // already well past → a chase, not the drive
+
+  const atr = t.atr ?? price * 0.01
+  const band = atr * 0.3
+  const zoneUpper = breakLevel
+  const zoneLower = breakLevel - Math.max(band, price * 0.004)
+  const invalidation = breakLevel - Math.max(atr * 0.5, price * 0.008)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
+  const rvol = t.relativeVolume ?? 0
+  const volOk = volumeExpanding(candles) || rvol >= 2
+  const triggered = closedAbove && price > breakLevel && volOk
+  const confirming = price >= zoneLower && price <= zoneUpper
+  const signals =
+    (closedAbove ? 1 : 0) + (volOk ? 1 : 0) +
+    (vwap != null && price > vwap ? 1 : 0) + (pdh != null && price > pdh ? 1 : 0)
+
+  const range = Math.max(atr * 2, price * 0.02)
+  const extraTargets: number[] = []
+  if (pdh != null && breakLevel === pmHigh && pdh > price * 1.002) extraTargets.push(pdh)
+  extraTargets.push(breakLevel + range, breakLevel + range * 2)
+
+  return buildSetup({
+    ctx, type: 'opening_drive', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Opening drive — first 15 min, breaking the ${pmHigh != null ? 'premarket high' : 'prior-day high'} $${breakLevel.toFixed(2)} on the open push${vwap != null ? `, holding VWAP $${vwap.toFixed(2)}` : ''}. RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle close above $${breakLevel.toFixed(2)} on the opening drive`,
+      'Volume expanding on the push',
+      'Holding above VWAP — no failed open',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: { volumeExpandsOnSignal: volumeExpanding(candles), unusualVolume: rvol > 3 },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: 'First-15-minute opening drive through the premarket / prior-day high — catches the early move before an opening range exists. Hands off to the ORB detector after.',
+  })
+}
+
 function detectOpeningRangeBreak(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, sessionLevels: sl, candles } = ctx
   const vwap = sl.vwap
@@ -1288,6 +1377,7 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
     detectMomentumPullback(ctx),
     detectBreakout(ctx),
     detectPremarketBreakout(ctx),
+    detectOpeningDrive(ctx),
     detectOpeningRangeBreak(ctx),
     detectHodBreak(ctx),
     detectBullFlag(ctx),

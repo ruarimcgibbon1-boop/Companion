@@ -28,6 +28,7 @@ function triggerConditionFor(type: SetupType, direction: 'long' | 'short'): stri
     case 'breakout': return 'a candle CLOSE above'
     case 'bull_flag': return 'a break + hold above the flag high'
     case 'break_of_structure': return 'a break of the prior swing high'
+    case 'opening_drive': return 'a break of the premarket/prior-day high'
     case 'pullback': return 'a bounce + reclaim of'
     case 'momentum_pullback': return 'a new high off the pullback above'
     case 'ema9_bounce': return 'a hold + reclaim above'

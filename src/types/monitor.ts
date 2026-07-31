@@ -17,6 +17,7 @@ export type SetupType =
   | 'breakout'
   | 'premarket_breakout'
   | 'opening_range_break'
+  | 'opening_drive'
   | 'hod_break'
   | 'bull_flag'
   | 'break_of_structure'
@@ -369,6 +370,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
     breakout: true,
     premarket_breakout: true,
     opening_range_break: true,
+    opening_drive: true,
     hod_break: true,
     bull_flag: true,
     break_of_structure: true,
@@ -486,6 +488,7 @@ export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   breakout: 'Breakout',
   premarket_breakout: 'Premarket Breakout',
   opening_range_break: 'Opening-Range Break',
+  opening_drive: 'Opening Drive',
   hod_break: 'HOD Break',
   bull_flag: 'Bull Flag',
   break_of_structure: 'Break of Structure',

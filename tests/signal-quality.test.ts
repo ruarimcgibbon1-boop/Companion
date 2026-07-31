@@ -540,3 +540,50 @@ describe('detectMomentumPullback — first pullback on a runner', () => {
       .some(s => s.type === 'momentum_pullback')).toBe(false)
   })
 })
+
+describe('detectOpeningDrive — first-15-min gapper drive', () => {
+  // Rising into a break of the premarket high (5.1) on the open push, last bar
+  // expanding volume. minutesSinceOpen inside the 15-min window.
+  function driveBars(): Candle[] {
+    const c = [4.90, 4.95, 5.00, 5.05, 5.08, 5.12, 5.15]
+    return c.map((x, i) => ({ time: 1_700_000_000 + i * 300, open: x - 0.02, high: x + 0.02, low: x - 0.03, close: x, volume: i === c.length - 1 ? 400_000 : 100_000 }))
+  }
+  const run = (over = {}) => detectSetups(ctx(driveBars(), 5.15, {
+    minutesSinceOpen: 5, changePct: 12, sessionLevels: session({ vwap: 5.0 }), technical: technical({ atr: 0.08 }), ...over,
+  }))
+
+  it('fires in the first 15 min on the premarket-high break', () => {
+    const od = run().find(s => s.type === 'opening_drive')
+    expect(od).toBeTruthy()
+    expect(od!.triggeredRaw).toBe(true)
+  })
+
+  it('does not fire once past the opening window', () => {
+    expect(run({ minutesSinceOpen: 30 }).some(s => s.type === 'opening_drive')).toBe(false)
+  })
+
+  it('does not fire premarket (that is premarket_breakout territory)', () => {
+    expect(run({ session: 'premarket', minutesSinceOpen: null }).some(s => s.type === 'opening_drive')).toBe(false)
+  })
+})
+
+describe('runner extension cap — top gainers can trigger further past the break', () => {
+  // Price 5.35 sits ~4.7% above the break level (premarket high 5.1).
+  function extBars(): Candle[] {
+    const c = [5.00, 5.10, 5.20, 5.28, 5.32, 5.30, 5.35]
+    return c.map((x, i) => ({ time: 1_700_000_000 + i * 300, open: x - 0.02, high: x + 0.02, low: x - 0.03, close: x, volume: i === c.length - 1 ? 400_000 : 100_000 }))
+  }
+  const orb = (over = {}) => detectSetups(ctx(extBars(), 5.35, { changePct: 6, ...over }))
+    .find(s => s.type === 'opening_range_break')
+
+  it('a normal name is dropped as extended (>4% past the break)', () => {
+    const s = orb({ technical: technical({ atr: 0.08, relativeVolume: 3 }) })
+    if (s) expect(s.triggeredRaw).toBe(false)
+  })
+
+  it('a genuine runner (high RVOL + ATR + day move) still triggers at the same extension', () => {
+    const s = orb({ changePct: 25, technical: technical({ atr: 0.2, relativeVolume: 6 }) })
+    expect(s).toBeTruthy()
+    expect(s!.triggeredRaw).toBe(true)
+  })
+})
