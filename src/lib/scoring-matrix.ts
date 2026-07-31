@@ -54,6 +54,7 @@ export interface ScoringContext {
 const WEIGHTS: Record<SetupType, ScoreBreakdown> = {
   //                     level pa  vol trend cat  rr  liq conf
   pullback:            w(20, 15, 13, 12, 8, 17, 10, 5),
+  momentum_pullback:   w(10, 18, 18, 18, 9, 15, 7, 5),  // trend/price-action heavy: a runner's first pullback, weak on fixed levels
   breakout:            w(22, 12, 18, 8, 9, 14, 12, 5),
   opening_range_break: w(14, 14, 20, 15, 10, 14, 8, 5),
   premarket_breakout:  w(12, 13, 20, 14, 12, 14, 10, 5),
@@ -114,7 +115,7 @@ export function scoreSetup(ctx: ScoringContext): ScoreResult {
   else if (ctx.relativeVolume == null) { risks.push('Relative volume unavailable') }
   // Bounces/pullbacks/flags should see selling dry up into the zone; breakouts and
   // structure breaks should see volume EXPAND on the trigger bar.
-  const wantsContraction = ctx.setupType === 'pullback' || ctx.setupType === 'bull_flag' || ctx.setupType.includes('bounce')
+  const wantsContraction = ctx.setupType === 'pullback' || ctx.setupType === 'momentum_pullback' || ctx.setupType === 'bull_flag' || ctx.setupType.includes('bounce')
   const wantsExpansion = ctx.setupType === 'breakout' || ctx.setupType === 'bull_flag' ||
     ctx.setupType === 'break_of_structure' || ctx.setupType === 'vwap_reclaim' || ctx.setupType === 'level_reclaim'
   if (wantsContraction && ctx.volumeContractsIntoZone) volFill += 0.3

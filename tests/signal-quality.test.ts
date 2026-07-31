@@ -499,3 +499,44 @@ describe('breakout R/R geometry (2026-07-23 NVEC regression)', () => {
     }
   })
 })
+
+describe('detectMomentumPullback — first pullback on a runner', () => {
+  // Run up to 4.92, two red digestion bars, then a green bar reclaiming a new
+  // high on expanding volume. A strong in-play name holding VWAP.
+  function runnerBars(): Candle[] {
+    const o = [
+      [3.98, 4.05, 3.95, 4.00, 100_000],
+      [4.28, 4.35, 4.25, 4.30, 100_000],
+      [4.58, 4.65, 4.55, 4.60, 120_000],
+      [4.85, 4.92, 4.80, 4.90, 150_000], // run high
+      [4.88, 4.90, 4.70, 4.72, 100_000], // red pullback
+      [4.72, 4.74, 4.63, 4.66, 90_000],  // red pullback
+      [4.67, 5.00, 4.66, 4.98, 400_000], // green reclaim, new high, vol expands
+    ]
+    return o.map((b, i) => ({ time: 1_700_000_000 + i * 300, open: b[0], high: b[1], low: b[2], close: b[3], volume: b[4] }))
+  }
+  const run = (over = {}) => detectSetups(ctx(runnerBars(), 4.98, {
+    changePct: 15, sessionLevels: session({ vwap: 4.5 }), technical: technical({ atr: 0.08 }), ...over,
+  }))
+
+  it('triggers on the reclaim, with the stop under the pullback low', () => {
+    const mp = run().find(s => s.type === 'momentum_pullback')
+    expect(mp).toBeTruthy()
+    expect(mp!.triggeredRaw).toBe(true)
+    expect(mp!.invalidation).toBeLessThan(4.66)   // under the higher-low (~4.63)
+    expect(mp!.invalidation).toBeGreaterThan(4.4)  // but a tight stop, not the base
+  })
+
+  it('does not fire on a weak non-runner (small day change)', () => {
+    expect(run({ changePct: 3 }).some(s => s.type === 'momentum_pullback')).toBe(false)
+  })
+
+  it('does not fire once price has lost VWAP', () => {
+    expect(run({ sessionLevels: session({ vwap: 5.2 }) }).some(s => s.type === 'momentum_pullback')).toBe(false)
+  })
+
+  it('does not fire when 15m structure is broken (lower highs/lows)', () => {
+    expect(run({ technical: technical({ atr: 0.08, higherHighsLows: false }) })
+      .some(s => s.type === 'momentum_pullback')).toBe(false)
+  })
+})

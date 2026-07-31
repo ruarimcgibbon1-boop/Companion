@@ -599,6 +599,83 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
   })
 }
 
+// The first-pullback continuation entry on a RUNNER. The biggest gainers move
+// parabolically — you can't catch the initial vertical break without chasing past
+// the extension cap (CYCU +495%, 2026-07-30). The tradeable entry is the FIRST
+// orderly pullback: a strong in-play name that ran, digested a few bars off its
+// high while holding VWAP, then makes a new high off the dip. Entering the reclaim
+// sits right at the pullback high (not extended), stop under the higher-low → good
+// R/R on a name that's already proven it can run. Gated hard to strong uptrends so
+// it never becomes a knife-catcher; the rollover veto drops it once the pullback
+// turns into a reversal.
+const MOMENTUM_PULLBACK_MIN_CHANGE = 10   // ≥ this % on the day = a genuine runner
+const MOMENTUM_PULLBACK_MAX_DEPTH = 0.10  // pullback no deeper than this off the high (first pullback, not a rollover)
+
+function detectMomentumPullback(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles, sessionLevels: sl } = ctx
+  const vwap = sl.vwap
+  if (vwap == null) return null
+
+  // Only strong, in-play runners holding trend — not a generic dip.
+  if (!inPlay(ctx)) return null
+  if (t.trend5m === 'down') return null
+  if (price < vwap) return null
+  if (t.higherHighsLows !== true) return null
+  if (ctx.changePct < MOMENTUM_PULLBACK_MIN_CHANGE) return null
+
+  if (candles.length < 6) return null
+  const prior = candles.slice(0, -1)              // everything before the current (breakout) bar
+  const recentHigh = Math.max(...lastN(prior, 12).map(c => c.high)) // the run high being reclaimed
+  const pbBars = lastN(prior, 3)                  // the digestion bars before the reclaim
+  if (pbBars.length < 2) return null
+  const pbHigh = Math.max(...pbBars.map(c => c.high)) // the reclaim / trigger level
+  const pbLow = Math.min(...pbBars.map(c => c.low))   // the higher-low we stop under
+
+  // Shallow, controlled pullback off the high — not a deep give-back / rollover.
+  const offHigh = recentHigh > 0 ? (recentHigh - price) / recentHigh : 1
+  if (offHigh > MOMENTUM_PULLBACK_MAX_DEPTH) return null
+  if (price <= pbLow) return null
+
+  const atr = t.atr ?? price * 0.01
+  const zoneUpper = pbHigh
+  const zoneLower = pbLow
+  const invalidation = pbLow - Math.max(atr * 0.5, price * 0.005)
+
+  const triggered = newHighAfterPullback(candles) && volumeExpanding(candles) && price >= pbHigh
+  const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(candles)
+  const rvol = t.relativeVolume ?? 0
+  const signals =
+    (newHighAfterPullback(candles) ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
+    (rvol >= 2 ? 1 : 0) + (price > vwap ? 1 : 0)
+
+  // Targets: reclaim the prior high, then the measured continuation (the run height).
+  const runHeight = Math.max(recentHigh - pbLow, price * 0.01)
+  const extraTargets = [recentHigh, recentHigh + runHeight]
+
+  return buildSetup({
+    ctx, type: 'momentum_pullback', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `First pullback on a runner (+${ctx.changePct.toFixed(0)}% day, RVOL ${rvol.toFixed(1)}×) — digesting ${(offHigh * 100).toFixed(1)}% off the high $${recentHigh.toFixed(2)}, holding VWAP. Enter the reclaim of $${pbHigh.toFixed(2)}.`,
+    confirmation: [
+      `Reclaim of the pullback high $${pbHigh.toFixed(2)} — first new high off the dip`,
+      'Selling volume dried up into the pullback',
+      'Still holding above VWAP — trend intact',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeContractsIntoZone: volumeContracting(candles),
+      volumeExpandsOnSignal: volumeExpanding(candles),
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Pullback rolled over well off the high — continuation may have failed' },
+    extraTargets,
+    notes: 'First-pullback continuation on a strong intraday runner. Stop under the pullback low; targets the prior high then the measured continuation.',
+  })
+}
+
 function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, candles } = ctx
   const res = levelsAbove(ctx.levels, price).find(l => l.strength >= 45)
@@ -1208,6 +1285,7 @@ export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   }
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
+    detectMomentumPullback(ctx),
     detectBreakout(ctx),
     detectPremarketBreakout(ctx),
     detectOpeningRangeBreak(ctx),

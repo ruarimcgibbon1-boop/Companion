@@ -29,6 +29,7 @@ function triggerConditionFor(type: SetupType, direction: 'long' | 'short'): stri
     case 'bull_flag': return 'a break + hold above the flag high'
     case 'break_of_structure': return 'a break of the prior swing high'
     case 'pullback': return 'a bounce + reclaim of'
+    case 'momentum_pullback': return 'a new high off the pullback above'
     case 'ema9_bounce': return 'a hold + reclaim above'
     case 'ema21_bounce': return 'a higher low + reclaim above'
     case 'vwap_bounce': return 'buyers defending / hold above'

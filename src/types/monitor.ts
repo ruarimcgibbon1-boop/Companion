@@ -13,6 +13,7 @@
 
 export type SetupType =
   | 'pullback'
+  | 'momentum_pullback'
   | 'breakout'
   | 'premarket_breakout'
   | 'opening_range_break'
@@ -364,6 +365,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   inApp: true,
   setupTypes: {
     pullback: true,
+    momentum_pullback: true,
     breakout: true,
     premarket_breakout: true,
     opening_range_break: true,
@@ -480,6 +482,7 @@ export interface MonitorFunnel {
 
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   pullback: 'Pullback',
+  momentum_pullback: 'Momentum Pullback',
   breakout: 'Breakout',
   premarket_breakout: 'Premarket Breakout',
   opening_range_break: 'Opening-Range Break',
