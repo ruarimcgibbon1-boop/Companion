@@ -16,6 +16,7 @@ import type {
   MonitorAlert,
   MonitorFunnel,
   PatternHit,
+  PatternLogRecord,
   NotificationSettings,
   SetupLog,
   DataIntegrity,
@@ -54,6 +55,7 @@ interface MonitorSweep {
   buySignals: BuySignalRecord[]
   ranked: DetectedSetup[]
   funnel: MonitorFunnel
+  patternLogs: PatternLogRecord[]
   now: number
 }
 
@@ -97,6 +99,7 @@ interface TradingStore {
   monitorFunnel: MonitorFunnel | null              // live — latest sweep's signal funnel (ephemeral)
   symbolSetups: Record<string, DetectedSetup[]>    // live — every setup per symbol (unfiltered)
   symbolPatterns: Record<string, PatternHit[] | undefined>  // live — candlestick pattern hits per symbol
+  patternLog: PatternLogRecord[]                   // persisted — accumulating log of pattern occurrences
   keyLevels: Record<string, KeyLevel[]>            // live — per symbol (for chart overlays)
   roadmaps: Record<string, PriceRoadmap>           // live — per symbol
   monitorMeta: Record<string, DataIntegrity>       // live — per symbol data integrity
@@ -160,6 +163,7 @@ interface TradingStore {
   markAllMonitorAlertsRead: () => void
   clearMonitorAlerts: () => void
   clearBuySignals: () => void
+  clearPatternLog: () => void
   updateBuySignal: (id: string, patch: Partial<BuySignalRecord>) => void
   upsertSetupLog: (log: SetupLog) => void
   updateNotificationSettings: (patch: Partial<NotificationSettings>) => void
@@ -201,6 +205,7 @@ export const useTradingStore = create<TradingStore>()(
       monitorFunnel: null,
       symbolSetups: {},
       symbolPatterns: {},
+      patternLog: [],
       keyLevels: {},
       roadmaps: {},
       monitorMeta: {},
@@ -300,6 +305,10 @@ export const useTradingStore = create<TradingStore>()(
           monitorMeta: { ...s.monitorMeta, ...p.meta },
           symbolSetups: { ...s.symbolSetups, ...p.symbolSetups },
           symbolPatterns: { ...s.symbolPatterns, ...p.symbolPatterns },
+          // Accumulate pattern occurrences (deduped by id), newest first, capped.
+          patternLog: p.patternLogs.length
+            ? [...p.patternLogs.filter(r => !s.patternLog.some(e => e.id === r.id)), ...s.patternLog].slice(0, 500)
+            : s.patternLog,
           setupStates,
           setupLogs,
           monitorAlerts: p.alerts.length ? [...p.alerts, ...s.monitorAlerts].slice(0, 100) : s.monitorAlerts,
@@ -326,6 +335,7 @@ export const useTradingStore = create<TradingStore>()(
       })),
       clearMonitorAlerts: () => set({ monitorAlerts: [] }),
       clearBuySignals: () => set({ buySignals: [] }),
+      clearPatternLog: () => set({ patternLog: [] }),
       updateBuySignal: (id, patch) => set(s => ({
         buySignals: s.buySignals.map(b => b.id === id ? { ...b, ...patch } : b),
       })),
@@ -404,6 +414,7 @@ export const useTradingStore = create<TradingStore>()(
         monitorAlerts: s.monitorAlerts,
         buySignals: s.buySignals,
         setupLogs: s.setupLogs,
+        patternLog: s.patternLog,
         notificationSettings: s.notificationSettings,
         searchedSymbols: s.searchedSymbols,
         // Persist positions but strip live fields

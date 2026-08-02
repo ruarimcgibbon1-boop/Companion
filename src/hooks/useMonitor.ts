@@ -3,7 +3,11 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
-import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel } from '@/types'
+import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel, PatternLogRecord } from '@/types'
+
+// One pattern log per symbol+pattern per ~10-min bucket, so a hit that persists
+// across sweeps (the last candle is unchanged until a new bar closes) logs once.
+const PATTERN_LOG_BUCKET_MS = 10 * 60 * 1000
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -255,6 +259,8 @@ export function useMonitor() {
       const changedLogs: SetupLog[] = []
       const newAlerts: MonitorAlert[] = []
       const newBuySignals: BuySignalRecord[] = []
+      const newPatternLogs: PatternLogRecord[] = []
+      const loggedPatternIds = new Set(s.patternLog.map(r => r.id))
 
       // Signal funnel: count where candidates die this sweep, so a 0-signal day
       // is legible (scanned → detected → cleared floor → triggered → logged).
@@ -269,7 +275,21 @@ export function useMonitor() {
         roadmaps[r.symbol] = r.roadmap
         meta[r.symbol] = r.integrity
         symbolSetups[r.symbol] = r.setups
-        if (r.patterns && r.patterns.length > 0) symbolPatterns[r.symbol] = r.patterns
+        if (r.patterns && r.patterns.length > 0) {
+          symbolPatterns[r.symbol] = r.patterns
+          // Quietly log each occurrence (deduped per ~10-min bucket) to build the dataset.
+          const bucket = Math.floor(now / PATTERN_LOG_BUCKET_MS)
+          for (const p of r.patterns) {
+            const id = `${r.symbol}:${p.pattern}:${bucket}`
+            if (loggedPatternIds.has(id)) continue
+            loggedPatternIds.add(id)
+            newPatternLogs.push({
+              id, timestamp: now, symbol: r.symbol, pattern: p.pattern,
+              strength: p.strength, atSupport: p.atSupport, volumeConfirmed: p.volumeConfirmed,
+              price: r.price, changePct: r.changePct, rvol: r.relativeVolume,
+            })
+          }
+        }
         if (r.setups.length > 0) funnel.symbolsWithSetups++
         funnel.rawSetups += r.setups.length
 
@@ -384,7 +404,7 @@ export function useMonitor() {
         .sort((a, b) => b.score - a.score)
         .slice(0, 60)
 
-      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, symbolPatterns, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, funnel, now })
+      s.ingestMonitorSweep({ keyLevels, roadmaps, meta, symbolSetups, symbolPatterns, setupStates, logs: changedLogs, alerts: newAlerts, buySignals: newBuySignals, ranked, funnel, patternLogs: newPatternLogs, now })
     } catch {
       /* network error — keep last state */
     } finally {

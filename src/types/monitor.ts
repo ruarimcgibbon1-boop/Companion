@@ -294,6 +294,21 @@ export const PATTERN_LABELS: Record<CandlePattern, string> = {
   three_white_soldiers: 'Three White Soldiers',
 }
 
+/** A logged pattern occurrence — accumulated in the background to build a dataset
+ *  of which candlestick patterns on which gainers actually pay off. */
+export interface PatternLogRecord {
+  id: string               // symbol:pattern:timeBucket — deduped per occurrence
+  timestamp: number        // epoch ms when first logged
+  symbol: string
+  pattern: CandlePattern
+  strength: number
+  atSupport: boolean
+  volumeConfirmed: boolean
+  price: number            // price when the pattern logged (for later outcome resolution)
+  changePct: number        // day change at log time (to filter to the top gainers)
+  rvol: number | null
+}
+
 // ── State machine record (persisted for restart restoration) ────────────────
 
 export interface SetupStateRecord {

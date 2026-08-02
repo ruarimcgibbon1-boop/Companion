@@ -688,44 +688,80 @@ const TOP_GAINERS_N = 10
 function PatternsTab({ onPick }: { onPick: () => void }) {
   const scannerRows = useTradingStore(s => s.scannerRows)
   const symbolPatterns = useTradingStore(s => s.symbolPatterns)
+  const patternLog = useTradingStore(s => s.patternLog)
+  const clearPatternLog = useTradingStore(s => s.clearPatternLog)
   const selectSymbol = useTradingStore(s => s.selectSymbol)
 
   // The day's top gainers = the scanner ranked by change, top N.
   const top = useMemo(() =>
     [...scannerRows].sort((a, b) => b.changePct - a.changePct).slice(0, TOP_GAINERS_N),
     [scannerRows])
-
-  const rows = top
+  const liveRows = top
     .map(g => ({ g, hits: (symbolPatterns[g.symbol] ?? []).slice().sort((a, b) => b.strength - a.strength) }))
     .filter(r => r.hits.length > 0)
 
+  const exportCsv = () => {
+    const head = ['time_ET', 'symbol', 'pattern', 'strength', 'at_support', 'volume_confirmed', 'price', 'change_pct', 'rvol']
+    const rows = patternLog.map(r => [
+      etTime(r.timestamp), r.symbol, r.pattern, r.strength, r.atSupport ? 1 : 0, r.volumeConfirmed ? 1 : 0,
+      r.price, r.changePct.toFixed(1), r.rvol == null ? '' : r.rvol.toFixed(1),
+    ].join(','))
+    const url = URL.createObjectURL(new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' }))
+    const a = document.createElement('a')
+    a.href = url; a.download = `pattern-log-${new Date().toISOString().slice(0, 10)}.csv`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <div className="h-full flex flex-col">
-      <div className="px-4 py-2 border-b border-gray-800">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
         <span className="text-[11px] text-gray-500">
-          Bullish candlestick patterns on the day&apos;s top {TOP_GAINERS_N} gainers · scored by location (at support), volume, and trend
+          Candlestick scan · top {TOP_GAINERS_N} gainers · <span className="text-gray-400">{patternLog.length} logged</span>
         </span>
+        <div className="flex gap-2">
+          <button onClick={exportCsv} disabled={!patternLog.length} className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40">Export CSV</button>
+          <button onClick={clearPatternLog} disabled={!patternLog.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
+        </div>
       </div>
-      {rows.length === 0 ? (
-        <div className="text-center text-gray-600 text-sm py-16 px-6">
-          No patterns on the top gainers right now. As a gainer forms a hammer, engulfing, morning star, or three-white-soldiers — especially pulled back to support on volume — it shows here.
-        </div>
-      ) : (
-        <div className="flex-1 overflow-y-auto divide-y divide-gray-800/60">
-          {rows.map(({ g, hits }) => (
-            <button key={g.symbol} onClick={() => { selectSymbol(g.symbol); onPick() }}
-              className="w-full text-left px-4 py-2.5 hover:bg-gray-800/40 flex items-start gap-3">
-              <div className="w-20 flex-shrink-0">
-                <div className="text-xs font-bold text-white">{g.symbol}</div>
-                <div className="text-[11px] font-mono text-green-400">+{g.changePct.toFixed(0)}%</div>
-              </div>
-              <div className="flex flex-wrap gap-1.5 min-w-0">
-                {hits.map((h, i) => <PatternChip key={i} hit={h} />)}
-              </div>
-            </button>
-          ))}
-        </div>
-      )}
+
+      <div className="flex-1 overflow-y-auto">
+        {/* Live now */}
+        <div className="px-4 pt-2.5 pb-1 text-[10px] uppercase tracking-wide text-gray-600">Live now</div>
+        {liveRows.length === 0 ? (
+          <div className="px-4 py-3 text-[11px] text-gray-600">No patterns on the top gainers this moment — they log below as they form.</div>
+        ) : (
+          <div className="divide-y divide-gray-800/60">
+            {liveRows.map(({ g, hits }) => (
+              <button key={g.symbol} onClick={() => { selectSymbol(g.symbol); onPick() }}
+                className="w-full text-left px-4 py-2 hover:bg-gray-800/40 flex items-start gap-3">
+                <div className="w-20 flex-shrink-0">
+                  <div className="text-xs font-bold text-white">{g.symbol}</div>
+                  <div className="text-[11px] font-mono text-green-400">+{g.changePct.toFixed(0)}%</div>
+                </div>
+                <div className="flex flex-wrap gap-1.5 min-w-0">{hits.map((h, i) => <PatternChip key={i} hit={h} />)}</div>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Accumulating log */}
+        <div className="px-4 pt-4 pb-1 text-[10px] uppercase tracking-wide text-gray-600">Logged history · newest first</div>
+        {patternLog.length === 0 ? (
+          <div className="px-4 py-3 text-[11px] text-gray-600">The background scan hasn&apos;t logged any patterns yet. It quietly records each hit on the top gainers so a which-patterns-pay dataset builds over time.</div>
+        ) : (
+          <div className="divide-y divide-gray-800/50">
+            {patternLog.slice(0, 100).map(r => (
+              <button key={r.id} onClick={() => { selectSymbol(r.symbol); onPick() }}
+                className="w-full text-left px-4 py-1.5 hover:bg-gray-800/40 grid grid-cols-[4rem_3.5rem_1fr_2.5rem] gap-2 items-center">
+                <span className="text-[10px] font-mono text-gray-500">{etTime(r.timestamp)}</span>
+                <span className="text-[11px] font-bold text-white">{r.symbol} <span className="font-mono text-[10px] text-green-400/80">+{r.changePct.toFixed(0)}%</span></span>
+                <span className="text-[11px] text-gray-300">{PATTERN_LABELS[r.pattern]} {r.atSupport && <span className="text-[9px] text-gray-500">@supp</span>} {r.volumeConfirmed && <span className="text-[9px] text-gray-500">·vol</span>}</span>
+                <span className={`text-[11px] font-mono text-right ${r.strength >= 75 ? 'text-emerald-400' : r.strength >= 55 ? 'text-yellow-400' : 'text-gray-500'}`}>{r.strength}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
