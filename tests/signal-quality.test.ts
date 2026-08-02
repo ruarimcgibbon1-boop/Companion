@@ -138,7 +138,11 @@ describe('premarket-anchored VWAP', () => {
     }))
   }
 
-  it('produces a VWAP from premarket candles when there is no regular session yet', () => {
+  // "Today premarket" only exists on a weekday — isTodayPremarket() is false on
+  // Sat/Sun, so this session-behavior test can't run on a weekend.
+  const isEtWeekend = ['Sat', 'Sun'].includes(
+    new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' }).format(new Date()))
+  it.skipIf(isEtWeekend)('produces a VWAP from premarket candles when there is no regular session yet', () => {
     const candles = todayPremarketBars([2.0, 2.1, 2.25, 2.3, 2.28, 2.35, 2.4])
     const sl = calculateSessionLevels(candles, [])
     // Before this change vwap was null in premarket (regular-only) — now it anchors to premarket.
@@ -585,5 +589,49 @@ describe('runner extension cap — top gainers can trigger further past the brea
     const s = orb({ changePct: 25, technical: technical({ atr: 0.2, relativeVolume: 6 }) })
     expect(s).toBeTruthy()
     expect(s!.triggeredRaw).toBe(true)
+  })
+})
+
+describe('momentum_pullback stop cap (2026-07-31 ZEO fix)', () => {
+  // A hyper-ATR runner where one digestion bar wicks 25% below the reclaim.
+  function wildBars(): Candle[] {
+    const o = [
+      [4.60, 4.65, 4.55, 4.62, 100_000],
+      [4.70, 4.80, 4.68, 4.78, 120_000],
+      [4.85, 4.92, 4.80, 4.90, 150_000], // run high 4.92
+      [4.88, 4.90, 4.70, 4.72, 100_000], // red
+      [4.72, 4.74, 3.70, 4.66, 110_000], // red with a HUGE low wick to 3.70
+      [4.67, 5.00, 4.66, 4.98, 400_000], // green reclaim, new high, vol expands
+    ]
+    return o.map((b, i) => ({ time: 1_700_000_000 + i * 300, open: b[0], high: b[1], low: b[2], close: b[3], volume: b[4] }))
+  }
+
+  it('caps the stop at ~8% below the reclaim instead of 25% under the wick', () => {
+    const mp = detectSetups(ctx(wildBars(), 4.98, {
+      changePct: 30, sessionLevels: session({ vwap: 4.5 }), technical: technical({ atr: 0.4 }),
+    })).find(s => s.type === 'momentum_pullback')
+    expect(mp).toBeTruthy()
+    // Uncapped the stop would be ~3.6 (26% under the ~4.9 reclaim); the cap holds it ≥ 8% off.
+    expect(mp!.invalidation).toBeGreaterThan(4.4)
+    expect(mp!.invalidation).toBeLessThan(4.7)
+  })
+})
+
+describe('faded-name guard on the widened extension cap', () => {
+  function extBars(): Candle[] {
+    const c = [5.00, 5.10, 5.20, 5.28, 5.32, 5.30, 5.35]
+    return c.map((x, i) => ({ time: 1_700_000_000 + i * 300, open: x - 0.02, high: x + 0.02, low: x - 0.03, close: x, volume: i === c.length - 1 ? 400_000 : 100_000 }))
+  }
+  const orb = (over = {}) => detectSetups(ctx(extBars(), 5.35, { changePct: 25, ...over }))
+    .find(s => s.type === 'opening_range_break')
+
+  it('a runner NEAR its high still gets the wide cap and triggers at ~4.7% extension', () => {
+    const s = orb({ technical: technical({ atr: 0.2, relativeVolume: 6, distanceFromDayHighPct: -1 }) })
+    expect(s!.triggeredRaw).toBe(true)
+  })
+
+  it('a faded runner (far below the day high) loses the wide cap and is dropped as extended', () => {
+    const s = orb({ technical: technical({ atr: 0.2, relativeVolume: 6, distanceFromDayHighPct: -20 }) })
+    if (s) expect(s.triggeredRaw).toBe(false)
   })
 })

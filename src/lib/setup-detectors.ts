@@ -157,14 +157,21 @@ const MAX_TRIGGER_EXTENSION_MOMENTUM = 0.09
 const RUNNER_MIN_RVOL = 5
 const RUNNER_MIN_ATR_PCT = 3
 const RUNNER_MIN_CHANGE_PCT = 20
+// A "runner" must still be near its high. A name deep below the day high has already
+// faded — its break is a dead-cat, not a run — so it must NOT get the wider chase
+// cap (CUPR −44% off high / FCUV −32% kept dropping, 2026-07-31). Within this % of
+// the day high = still running; further off = faded, back to the strict 4% cap.
+const RUNNER_MAX_OFF_HIGH_PCT = 8
 
 function maxTriggerExtension(ctx: DetectionContext, type: SetupType): number {
   if (!STRENGTH_ENTRY_TYPES.includes(type)) return MAX_TRIGGER_EXTENSION_PCT
   const t = ctx.technical
   const rvol = t.relativeVolume ?? 0
   const atrPct = t.atr != null && ctx.price > 0 ? (t.atr / ctx.price) * 100 : 0
+  const offHigh = t.distanceFromDayHighPct ?? -99 // negative = below the day high
+  const nearHigh = offHigh > -RUNNER_MAX_OFF_HIGH_PCT
   const runner = rvol >= RUNNER_MIN_RVOL && atrPct >= RUNNER_MIN_ATR_PCT &&
-    Math.abs(ctx.changePct) >= RUNNER_MIN_CHANGE_PCT
+    Math.abs(ctx.changePct) >= RUNNER_MIN_CHANGE_PCT && nearHigh
   return runner ? MAX_TRIGGER_EXTENSION_MOMENTUM : MAX_TRIGGER_EXTENSION_PCT
 }
 // Sum of the last 5 bars' dollar volume below which a name is untradeable. Low
@@ -633,6 +640,12 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
 // turns into a reversal.
 const MOMENTUM_PULLBACK_MIN_CHANGE = 10   // ≥ this % on the day = a genuine runner
 const MOMENTUM_PULLBACK_MAX_DEPTH = 0.10  // pullback no deeper than this off the high (first pullback, not a rollover)
+// Cap the stop distance. On a hyper-ATR name the 3-bar pullback low can sit far
+// below the entry from one wild wick (ZEO 2026-07-31: pbLow 26% under entry → a
+// −26.8% trade), even when price is only a few % off the high. Never let the stop
+// exceed this % below the reclaim — a tighter stop stops out more on wild names,
+// but caps the per-trade loss instead of blowing up the book on one candle.
+const MOMENTUM_PULLBACK_MAX_STOP_PCT = 0.08
 
 function detectMomentumPullback(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, candles, sessionLevels: sl } = ctx
@@ -662,7 +675,9 @@ function detectMomentumPullback(ctx: DetectionContext): DetectedSetup | null {
   const atr = t.atr ?? price * 0.01
   const zoneUpper = pbHigh
   const zoneLower = pbLow
-  const invalidation = pbLow - Math.max(atr * 0.5, price * 0.005)
+  // Stop under the pullback low, but never further than MAX_STOP_PCT below the reclaim.
+  const rawInvalidation = pbLow - Math.max(atr * 0.5, price * 0.005)
+  const invalidation = Math.max(rawInvalidation, pbHigh * (1 - MOMENTUM_PULLBACK_MAX_STOP_PCT))
 
   const triggered = newHighAfterPullback(candles) && volumeExpanding(candles) && price >= pbHigh
   const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(candles)
