@@ -81,8 +81,12 @@ async function backfillRelativeVolume(rows: ScannerRow[], inPremarket: boolean):
       })
       if (!profile) return
       if (profile.relativeVolume != null) r.relativeVolume = profile.relativeVolume
-      // The measured premarket volume beats the 0 the candle feed reports.
-      if (profile.todayVolume > 0) {
+      // Only trust the number when the feed actually captured the tape. A tiny
+      // "measured" reading (HYFM's 55 premarket shares) is missing coverage, not
+      // thin liquidity — writing it here would let the premarket volume floor drop
+      // the very rockets we want to surface. When unmeasured, leave premarketVolume
+      // null (unknown) so the row survives and is ranked on price/change instead.
+      if (profile.measured && profile.todayVolume > 0) {
         r.premarketVolume = profile.todayVolume
         if (r.volume === 0) r.volume = profile.todayVolume
       }

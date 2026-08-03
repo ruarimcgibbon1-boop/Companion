@@ -40,8 +40,13 @@ export interface PremarketVolumeProfile {
   baselineVolume: number | null
   /** How many prior sessions the baseline is built from. */
   sessions: number
-  /** todayVolume ÷ baseline. Null when there is no prior-session history to compare against. */
+  /** todayVolume ÷ baseline. Null when the reading is untrustworthy — either no
+   *  prior-session history, or `measured` is false. */
   relativeVolume: number | null
+  /** Whether the feed actually captured this name's premarket tape. When false,
+   *  everything downstream must treat the volume as UNKNOWN, not as "low/dead" —
+   *  see the coverage-floor note below. */
+  measured: boolean
 }
 
 const PREMARKET_START_HHMM = 400
@@ -51,6 +56,17 @@ const PREMARKET_END_HHMM = 930
 const BASELINE_FLOOR_SHARES = 1_000
 /** Ratios beyond this are precision theatre (and blow up every display). */
 const MAX_REPORTED_RVOL = 999
+/**
+ * Below this many premarket shares, the feed has NOT captured the name's tape —
+ * so the reading is "unknown", not "low". FMP's intraday coverage is a subset of
+ * venues and for some tickers it's essentially empty premarket: 2026-08-03 it
+ * reported 55 shares for HYFM and 295 for EZRA — both of which gapped 200–500%
+ * and traded heavily (a name cannot move from $0.54 to $3.44 on 55 shares). A
+ * hard volume gate on those numbers blocks exactly the top-gainer rockets we most
+ * want. So under this floor we return relativeVolume null + measured false, and
+ * callers fall back to PRICE structure (the reliable signal) instead of vetoing.
+ */
+const COVERAGE_FLOOR_SHARES = 10_000
 
 function hhmm(date: string): number | null {
   // "2026-08-03 07:35:00" → 735. Anything else (ISO with offset) → parse the same slice.
@@ -98,13 +114,17 @@ export function premarketVolumeProfile(
   const prior: number[] = []
   for (const [day, vol] of byDay) if (day !== opts.todayEt) prior.push(vol)
 
+  // The feed didn't capture the tape → the number is unknown, not low. Fall back
+  // to price structure downstream rather than vetoing a rocket on missing data.
+  const measured = todayVolume >= COVERAGE_FLOOR_SHARES
+
   const baselineVolume = median(prior)
-  if (baselineVolume == null) {
-    return { todayVolume, baselineVolume: null, sessions: 0, relativeVolume: null }
+  if (!measured || baselineVolume == null) {
+    return { todayVolume, baselineVolume, sessions: prior.length, relativeVolume: null, measured }
   }
   const effective = Math.max(baselineVolume, BASELINE_FLOOR_SHARES)
   const relativeVolume = Math.min(todayVolume / effective, MAX_REPORTED_RVOL)
-  return { todayVolume, baselineVolume, sessions: prior.length, relativeVolume }
+  return { todayVolume, baselineVolume, sessions: prior.length, relativeVolume, measured }
 }
 
 /** Current ET wall-clock as HHMM (the same shape the FMP rows carry). */

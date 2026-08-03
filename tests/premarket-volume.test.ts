@@ -101,11 +101,27 @@ describe('premarketVolumeProfile', () => {
     expect(p.sessions).toBe(0)
   })
 
-  it('reports a measured zero for a name that has not traded premarket', () => {
-    const rows = [row('2026-07-31 08:00:00', 40_000), row('2026-07-30 08:00:00', 40_000)]
+  it('treats a below-coverage reading as UNKNOWN, not as "dead" (the HYFM case)', () => {
+    // FMP had 55 premarket shares for a name that gapped 500% and traded heavily —
+    // that is missing coverage, not low participation. A ratio built on it (0.1×)
+    // would veto exactly the rocket we want, so the profile reports it unmeasured
+    // (relativeVolume null) and callers fall back to price structure.
+    const rows = [
+      row('2026-08-03 08:00:00', 55),
+      row('2026-07-31 08:00:00', 40_000),
+      row('2026-07-30 08:00:00', 40_000),
+    ]
     const p = premarketVolumeProfile(rows, { todayEt: '2026-08-03', throughHHMM: 900 })
-    expect(p.todayVolume).toBe(0)
-    expect(p.relativeVolume).toBe(0)
+    expect(p.todayVolume).toBe(55)
+    expect(p.measured).toBe(false)
+    expect(p.relativeVolume).toBeNull()
+  })
+
+  it('marks a genuinely covered reading measured', () => {
+    const rows = [row('2026-08-03 08:00:00', 200_000), row('2026-07-31 08:00:00', 40_000)]
+    const p = premarketVolumeProfile(rows, { todayEt: '2026-08-03', throughHHMM: 900 })
+    expect(p.measured).toBe(true)
+    expect(p.relativeVolume).not.toBeNull()
   })
 })
 

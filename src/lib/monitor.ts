@@ -169,7 +169,11 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       changePct,
       volume: currentVolume,
       relativeVolume: technical.relativeVolume,
-      premarketVolume: premarket?.todayVolume ?? null,
+      // Only report the premarket volume when the feed actually captured the tape.
+      // A tiny "measured" number (HYFM 55 shares) is missing coverage, not thin
+      // liquidity — reporting it lets the buy-log floor and scanner filter drop the
+      // exact rockets we want. Null = unknown, and unknown never vetoes.
+      premarketVolume: premarket?.measured ? premarket.todayVolume : null,
       spreadPct: null,
       catalyst: hasCatalyst ? (cache.get<NewsItem[]>(`news:${sym}`)?.[0]?.quality ?? 'Catalyst') : 'No catalyst data',
       levels,

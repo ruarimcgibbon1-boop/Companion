@@ -392,32 +392,42 @@ describe('premarket breakout', () => {
     expect(setups.some(s => s.type === 'premarket_breakout')).toBe(false)
   })
 
-  // Premarket participation gate. The old volume check was
-  // `volumeExpanding(candles) || !hasVolumeData(candles) || rvol >= 1.5` — and the
-  // feed reports premarket volume as 0, so the "data gap" arm passed everything.
-  // A gap on air with nobody trading it is the dud we kept buying.
-  it('does NOT trigger on a gapper trading its NORMAL premarket volume', () => {
+  // Premarket in-play is judged by PRICE (a real top-gainer move), with volume as a
+  // bonus when the feed actually has the tape. The feed CANNOT see the biggest
+  // rockets — FMP had 55 premarket shares for HYFM, which gapped $0.54→$3.44 — so a
+  // hard volume gate blocks precisely the trades we want. A flat, low-gap name is
+  // the dud; a big gapper with a wide premarket range is the trade.
+
+  // A modest gap that isn't really moving, on unremarkable volume: neither the
+  // volume arm nor the price arm passes → no BUY (still visible as a watch).
+  const flatLowGapSession = () => session({ previousClose: 5.0, premarketHigh: 5.1, premarketLow: 5.02 })
+  it('does NOT trigger on a flat, low-gap name (a dud that does not move)', () => {
     const s = detectSetups(ctx(gapper, 5.15, {
-      session: 'premarket', technical: technical({ relativeVolume: 1.2 }),
+      session: 'premarket', sessionLevels: flatLowGapSession(),
+      technical: technical({ relativeVolume: 1.2 }),   // gap ~3%, range ~1.6%, rvol 1.2
     })).find(x => x.type === 'premarket_breakout')
-    // Still visible as a watch — it just cannot fire a BUY.
     expect(s).toBeTruthy()
     expect(s!.triggeredRaw).toBe(false)
   })
 
-  it('triggers when premarket volume is a genuine surge', () => {
+  it('triggers that same flat name once volume genuinely surges', () => {
     const s = detectSetups(ctx(gapper, 5.15, {
-      session: 'premarket', technical: technical({ relativeVolume: 12 }),
+      session: 'premarket', sessionLevels: flatLowGapSession(),
+      technical: technical({ relativeVolume: 12 }),    // volume arm carries it
     })).find(x => x.type === 'premarket_breakout')
     expect(s!.triggeredRaw).toBe(true)
   })
 
-  it('falls back to bar volume (and flags it) when the name has no premarket baseline', () => {
+  it('triggers a big premarket mover the feed cannot see — in play on PRICE (the HYFM case)', () => {
+    // Huge gap + wide premarket range, but no usable volume (rvol null). This is the
+    // exact name we were missing: it must fire on price, and say the volume is uncovered.
     const s = detectSetups(ctx(gapper, 5.15, {
-      session: 'premarket', technical: technical({ relativeVolume: null }),
+      session: 'premarket',
+      sessionLevels: session({ previousClose: 3.0, premarketHigh: 5.1, premarketLow: 3.2 }),
+      technical: technical({ relativeVolume: null }),
     })).find(x => x.type === 'premarket_breakout')
-    expect(s!.triggeredRaw).toBe(true)   // never block on missing data
-    expect(s!.risks.some(r => /baseline/i.test(r))).toBe(true)
+    expect(s!.triggeredRaw).toBe(true)
+    expect(s!.risks.some(r => /feed|price|covered/i.test(r))).toBe(true)
   })
 })
 
@@ -721,12 +731,15 @@ describe('faded-name guard on the widened extension cap', () => {
 })
 
 describe('premarket zero-volume trigger (2026-08-03 feed fix)', () => {
-  // Yahoo premarket 1-min bars come back with price but volume: 0.
+  // Yahoo premarket 1-min bars come back with price but volume: 0 — so premarket is
+  // judged on price. A moving gapper triggers; a flat non-mover does not, whatever
+  // the volume feed says.
   const pmBars = (vol: number): Candle[] =>
     [4.80, 4.90, 5.00, 5.05, 5.12].map((c, i) =>
       ({ time: 1_700_000_000 + i * 60, open: c - 0.03, high: c + 0.02, low: c - 0.04, close: c, volume: vol }))
 
-  it('premarket_breakout triggers on a zero-volume feed (data gap ≠ no volume)', () => {
+  it('premarket_breakout triggers on a zero-volume feed when the name is moving (data gap ≠ no signal)', () => {
+    // Default session: premarketHigh 5.1 / premarketLow 4.6 → ~11% premarket range.
     const pb = detectSetups(ctx(pmBars(0), 5.15, {
       session: 'premarket', changePct: 9, sessionLevels: session({ vwap: 4.5 }),
     })).find(s => s.type === 'premarket_breakout')
@@ -734,9 +747,11 @@ describe('premarket zero-volume trigger (2026-08-03 feed fix)', () => {
     expect(pb!.triggeredRaw).toBe(true)
   })
 
-  it('still requires expansion when volume DOES exist (flat volume → no trigger)', () => {
+  it('does NOT trigger a flat, low-gap name even when the feed reports volume', () => {
+    // Tight range (premarketLow 5.02) + small gap + unremarkable rvol → not moving.
     const pb = detectSetups(ctx(pmBars(100_000), 5.15, {
-      session: 'premarket', changePct: 9, sessionLevels: session({ vwap: 4.5 }),
+      session: 'premarket', changePct: 3,
+      sessionLevels: session({ vwap: 4.5, previousClose: 5.0, premarketHigh: 5.1, premarketLow: 5.02 }),
       technical: technical({ relativeVolume: 1 }),
     })).find(s => s.type === 'premarket_breakout')
     if (pb) expect(pb.triggeredRaw).toBe(false)

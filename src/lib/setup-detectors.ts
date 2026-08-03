@@ -18,7 +18,7 @@ import type {
 import { scoreSetup, type ScoringContext } from './scoring-matrix'
 import { approachThresholdPct } from './adaptive-threshold'
 import { deriveSignal } from './signals'
-import type { SessionType } from './market-hours'
+import { isPremarket, type SessionType } from './market-hours'
 
 export interface DetectionContext {
   symbol: string
@@ -813,16 +813,22 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
 // thin — treat the resulting P/L with a slippage haircut, not at face value.
 const PREMARKET_MIN_GAP_PCT = 2    // gap vs prior close to count as "in play" (was 4)
 const PREMARKET_MAX_COIL_PCT = 0.05 // prior bars must have based within this % of the PM high (was 0.03)
-// Premarket relative volume — the participation gate this detector never had.
-// Its only volume evidence used to be `volumeConfirmsTrigger(candles) || rvol >= 1.5`,
-// and BOTH sides were dead: the candle feed reports premarket volume as 0 (so
-// `hasVolumeData` is false and the check passes trivially as a "data gap"), and
-// RVOL was null/meaningless before 09:30. So the gate always said yes, and we
-// fired on names with a gap on air that never moved. Now that premarket RVOL is
-// real (see premarket-volume.ts), demand a genuine surge: trading this multiple
-// of its own typical premarket volume by this time of day. 2026-08-03 read:
-// UPC +102% was ~130× its baseline, AAPL 0.9×, the day's drifters well under 1.
-const PREMARKET_MIN_RVOL = 3
+// Premarket "in play" is judged by PRICE, with volume as a bonus — not the other
+// way round. The reason is data: the day's biggest premarket rockets are exactly
+// the names our volume feed can't see (2026-08-03 FMP had 55 premarket shares for
+// HYFM, which gapped $0.54→$3.44 and was traded heavily — the user took 5 green
+// trades on it while Companion, gating on that 55-share reading, never surfaced
+// it). A hard volume gate blocks precisely the trades we want. The reliable
+// premarket signal is price — Yahoo carries the full premarket price path even
+// when it reports volume 0 — so a name is in play premarket when EITHER measured
+// RVOL confirms a genuine surge (when the feed does have the tape — UPC was 597×
+// on 2026-08-03) OR price shows a real top-gainer move: a big gap AND/OR a wide
+// premarket range (it is actually trading, not a flat gap-and-sit dud). This
+// serves both halves of the brief — it catches HYFM/DFNS (big movers with no
+// usable volume) and still rejects the low-gap names that "don't move".
+const PREMARKET_MIN_RVOL = 3         // measured surge that confirms in-play on its own
+const PREMARKET_STRONG_GAP_PCT = 15  // a gap this large IS the top-gainer profile
+const PREMARKET_MIN_RANGE_PCT = 10   // premarket high→low swing proving the name trades
 
 function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, sessionLevels: sl, candles, session } = ctx
@@ -848,45 +854,60 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   const continuation = makingHigherLows(candles)
   if (!coiled && !continuation) return null
 
-  // Break level = the premarket high; clearing the prior-day high too is extra strength.
+  // Break level = the premarket high formed BEFORE the current bar. sl.premarketHigh
+  // includes the forming bar, so `close > pmHigh` can never be true — a bar's close
+  // can't exceed a high that includes itself. That made the trigger unsatisfiable in
+  // the live pipeline (it only ever "fired" in tests that hardcode pmHigh below the
+  // price), so a genuine break of the premarket high never registered. Clear the
+  // PRIOR premarket bars' high instead. Fall back to pmHigh when there aren't enough
+  // premarket bars to have a prior (keeps hardcoded-level unit tests valid).
+  const pmCandles = candles.filter(c => isPremarket(c.time * 1000))
+  const breakLevel = pmCandles.length >= 2
+    ? Math.max(...pmCandles.slice(0, -1).map(c => c.high))
+    : pmHigh
   const band = (t.atr ?? price * 0.01) * 0.3
-  const zoneUpper = pmHigh
-  const zoneLower = pmHigh - Math.max(band, price * 0.006)
-  const invalidation = pmHigh - Math.max((t.atr ?? price * 0.01) * 0.5, price * 0.01)
+  const zoneUpper = breakLevel
+  const zoneLower = breakLevel - Math.max(band, price * 0.006)
+  const invalidation = breakLevel - Math.max((t.atr ?? price * 0.01) * 0.5, price * 0.01)
 
   const lastCandle = candles[candles.length - 1]
-  const closedAbove = lastCandle ? lastCandle.close > pmHigh : false
+  const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
   const rvol = t.relativeVolume
-  // Real premarket participation, or no trigger. When the measure is unavailable
-  // (no prior-session history — a fresh listing) fall back to bar-over-bar
-  // expansion rather than blocking on missing data, and say so in the risks.
-  const volumeOk = rvol != null ? rvol >= PREMARKET_MIN_RVOL : volumeConfirmsTrigger(candles)
-  const triggered = closedAbove && price > pmHigh && volumeOk
+  // In play by volume (a measured surge, when the feed has the tape) OR by price (a
+  // real top-gainer move the feed can't see). See the constants above for why price
+  // leads. The price arm needs a genuine gap or evidence the name is actually
+  // trading a range — a wide premarket swing — so a flat low-gap dud fails both.
+  const pmLow = sl.premarketLow
+  const rangePct = pmLow != null && pmLow > 0 ? ((pmHigh - pmLow) / pmLow) * 100 : 0
+  const volumeConfirmed = rvol != null && rvol >= PREMARKET_MIN_RVOL
+  const movingByPrice = gapPct >= PREMARKET_STRONG_GAP_PCT || rangePct >= PREMARKET_MIN_RANGE_PCT
+  const inPlay = volumeConfirmed || movingByPrice
+  const triggered = closedAbove && price > breakLevel && inPlay
   const confirming = price >= zoneLower && price <= zoneUpper
   const pdh = sl.previousDayHigh
   const signals =
-    (closedAbove ? 1 : 0) + (volumeOk ? 1 : 0) +
+    (closedAbove ? 1 : 0) + (inPlay ? 1 : 0) +
     (vwap != null && price > vwap ? 1 : 0) + (pdh != null && price > pdh ? 1 : 0)
 
-  // Targets: prior-day high (the classic gap target) then measured moves off the gap.
+  // Targets: prior-day high (the classic gap target) then measured moves off the break.
   const range = Math.max((t.atr ?? price * 0.02) * 2, price * 0.02)
   const extraTargets: number[] = []
   if (pdh != null && pdh > price * 1.002) extraTargets.push(pdh)
-  extraTargets.push(pmHigh + range, pmHigh + range * 2)
+  extraTargets.push(breakLevel + range, breakLevel + range * 2)
 
   return buildSetup({
     ctx, type: 'premarket_breakout', direction: 'long',
     zoneLower, zoneUpper,
-    rationale: `Premarket breakout — gapped +${gapPct.toFixed(0)}% and pushing through the premarket high $${pmHigh.toFixed(2)}${vwap != null ? `, holding above PM VWAP $${vwap.toFixed(2)}` : ''}. ${rvol != null ? `Premarket RVOL ${rvol.toFixed(1)}×.` : 'Premarket RVOL unavailable (no prior-session history).'}`,
+    rationale: `Premarket breakout — gapped +${gapPct.toFixed(0)}% (range ${rangePct.toFixed(0)}%) and pushing through the premarket high $${pmHigh.toFixed(2)}${vwap != null ? `, holding above PM VWAP $${vwap.toFixed(2)}` : ''}. ${rvol != null ? `Premarket RVOL ${rvol.toFixed(1)}×.` : 'Premarket volume not covered by the feed — in play on price.'}`,
     confirmation: [
       `Candle CLOSE above the premarket high $${pmHigh.toFixed(2)}`,
-      'Real volume behind the push (premarket is thin — demand bids)',
+      'Price holding the gap and near the highs (buyers still in control)',
       'Holds the gap and PM VWAP into the 09:30 open',
     ],
     invalidation,
     testCount: 0,
     scoringOverrides: {
-      volumeExpandsOnSignal: volumeOk,
+      volumeExpandsOnSignal: volumeConfirmed,
       unusualVolume: (rvol ?? 0) > PREMARKET_MIN_RVOL,
     },
     confirmationSignals: signals,
@@ -896,7 +917,7 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
     notes: 'Premarket: thin liquidity and wide spreads — size down and expect slippage. Strongest when it holds the gap into the open.',
     risks: [
       'Premarket liquidity is thin — fills and stops are unreliable',
-      ...(rvol == null ? ['No premarket volume baseline for this name — participation unverified'] : []),
+      ...(rvol == null ? ['Premarket volume not covered by the data feed — participation unverified, judged on price'] : []),
       ...(rvol != null && rvol < PREMARKET_MIN_RVOL * 2 ? ['Premarket volume only modestly above normal — the gap may fade at the open'] : []),
     ],
   })
