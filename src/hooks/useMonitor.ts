@@ -46,6 +46,12 @@ function playAlertSound(kind: MonitorAlert['kind']) {
 
 // ── Universe gathering ──────────────────────────────────────────────────────
 
+// Focus the scanner-fed universe on the day's top gainers — that's where the
+// momentum edge is, and it keeps the sweep tight (2026-08-03: user "only focus on
+// the top 15 gainers"). Explicit picks (watchlist / open positions / selected) are
+// still monitored on top.
+const TOP_GAINERS_UNIVERSE = 15
+
 function gatherUniverse(): string[] {
   const s = useTradingStore.getState()
   const set = new Set<string>()
@@ -57,9 +63,10 @@ function gatherUniverse(): string[] {
   if (s.selectedSymbol) set.add(s.selectedSymbol)
   for (const sym of s.searchedSymbols.slice(0, 10)) set.add(sym)
 
-  // Scanner-wide mode also folds in every scanner row.
+  // Scanner-wide mode folds in the TOP N gainers by day change — not every row.
   if (scope === 'scanner') {
-    for (const r of s.scannerRows) set.add(r.symbol)
+    const topGainers = [...s.scannerRows].sort((a, b) => b.changePct - a.changePct).slice(0, TOP_GAINERS_UNIVERSE)
+    for (const r of topGainers) set.add(r.symbol)
   }
   return [...set].slice(0, 40)
 }

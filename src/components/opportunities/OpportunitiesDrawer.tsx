@@ -683,7 +683,7 @@ function FunnelCard() {
 
 // ── Pattern Scan (top-10 gainers) ────────────────────────────────────────────
 
-const TOP_GAINERS_N = 10
+const TOP_GAINERS_N = 15
 
 function PatternsTab({ onPick }: { onPick: () => void }) {
   const scannerRows = useTradingStore(s => s.scannerRows)
