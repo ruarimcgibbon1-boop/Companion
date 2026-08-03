@@ -670,7 +670,7 @@ function FunnelCard() {
       </div>
       {f.triggered > 0 && f.logged < f.triggered && (
         <div className="mt-1 text-[10px] text-gray-500">
-          Triggered but dropped: <span className="text-red-400/80">veto {f.droppedVeto}</span> · after-close {f.droppedSession} · stand-down {f.droppedStandDown} · capped {f.droppedCapped} · dup {f.droppedDup}
+          Triggered but dropped: <span className="text-red-400/80">veto {f.droppedVeto}</span> · after-close {f.droppedSession} · low-vol {f.droppedVolume} · stand-down {f.droppedStandDown} · capped {f.droppedCapped} · dup {f.droppedDup}
         </div>
       )}
       <div className="mt-1 text-[10px] text-gray-600">

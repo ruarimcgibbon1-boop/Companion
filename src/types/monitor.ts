@@ -260,6 +260,7 @@ export interface MonitorResult {
   symbol: string
   price: number
   changePct: number
+  volume: number            // day/session share volume (0 when the feed omits it, e.g. premarket)
   relativeVolume: number | null
   spreadPct: number | null
   catalyst: string
@@ -513,6 +514,7 @@ export interface MonitorFunnel {
   byState: Partial<Record<SetupState, number>>  // geometry state among tracked
   triggered: number           // long setups with triggeredRaw among tracked
   droppedSession: number      // …dropped as untradeable (after-hours / overnight)
+  droppedVolume: number       // …dropped below the min buy-signal volume floor
   droppedVeto: number         // triggered longs dropped by the quality veto (flagged)
   droppedStandDown: number    // …by the failed-bounce stand-down
   droppedCapped: number       // …by the per-symbol cap

@@ -9,6 +9,11 @@ import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRe
 // across sweeps (the last candle is unchanged until a new bar closes) logs once.
 const PATTERN_LOG_BUCKET_MS = 10 * 60 * 1000
 
+// A buy signal needs real liquidity behind it — at least this many shares traded on
+// the day. Screens out the thin illiquid names a fill can't get (SHPH-type). Volume
+// is exempt when the feed reports 0 (premarket data gap — can't measure).
+const MIN_BUY_VOLUME = 100_000
+
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
 // upstream data allows. Going lower re-reads the same cached quote (no fresher
@@ -274,7 +279,7 @@ export function useMonitor() {
       const funnel: MonitorFunnel = {
         timestamp: now, scanned: results.length, symbolsWithSetups: 0, rawSetups: 0,
         belowFloor: 0, tracked: 0, byState: {}, triggered: 0,
-        droppedSession: 0, droppedVeto: 0, droppedStandDown: 0, droppedCapped: 0, droppedDup: 0, logged: 0,
+        droppedSession: 0, droppedVolume: 0, droppedVeto: 0, droppedStandDown: 0, droppedCapped: 0, droppedDup: 0, logged: 0,
       }
 
       for (const r of results) {
@@ -358,7 +363,12 @@ export function useMonitor() {
             // overnight) is untradeable — you can't act on it, and it fired off the
             // closing print (2026-07-29 logged 3 at 16:01). Premarket + regular stay.
             const tradeable = r.integrity.session === 'premarket' || r.integrity.session === 'regular'
+            // Buy signals need real liquidity — at least MIN_BUY_VOLUME shares traded.
+            // Exempt volume === 0: the feed omits volume premarket (a data gap, not
+            // "no volume"), so a hard floor there would re-block premarket firing.
+            const volumeOk = r.volume === 0 || r.volume >= MIN_BUY_VOLUME
             if (!tradeable) funnel.droppedSession++
+            else if (!volumeOk) funnel.droppedVolume++
             else if (setup.qualityVetoed) funnel.droppedVeto++
             else if (standDown) funnel.droppedStandDown++
             else if (capped) funnel.droppedCapped++

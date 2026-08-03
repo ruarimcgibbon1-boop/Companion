@@ -147,6 +147,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       symbol: sym,
       price,
       changePct,
+      volume: currentVolume,
       relativeVolume: technical.relativeVolume,
       spreadPct: null,
       catalyst: hasCatalyst ? (cache.get<NewsItem[]>(`news:${sym}`)?.[0]?.quality ?? 'Catalyst') : 'No catalyst data',
