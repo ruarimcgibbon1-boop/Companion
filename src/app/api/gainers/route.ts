@@ -1,10 +1,12 @@
 import { NextResponse } from 'next/server'
-import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getPressReleases, getFloatShares } from '@/lib/fmp-client'
+import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getPressReleases, getFloatShares, getDailyCandles, getExtendedIntradayCandles } from '@/lib/fmp-client'
 import { getYFQuote, getYFScreener, getYFTrending, getYFCandles } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
 import { processNews, getBestCatalystSummary } from '@/lib/news-engine'
 import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
 import { getSessionType, isPremarket } from '@/lib/market-hours'
+import { sessionFractionElapsed } from '@/lib/technical'
+import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-volume'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -41,16 +43,58 @@ function assignBadges(row: {
   return badges
 }
 
-// Fraction of the 9:30–16:00 ET regular session elapsed (clamped 0.05–1) so
-// relative volume is time-of-day adjusted rather than compared to a full day.
-function sessionFractionElapsed(): number {
-  const et = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())
-  const [h, m] = et.split(':').map(Number)
-  const mins = h * 60 + m
-  const open = 9 * 60 + 30, close = 16 * 60
-  if (mins >= close) return 1
-  if (mins <= open) return 0.05   // premarket — compare against a small slice of the day
-  return Math.max(0.05, (mins - open) / (close - open))
+// Fraction of the regular session elapsed, floored at 0.05 so an early-session or
+// premarket row is compared against a small slice of a day rather than dividing by
+// ~zero. The unclamped ET-correct calculation lives in technical.ts — one source of
+// truth, since RVOL means the same thing in the scanner and in the signal engine.
+function scannerSessionFraction(): number {
+  return Math.max(sessionFractionElapsed(), 0.05)
+}
+
+/**
+ * Fill in the RVOL the primary sources can't supply.
+ *
+ * Every one of the day's real movers showed "—": FMP's /quote no longer returns
+ * `averageVolume` at all (the field is absent from the response, verified
+ * 2026-08-03), and Yahoo's day_gainers screener — the only source that does carry
+ * an average — has a size floor that excludes exactly the sub-$300M names that gap
+ * 100%+. So the rows with no baseline were the rows we most wanted to rank.
+ *
+ * Regular hours: derive the 20-day average from daily candles (the same fallback
+ * the monitor already uses) off the shared `daily:` cache key.
+ *
+ * Premarket: the day-pace calculation does not apply, and the candle feed reports
+ * premarket volume as 0, so use the real premarket measure — today's premarket
+ * volume vs this name's own typical premarket volume by this time of day. Shares
+ * the `pmvol:` cache key with the monitor, so the column now reads the same number
+ * the premarket signal gate is judging.
+ *
+ * Runs on the ranked rows only (≤30) and never overwrites a value we already have.
+ */
+async function backfillRelativeVolume(rows: ScannerRow[], inPremarket: boolean): Promise<void> {
+  await Promise.allSettled(rows.map(async r => {
+    if (inPremarket) {
+      const profile = await cached(`pmvol:${r.symbol}`, TTL.PREMARKET_VOL, async () => {
+        const candles = await getExtendedIntradayCandles(r.symbol)
+        if (candles.length === 0) return null
+        return premarketVolumeProfile(candles, { todayEt: etDateNow(), throughHHMM: etHHMMNow() })
+      })
+      if (!profile) return
+      if (profile.relativeVolume != null) r.relativeVolume = profile.relativeVolume
+      // The measured premarket volume beats the 0 the candle feed reports.
+      if (profile.todayVolume > 0) {
+        r.premarketVolume = profile.todayVolume
+        if (r.volume === 0) r.volume = profile.todayVolume
+      }
+      return
+    }
+    if (r.relativeVolume != null || r.volume <= 0) return
+    const daily = await cached(`daily:${r.symbol}`, TTL.CANDLES_DAILY, () => getDailyCandles(r.symbol))
+    if (daily.length < 5) return
+    const recent = daily.slice(-20)
+    const avgVol = recent.reduce((s, c) => s + c.volume, 0) / recent.length
+    if (avgVol > 0) r.relativeVolume = r.volume / (avgVol * scannerSessionFraction())
+  }))
 }
 
 // Real premarket price for a symbol. Yahoo's meta.preMarketPrice is unreliable
@@ -229,6 +273,9 @@ export async function GET(request: Request) {
       })
     )
 
+    // Premarket volume is inherently lower — relax the floor to 5% of normal.
+    const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume
+
     const rows: ScannerRow[] = universe
       .map((g: UniverseEntry, i: number) => {
         const q = quoteMap.get(g.symbol)
@@ -277,10 +324,8 @@ export async function GET(request: Request) {
         // Prefer YF screener's 3-month average daily volume; fall back to FMP quote's.
         const avgVol = (g.yfAvgVolume && g.yfAvgVolume > 0) ? g.yfAvgVolume : (q?.averageVolume ?? 0)
         // Session-adjusted relative volume: today's volume vs the normal pace by this time.
-        const rvol = avgVol > 0 ? volume / (avgVol * sessionFractionElapsed()) : null
+        const rvol = avgVol > 0 ? volume / (avgVol * scannerSessionFraction()) : null
 
-        // Premarket volume is inherently lower — relax filter to 5% of normal
-        const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume
 
         if (price < filters.minPrice || price > filters.maxPrice) return null
         // During premarket only show upside gappers (positive change)
@@ -331,12 +376,25 @@ export async function GET(request: Request) {
       .slice(0, filters.maxResults)
       .map((r, i) => ({ ...r, rank: i + 1 }))
 
+    // RVOL backfill for the ranked rows only — before badges, which read it.
+    await backfillRelativeVolume(rows, inPremarket)
+    // Re-apply the volume floors now that the previously-unknown rows have numbers.
+    // The pass during mapping can only drop a row whose RVOL was already known, so
+    // without this a High-RVOL filter still let every baseline-less name through —
+    // and in premarket every row arrived with volume 0 (feed gap), so nothing could
+    // be screened on volume at all. Rows still lacking a measurement are kept: never
+    // drop a name for missing data.
+    const ranked = rows
+      .filter(r => filters.minRelativeVolume <= 0 || r.relativeVolume == null || r.relativeVolume >= filters.minRelativeVolume)
+      .filter(r => !inPremarket || r.premarketVolume == null || r.premarketVolume >= effectiveMinVolume)
+      .map((r, i) => ({ ...r, rank: i + 1 }))
+
     // Catalyst enrichment for the ranked rows only. Merge press-releases with the
     // news feed (PR first — the original, freshest wire) so a gapper's actual
     // headline drives the label, and derive the real category + quality via
     // getBestCatalystSummary. Cached 3 min per symbol.
     await Promise.allSettled(
-      rows.map(async r => {
+      ranked.map(async r => {
         const [pr, news] = await Promise.all([
           cached(`pr:${r.symbol}`, TTL.NEWS, () => getPressReleases(r.symbol, 8)),
           cached(`news:${r.symbol}`, TTL.NEWS, () => getStockNews(r.symbol, 8)),
@@ -355,7 +413,7 @@ export async function GET(request: Request) {
       })
     )
 
-    return NextResponse.json({ rows, sessionType, timestamp: Date.now() })
+    return NextResponse.json({ rows: ranked, sessionType, timestamp: Date.now() })
   } catch (err) {
     console.error('gainers route error:', err)
     return NextResponse.json({ error: 'Failed to fetch gainers' }, { status: 500 })
