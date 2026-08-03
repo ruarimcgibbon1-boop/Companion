@@ -635,3 +635,26 @@ describe('faded-name guard on the widened extension cap', () => {
     if (s) expect(s.triggeredRaw).toBe(false)
   })
 })
+
+describe('premarket zero-volume trigger (2026-08-03 feed fix)', () => {
+  // Yahoo premarket 1-min bars come back with price but volume: 0.
+  const pmBars = (vol: number): Candle[] =>
+    [4.80, 4.90, 5.00, 5.05, 5.12].map((c, i) =>
+      ({ time: 1_700_000_000 + i * 60, open: c - 0.03, high: c + 0.02, low: c - 0.04, close: c, volume: vol }))
+
+  it('premarket_breakout triggers on a zero-volume feed (data gap ≠ no volume)', () => {
+    const pb = detectSetups(ctx(pmBars(0), 5.15, {
+      session: 'premarket', changePct: 9, sessionLevels: session({ vwap: 4.5 }),
+    })).find(s => s.type === 'premarket_breakout')
+    expect(pb).toBeTruthy()
+    expect(pb!.triggeredRaw).toBe(true)
+  })
+
+  it('still requires expansion when volume DOES exist (flat volume → no trigger)', () => {
+    const pb = detectSetups(ctx(pmBars(100_000), 5.15, {
+      session: 'premarket', changePct: 9, sessionLevels: session({ vwap: 4.5 }),
+      technical: technical({ relativeVolume: 1 }),
+    })).find(s => s.type === 'premarket_breakout')
+    if (pb) expect(pb.triggeredRaw).toBe(false)
+  })
+})

@@ -108,6 +108,19 @@ export function volumeExpanding(candles: Candle[]): boolean {
   return avg > 0 && last.volume > avg * VOLUME_EXPANSION_MULT
 }
 
+// The Yahoo feed returns PREMARKET 1-min bars with price but volume: 0 (a DATA
+// GAP, not "no volume"). Every momentum trigger gates on volumeExpanding, which is
+// always false on zero volume — so nothing could ever trigger before the open
+// (2026-08-03: 51 premarket setups, 0 triggered). When there's no usable volume
+// data, confirm the trigger on the price break alone; require expansion only when
+// volume actually exists (so RTH behaviour is unchanged).
+function hasVolumeData(candles: Candle[]): boolean {
+  return lastN(candles, VOLUME_EXPANSION_LOOKBACK).some(c => c.volume > 0)
+}
+function volumeConfirmsTrigger(candles: Candle[]): boolean {
+  return volumeExpanding(candles) || !hasVolumeData(candles)
+}
+
 // ── Long-bounce quality gates (from the 2026-07-06/07 trade review) ──────────
 // Buying "bounces" into a stock that has already rolled over off its session
 // high (CLRO 10.5 after a 9→12 run; JLHL 4.8 after topping 5.5; FISV 54.8 off
@@ -598,7 +611,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const confirming = makingHigherLows(candles) && volumeContracting(candles)
   const reclaim = lastCandle ? lastCandle.close > zoneUpper : false
-  const triggered = reclaim && volumeExpanding(candles) && newHighAfterPullback(candles) && !bounceBlocked(ctx)
+  const triggered = reclaim && volumeConfirmsTrigger(candles) && newHighAfterPullback(candles) && !bounceBlocked(ctx)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) +
     (volumeContracting(candles) ? 1 : 0) +
@@ -679,7 +692,7 @@ function detectMomentumPullback(ctx: DetectionContext): DetectedSetup | null {
   const rawInvalidation = pbLow - Math.max(atr * 0.5, price * 0.005)
   const invalidation = Math.max(rawInvalidation, pbHigh * (1 - MOMENTUM_PULLBACK_MAX_STOP_PCT))
 
-  const triggered = newHighAfterPullback(candles) && volumeExpanding(candles) && price >= pbHigh
+  const triggered = newHighAfterPullback(candles) && volumeConfirmsTrigger(candles) && price >= pbHigh
   const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(candles)
   const rvol = t.relativeVolume ?? 0
   const signals =
@@ -727,7 +740,7 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const tightening = makingHigherLows(candles) && res.midpoint - price < (t.atr ?? price * 0.02)
   const closedAbove = lastCandle ? lastCandle.close > res.upper : false
-  const triggered = closedAbove && volumeExpanding(candles)
+  const triggered = closedAbove && volumeConfirmsTrigger(candles)
   const confirming = (price >= zoneLower && price <= zoneUpper) && tightening
   const signals =
     (tightening ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) + (closedAbove ? 1 : 0)
@@ -798,7 +811,7 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   const closedAbove = lastCandle ? lastCandle.close > pmHigh : false
   const rvol = t.relativeVolume ?? 0
   // Premarket volume is thin — accept a bar-over-bar expansion OR elevated RVOL.
-  const volumeOk = volumeExpanding(candles) || rvol >= 1.5
+  const volumeOk = volumeConfirmsTrigger(candles) || rvol >= 1.5
   const triggered = closedAbove && price > pmHigh && volumeOk
   const confirming = price >= zoneLower && price <= zoneUpper
   const pdh = sl.previousDayHigh
@@ -880,7 +893,7 @@ function detectOpeningDrive(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
   const rvol = t.relativeVolume ?? 0
-  const volOk = volumeExpanding(candles) || rvol >= 2
+  const volOk = volumeConfirmsTrigger(candles) || rvol >= 2
   const triggered = closedAbove && price > breakLevel && volOk
   const confirming = price >= zoneLower && price <= zoneUpper
   const signals =
@@ -937,7 +950,7 @@ function detectOpeningRangeBreak(ctx: DetectionContext): DetectedSetup | null {
 
   const lastCandle = candles[candles.length - 1]
   const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
-  const triggered = closedAbove && price > zoneUpper && volumeExpanding(candles)
+  const triggered = closedAbove && price > zoneUpper && volumeConfirmsTrigger(candles)
   const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
   const rvol = t.relativeVolume ?? 0
   const signals =
@@ -1012,7 +1025,7 @@ function detectHodBreak(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const closedAbove = lastCandle ? lastCandle.close > hod : false
   const rvol = t.relativeVolume ?? 0
-  const triggered = closedAbove && price > hod && volumeExpanding(candles) && makingHigherLows(candles)
+  const triggered = closedAbove && price > hod && volumeConfirmsTrigger(candles) && makingHigherLows(candles)
   const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
   const signals =
     (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
@@ -1064,7 +1077,7 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
   const lastCandle = candles[candles.length - 1]
   const holding = lastCandle ? lastCandle.close > ema : false
   const confirming = (price >= zoneLower && price <= zoneUpper) && makingHigherLows(candles)
-  const triggered = holding && volumeExpanding(candles) && newHighAfterPullback(candles) &&
+  const triggered = holding && volumeConfirmsTrigger(candles) && newHighAfterPullback(candles) &&
     price > zoneUpper && !bounceBlocked(ctx) &&
     (which === 'ema9' ? EMA9_BOUNCE_TRIGGERS_ENABLED : true)
   const signals =
@@ -1138,8 +1151,8 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   // already demanded expansion.)
   const triggered = (above
     ? reclaimed && newHighAfterPullback(candles) && volumeContractingBefore(candles) &&
-      volumeExpanding(candles) && price > zoneUpper
-    : reclaimed && newHighAfterPullback(candles) && volumeExpanding(candles) && price > vwap) && !bounceBlocked(ctx)
+      volumeConfirmsTrigger(candles) && price > zoneUpper
+    : reclaimed && newHighAfterPullback(candles) && volumeConfirmsTrigger(candles) && price > vwap) && !bounceBlocked(ctx)
   const signals =
     (reclaimed ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0) +
     (above ? (volumeContracting(candles) ? 1 : 0) : (volumeExpanding(candles) ? 1 : 0))
@@ -1203,7 +1216,7 @@ function detectBullFlag(ctx: DetectionContext): DetectedSetup | null {
 
   const last = candles[candles.length - 1]
   const closedAbove = last.close > flagHigh
-  const triggered = closedAbove && volumeExpanding(candles)
+  const triggered = closedAbove && volumeConfirmsTrigger(candles)
   const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(flag)
   const signals = (volumeContracting(flag) ? 1 : 0) + (closedAbove ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
 
@@ -1255,7 +1268,7 @@ function detectBreakOfStructure(ctx: DetectionContext): DetectedSetup | null {
 
   const last = candles[candles.length - 1]
   const closedAbove = last.close > lastSwingHigh
-  const triggered = closedAbove && volumeExpanding(candles) && makingHigherLows(candles)
+  const triggered = closedAbove && volumeConfirmsTrigger(candles) && makingHigherLows(candles)
   const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
   const signals = (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
 
@@ -1295,7 +1308,7 @@ function detectRejection(ctx: DetectionContext): DetectedSetup | null {
   const zoneLower = res.lower
   const zoneUpper = res.upper
   const invalidation = res.upper + band * 1.5
-  const triggered = lastCandle ? lastCandle.close < res.lower && volumeExpanding(candles) : false
+  const triggered = lastCandle ? lastCandle.close < res.lower && volumeConfirmsTrigger(candles) : false
   const confirming = makingLowerHighs(candles)
   const signals = (rejecting ? 1 : 0) + (makingLowerHighs(candles) ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0)
 
@@ -1327,7 +1340,7 @@ function detectBreakdown(ctx: DetectionContext): DetectedSetup | null {
 
   const lastCandle = candles[candles.length - 1]
   const lostLevel = lastCandle ? lastCandle.close < sup.lower : false
-  const triggered = lostLevel && volumeExpanding(candles)
+  const triggered = lostLevel && volumeConfirmsTrigger(candles)
   const confirming = makingLowerHighs(candles) && price <= zoneUpper
   const signals = (lostLevel ? 1 : 0) + (makingLowerHighs(candles) ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0)
 
