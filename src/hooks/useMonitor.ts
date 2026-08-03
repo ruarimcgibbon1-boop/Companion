@@ -10,9 +10,17 @@ import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRe
 const PATTERN_LOG_BUCKET_MS = 10 * 60 * 1000
 
 // A buy signal needs real liquidity behind it — at least this many shares traded on
-// the day. Screens out the thin illiquid names a fill can't get (SHPH-type). Volume
-// is exempt when the feed reports 0 (premarket data gap — can't measure).
+// the day. Screens out the thin illiquid names a fill can't get (SHPH-type).
 const MIN_BUY_VOLUME = 100_000
+// The premarket equivalent. A whole premarket session trades a small fraction of a
+// regular one, so the day floor would block everything before 09:30 — and until now
+// premarket was simply exempt, because the candle feed reports premarket volume as 0.
+// It is measured now (extended-hours feed, see premarket-volume.ts), so premarket
+// gets a floor of its own. Note the scale: that feed covers a subset of venues, so
+// this is lower than the consolidated number it corresponds to. 2026-08-03 premarket
+// reads — UPC 625k / DFNS 678k pass; HYFM 5k, WLDS 10k, CNCK 1k (all dead premarket,
+// all "signals on names that don't move") do not.
+const MIN_PREMARKET_BUY_VOLUME = 50_000
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -363,10 +371,13 @@ export function useMonitor() {
             // overnight) is untradeable — you can't act on it, and it fired off the
             // closing print (2026-07-29 logged 3 at 16:01). Premarket + regular stay.
             const tradeable = r.integrity.session === 'premarket' || r.integrity.session === 'regular'
-            // Buy signals need real liquidity — at least MIN_BUY_VOLUME shares traded.
-            // Exempt volume === 0: the feed omits volume premarket (a data gap, not
-            // "no volume"), so a hard floor there would re-block premarket firing.
-            const volumeOk = r.volume === 0 || r.volume >= MIN_BUY_VOLUME
+            // Buy signals need real liquidity behind them. Premarket is measured on
+            // its own scale; only a genuinely unmeasurable reading (null — the
+            // extended-feed fetch failed) is exempt, so a data gap can't silently
+            // shut premarket down.
+            const volumeOk = r.integrity.session === 'premarket'
+              ? r.premarketVolume == null || r.premarketVolume >= MIN_PREMARKET_BUY_VOLUME
+              : r.volume === 0 || r.volume >= MIN_BUY_VOLUME
             if (!tradeable) funnel.droppedSession++
             else if (!volumeOk) funnel.droppedVolume++
             else if (setup.qualityVetoed) funnel.droppedVeto++

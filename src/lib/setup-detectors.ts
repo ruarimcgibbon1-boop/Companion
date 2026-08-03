@@ -149,11 +149,31 @@ const STRENGTH_ENTRY_TYPES: SetupType[] = [
 ]
 // A target only a few basis points beyond the fill is noise, not a target: it
 // tanks R/R and books phantom "wins" (KUST/MWC/INM 2026-07-22). The first RATED
-// target must clear a meaningful reward — ≥ this fraction of the risk, or a small
-// % of price, whichever is larger — so trivial levels are skipped for the measured
-// move behind them.
+// target must clear a meaningful reward — ≥ this fraction of the risk, a % of
+// price, or a volatility unit, whichever is largest — so trivial levels are
+// skipped for the measured move behind them.
+// The 0.4% price floor was far too small for this book: on 2026-07-31 AMCX's ORB
+// rated T1 at 11.57 off an 11.50 fill (+0.6% — seven cents), and half a scale-out
+// at +0.6% cannot pay for the losers. These are momentum names running 20–300% in
+// a day; the thesis is low-win/high-payoff, so a first target must be worth
+// taking. ATR does the scaling — 1 volatility unit on a 6%-ATR runner is ~6%.
 const MIN_T1_REWARD_R = 0.8
-const MIN_T1_REWARD_PCT = 0.004
+const MIN_T1_REWARD_PCT = 0.02
+const MIN_T1_REWARD_ATR_MULT = 1.0
+// Targets that sit on top of each other are one target wearing three hats — the
+// old 0.3% dedup let T1/T2/T3 land inside a single 1% band, so scaling out at
+// each was really one exit. Keep them a real move apart (or half a volatility
+// unit, whichever is wider).
+const TARGET_SPACING_PCT = 0.015
+const TARGET_SPACING_ATR_MULT = 0.5
+// The runner leg. Level stacks are dense near price and thin out fast, so a
+// level-derived ladder often tops out a few % up and we exit a 40% move at +3%.
+// When the name is volatile enough for it to be a realistic day's reach (10%
+// within RUNNER_TARGET_ATR_MULT ATR — true of the gainer universe, false of a
+// sleepy large cap), extend the ladder to a 10% runner. This is where the payoff
+// asymmetry the book needs actually comes from.
+const RUNNER_TARGET_PCT = 0.10
+const RUNNER_TARGET_ATR_MULT = 3
 // A long "bounce" whose price has already run well above its entry zone is a
 // chase, not a bounce: the zone is unfillable and entering at the trigger means
 // a wide stop for a tiny first target. Don't let it fire a BUY. (2026-07-08's
@@ -459,15 +479,32 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // The first rated target must clear a meaningful reward beyond the fill (see
   // MIN_T1_REWARD_R) — a level a few bps away is noise that tanks R/R and books
   // phantom wins. Skip those in favour of the measured move behind them.
-  const minReward = Math.max(riskDist * MIN_T1_REWARD_R, entryFill * MIN_T1_REWARD_PCT)
+  const atrAbs = t.atr != null && t.atr > 0 ? t.atr : 0
+  const minReward = Math.max(
+    riskDist * MIN_T1_REWARD_R,
+    entryFill * MIN_T1_REWARD_PCT,
+    atrAbs * MIN_T1_REWARD_ATR_MULT,
+  )
   const targetFloor = dirLong ? entryFill + minReward : entryFill - minReward
+  const spacing = Math.max(entryFill * TARGET_SPACING_PCT, atrAbs * TARGET_SPACING_ATR_MULT)
   const picked: { price: number; label: string }[] = []
   for (const o of cand
     .filter(o => dirLong ? o.price > targetFloor : o.price < targetFloor)
     .sort((a, b) => dirLong ? a.price - b.price : b.price - a.price)) {
-    if (!picked.some(p => Math.abs(p.price - o.price) / o.price < 0.003)) picked.push(o)
+    if (!picked.some(p => Math.abs(p.price - o.price) < spacing)) picked.push(o)
   }
-  const targets: SetupTarget[] = picked.slice(0, 3).map((o, i) => ({
+  // Extend to the runner leg when a 10% move is a realistic reach for this name's
+  // volatility and the levels above don't already carry us there.
+  const ladder = picked.slice(0, 3)
+  const runnerPrice = dirLong ? entryFill * (1 + RUNNER_TARGET_PCT) : entryFill * (1 - RUNNER_TARGET_PCT)
+  const runnerReachable = atrAbs > 0 && entryFill * RUNNER_TARGET_PCT <= atrAbs * RUNNER_TARGET_ATR_MULT
+  const top = ladder[ladder.length - 1]
+  const ladderReachesRunner = top != null && (dirLong ? top.price >= runnerPrice : top.price <= runnerPrice)
+  if (runnerReachable && !ladderReachesRunner) {
+    if (ladder.length >= 3) ladder.length = 2   // keep the last rung for the runner
+    ladder.push({ price: runnerPrice, label: `${Math.round(RUNNER_TARGET_PCT * 100)}% runner` })
+  }
+  const targets: SetupTarget[] = ladder.map((o, i) => ({
     price: o.price,
     label: `T${i + 1}${o.label ? ` (${o.label})` : ''}`,
     rewardRisk: rr(entryFill, stopRef, o.price),
@@ -776,6 +813,16 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
 // thin — treat the resulting P/L with a slippage haircut, not at face value.
 const PREMARKET_MIN_GAP_PCT = 2    // gap vs prior close to count as "in play" (was 4)
 const PREMARKET_MAX_COIL_PCT = 0.05 // prior bars must have based within this % of the PM high (was 0.03)
+// Premarket relative volume — the participation gate this detector never had.
+// Its only volume evidence used to be `volumeConfirmsTrigger(candles) || rvol >= 1.5`,
+// and BOTH sides were dead: the candle feed reports premarket volume as 0 (so
+// `hasVolumeData` is false and the check passes trivially as a "data gap"), and
+// RVOL was null/meaningless before 09:30. So the gate always said yes, and we
+// fired on names with a gap on air that never moved. Now that premarket RVOL is
+// real (see premarket-volume.ts), demand a genuine surge: trading this multiple
+// of its own typical premarket volume by this time of day. 2026-08-03 read:
+// UPC +102% was ~130× its baseline, AAPL 0.9×, the day's drifters well under 1.
+const PREMARKET_MIN_RVOL = 3
 
 function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   const { price, technical: t, sessionLevels: sl, candles, session } = ctx
@@ -809,9 +856,11 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
 
   const lastCandle = candles[candles.length - 1]
   const closedAbove = lastCandle ? lastCandle.close > pmHigh : false
-  const rvol = t.relativeVolume ?? 0
-  // Premarket volume is thin — accept a bar-over-bar expansion OR elevated RVOL.
-  const volumeOk = volumeConfirmsTrigger(candles) || rvol >= 1.5
+  const rvol = t.relativeVolume
+  // Real premarket participation, or no trigger. When the measure is unavailable
+  // (no prior-session history — a fresh listing) fall back to bar-over-bar
+  // expansion rather than blocking on missing data, and say so in the risks.
+  const volumeOk = rvol != null ? rvol >= PREMARKET_MIN_RVOL : volumeConfirmsTrigger(candles)
   const triggered = closedAbove && price > pmHigh && volumeOk
   const confirming = price >= zoneLower && price <= zoneUpper
   const pdh = sl.previousDayHigh
@@ -828,7 +877,7 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   return buildSetup({
     ctx, type: 'premarket_breakout', direction: 'long',
     zoneLower, zoneUpper,
-    rationale: `Premarket breakout — gapped +${gapPct.toFixed(0)}% and pushing through the premarket high $${pmHigh.toFixed(2)}${vwap != null ? `, holding above PM VWAP $${vwap.toFixed(2)}` : ''}. RVOL ${rvol.toFixed(1)}×.`,
+    rationale: `Premarket breakout — gapped +${gapPct.toFixed(0)}% and pushing through the premarket high $${pmHigh.toFixed(2)}${vwap != null ? `, holding above PM VWAP $${vwap.toFixed(2)}` : ''}. ${rvol != null ? `Premarket RVOL ${rvol.toFixed(1)}×.` : 'Premarket RVOL unavailable (no prior-session history).'}`,
     confirmation: [
       `Candle CLOSE above the premarket high $${pmHigh.toFixed(2)}`,
       'Real volume behind the push (premarket is thin — demand bids)',
@@ -838,7 +887,7 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
     testCount: 0,
     scoringOverrides: {
       volumeExpandsOnSignal: volumeOk,
-      unusualVolume: rvol > 3,
+      unusualVolume: (rvol ?? 0) > PREMARKET_MIN_RVOL,
     },
     confirmationSignals: signals,
     triggered,
@@ -847,7 +896,8 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
     notes: 'Premarket: thin liquidity and wide spreads — size down and expect slippage. Strongest when it holds the gap into the open.',
     risks: [
       'Premarket liquidity is thin — fills and stops are unreliable',
-      ...(rvol < 1.5 ? ['Light premarket volume — the gap may fade at the open'] : []),
+      ...(rvol == null ? ['No premarket volume baseline for this name — participation unverified'] : []),
+      ...(rvol != null && rvol < PREMARKET_MIN_RVOL * 2 ? ['Premarket volume only modestly above normal — the gap may fade at the open'] : []),
     ],
   })
 }

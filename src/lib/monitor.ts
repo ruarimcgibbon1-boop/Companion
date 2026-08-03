@@ -11,7 +11,7 @@
  */
 
 import type { Candle, MonitorResult, NewsItem } from '@/types'
-import { getQuote, getIntradayCandles, getDailyCandles, getFloatShares } from './fmp-client'
+import { getQuote, getIntradayCandles, getDailyCandles, getFloatShares, getExtendedIntradayCandles } from './fmp-client'
 import { getYFCandles, getYFQuote } from './yahoo-client'
 import { calculateSessionLevels, calculateTechnical } from './technical'
 import { buildKeyLevels } from './levels-engine'
@@ -19,6 +19,7 @@ import { detectSetups, type DetectionContext } from './setup-detectors'
 import { detectCandlePatterns } from './candlestick-patterns'
 import { buildRoadmap } from './roadmap-engine'
 import { getSessionType, minutesSinceOpen } from './market-hours'
+import { premarketVolumeProfile, etDateNow, etHHMMNow } from './premarket-volume'
 import { cache, cached, TTL } from './cache'
 
 function toCandles(raw: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>): Candle[] {
@@ -94,6 +95,26 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       intraday, daily, currentVolume, avgVolume, sessionLevels, price
     )
 
+    // Premarket participation. RVOL as computed above is null before 09:30 (no
+    // regular session to pace against) and the primary candle feed reports
+    // premarket volume as 0, so premarket had NO volume evidence at all — the
+    // gap that let signals fire on names that never moved. Substitute the real
+    // premarket measure: today's premarket volume vs this name's own typical
+    // premarket volume by this time of day, off the one feed that carries it.
+    const session = getSessionType()
+    const premarket = session === 'premarket'
+      ? await cached(`pmvol:${sym}`, TTL.PREMARKET_VOL, async () => {
+          const rows = await getExtendedIntradayCandles(sym)
+          // No rows at all = the fetch failed, NOT a quiet premarket: the window
+          // spans 10 days of regular hours too, so a live symbol always has some.
+          // Returning a measured zero here would silently block every premarket
+          // signal and look identical to "nothing set up today".
+          if (rows.length === 0) return null
+          return premarketVolumeProfile(rows, { todayEt: etDateNow(), throughHHMM: etHHMMNow() })
+        })
+      : null
+    if (premarket?.relativeVolume != null) technical.relativeVolume = premarket.relativeVolume
+
     if (sessionLevels.vwap == null) missing.push('VWAP')
     if (technical.ema9 == null) missing.push('9 EMA')
     if (technical.ema20 == null) missing.push('21 EMA')
@@ -116,7 +137,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       hasCatalyst,
       spreadPct: null,     // real-time spread not available from this feed — honestly null
       changePct: quote?.changePercentage ?? 0,
-      session: getSessionType(),
+      session,
       minutesSinceOpen: minutesSinceOpen(),
       float,
     }
@@ -136,7 +157,6 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
     // Data integrity — freshest underlying data point.
     const freshestMs = Math.max(candleTs, quoteTs, yfQuote ? Date.now() - 30_000 : 0)
     const ageMs = Date.now() - freshestMs
-    const session = getSessionType()
     const activeSession = session === 'premarket' || session === 'regular' || session === 'afterhours'
     const delayed = activeSession && ageMs > 120_000
 
@@ -149,6 +169,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       changePct,
       volume: currentVolume,
       relativeVolume: technical.relativeVolume,
+      premarketVolume: premarket?.todayVolume ?? null,
       spreadPct: null,
       catalyst: hasCatalyst ? (cache.get<NewsItem[]>(`news:${sym}`)?.[0]?.quality ?? 'Catalyst') : 'No catalyst data',
       levels,
@@ -180,7 +201,8 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
         volumeTrend: technical.volumeTrend,
         gapPct: technical.gapPct,
         premarketHigh: sessionLevels.premarketHigh,
-        premarketVolume: sessionLevels.premarketVolume,
+        // Prefer the measured premarket volume — the candle feed reports 0 premarket.
+        premarketVolume: premarket?.todayVolume ?? sessionLevels.premarketVolume,
         dayHigh: sessionLevels.regularHigh,
         previousDayHigh: sessionLevels.previousDayHigh,
         previousClose: sessionLevels.previousClose,

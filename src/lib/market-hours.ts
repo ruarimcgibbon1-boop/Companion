@@ -68,6 +68,13 @@ export function isPremarket(ts: number, config = DEFAULT_SESSION_CONFIG): boolea
   return getSessionType(ts, config) === 'premarket'
 }
 
+/** Minutes since ET midnight. The building block for any "how far into the day" maths —
+ *  doing that arithmetic on the host clock silently measures the LOCAL trading day. */
+export function etMinutesOfDay(ts: number = Date.now()): number {
+  const h = etHHMM(ts)
+  return Math.floor(h / 100) * 60 + (h % 100)
+}
+
 /** Minutes elapsed since the 09:30 ET open, or null outside regular hours. */
 export function minutesSinceOpen(ts: number = Date.now(), config = DEFAULT_SESSION_CONFIG): number | null {
   if (getSessionType(ts, config) !== 'regular') return null

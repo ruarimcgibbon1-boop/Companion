@@ -6,6 +6,7 @@ import {
   rsi,
   atr,
   relativeVolume,
+  sessionFractionElapsed,
   calculateSessionLevels,
   calculateSupportResistance,
 } from '../src/lib/technical'
@@ -142,6 +143,42 @@ describe('relativeVolume', () => {
     // avgVol 1M, halfway through session, current vol 1M → pace is 2M = 2x
     const result = relativeVolume(1_000_000, 1_000_000, 0.5)!
     expect(result).toBeCloseTo(2)
+  })
+})
+
+// The fraction RVOL is paced against. This was computed off the host clock, so on
+// a London machine it measured the LOCAL trading day: ~0.77 elapsed at the 09:30 ET
+// open and pinned at 1.0 from 11:00 ET, understating morning RVOL by 10–20×.
+describe('sessionFractionElapsed', () => {
+  // 2026-08-03 is EDT (UTC-4); Europe/London is UTC+1 that day, so any host-clock
+  // arithmetic gives visibly different answers here.
+  const et = (h: number, m = 0) => Date.UTC(2026, 7, 3, h + 4, m)
+
+  it('is 0 through premarket — there is no session to pace against yet', () => {
+    expect(sessionFractionElapsed(et(4))).toBe(0)
+    expect(sessionFractionElapsed(et(8, 30))).toBe(0)
+    expect(sessionFractionElapsed(et(9, 29))).toBe(0)
+  })
+
+  it('is ~0 at the open, not 0.77', () => {
+    expect(sessionFractionElapsed(et(9, 30))).toBe(0)
+    // 09:45 ET = a quarter hour into a 390-minute session.
+    expect(sessionFractionElapsed(et(9, 45))).toBeCloseTo(15 / 390, 4)
+  })
+
+  it('is half a session at 12:45 ET, not pinned at 1.0', () => {
+    expect(sessionFractionElapsed(et(12, 45))).toBeCloseTo(0.5, 4)
+  })
+
+  it('reaches 1 only at the close and stays there', () => {
+    expect(sessionFractionElapsed(et(16))).toBe(1)
+    expect(sessionFractionElapsed(et(18))).toBe(1)
+  })
+
+  it('paces the morning correctly end to end (the regression that mattered)', () => {
+    // 10:00 ET, a name that has already traded a full average day's volume.
+    const rvol = relativeVolume(1_000_000, 1_000_000, sessionFractionElapsed(et(10)))!
+    expect(rvol).toBeCloseTo(13, 0)   // ~13× pace; the London clock reported ~1.3×
   })
 })
 

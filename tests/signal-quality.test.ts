@@ -391,6 +391,90 @@ describe('premarket breakout', () => {
     const setups = detectSetups(ctx(gapper, 5.15, { session: 'premarket', sessionLevels: session({ previousClose: 5.10 }) }))
     expect(setups.some(s => s.type === 'premarket_breakout')).toBe(false)
   })
+
+  // Premarket participation gate. The old volume check was
+  // `volumeExpanding(candles) || !hasVolumeData(candles) || rvol >= 1.5` — and the
+  // feed reports premarket volume as 0, so the "data gap" arm passed everything.
+  // A gap on air with nobody trading it is the dud we kept buying.
+  it('does NOT trigger on a gapper trading its NORMAL premarket volume', () => {
+    const s = detectSetups(ctx(gapper, 5.15, {
+      session: 'premarket', technical: technical({ relativeVolume: 1.2 }),
+    })).find(x => x.type === 'premarket_breakout')
+    // Still visible as a watch — it just cannot fire a BUY.
+    expect(s).toBeTruthy()
+    expect(s!.triggeredRaw).toBe(false)
+  })
+
+  it('triggers when premarket volume is a genuine surge', () => {
+    const s = detectSetups(ctx(gapper, 5.15, {
+      session: 'premarket', technical: technical({ relativeVolume: 12 }),
+    })).find(x => x.type === 'premarket_breakout')
+    expect(s!.triggeredRaw).toBe(true)
+  })
+
+  it('falls back to bar volume (and flags it) when the name has no premarket baseline', () => {
+    const s = detectSetups(ctx(gapper, 5.15, {
+      session: 'premarket', technical: technical({ relativeVolume: null }),
+    })).find(x => x.type === 'premarket_breakout')
+    expect(s!.triggeredRaw).toBe(true)   // never block on missing data
+    expect(s!.risks.some(r => /baseline/i.test(r))).toBe(true)
+  })
+})
+
+// Targets. The book is momentum — low win rate, high payoff — so a first target
+// has to be worth scaling into and the ladder has to leave room for the runner.
+// 2026-07-31 rated AMCX's ORB T1 at +0.6% (seven cents on an 11.50 fill), which
+// is the shape of "we exit a 40% move at +3%".
+describe('target ladder geometry', () => {
+  function breakBars(): Candle[] {
+    const closes = [4.85, 4.88, 4.90, 4.92, 4.95, 4.98, 5.02, 5.06, 5.10, 5.14, 5.18]
+    return closes.map((c, i) => ({
+      time: 1_700_000_000 + i * 300,
+      open: c - 0.01, high: c + 0.02, low: c - 0.02, close: c,
+      volume: i === closes.length - 1 ? 400_000 : 100_000,
+    }))
+  }
+  const longs = (over: Partial<DetectionContext> = {}) =>
+    detectSetups(ctx(breakBars(), 5.18, {
+      technical: technical({ atr: 0.30, distanceFromDayHighPct: 0 }),   // ~5.8% ATR: a mover
+      sessionLevels: session({ premarketHigh: 4.9, vwap: 5.0 }),
+      ...over,
+    })).filter(s => s.direction === 'long' && s.targets.length > 0 && s.entryFill != null)
+
+  it('never rates a first target inside a real move of the fill', () => {
+    const setups = longs()
+    expect(setups.length).toBeGreaterThan(0)
+    for (const s of setups) {
+      const gain = (s.targets[0].price - s.entryFill!) / s.entryFill!
+      expect(gain).toBeGreaterThanOrEqual(0.02)   // ≥ 2% of price…
+      expect(s.targets[0].price - s.entryFill!).toBeGreaterThanOrEqual(0.30 * 0.99) // …and ≥ 1 ATR here
+    }
+  })
+
+  it('spaces the rungs so scaling out three times is three different exits', () => {
+    for (const s of longs()) {
+      for (let i = 1; i < s.targets.length; i++) {
+        const gap = s.targets[i].price - s.targets[i - 1].price
+        expect(gap).toBeGreaterThanOrEqual(Math.max(s.entryFill! * 0.015, 0.30 * 0.5) * 0.99)
+      }
+    }
+  })
+
+  it('extends the ladder to a 10% runner when the levels above stop short', () => {
+    for (const s of longs()) {
+      const top = s.targets[s.targets.length - 1]
+      expect(top.price).toBeGreaterThanOrEqual(s.entryFill! * 1.10 * 0.999)
+      expect(s.targets.length).toBeLessThanOrEqual(3)
+    }
+  })
+
+  it('does NOT invent a 10% runner on a name too quiet to reach it', () => {
+    // ATR 0.02 on a $5 name (~0.4%): 10% is ~25 ATR away — fantasy, and it would
+    // fake a huge R/R. Level-based targets only.
+    for (const s of longs({ technical: technical({ atr: 0.02, distanceFromDayHighPct: 0 }) })) {
+      expect(s.targets.some(t => t.label.includes('runner'))).toBe(false)
+    }
+  })
 })
 
 describe('new momentum setups', () => {

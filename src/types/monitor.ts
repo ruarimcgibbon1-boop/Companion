@@ -261,6 +261,10 @@ export interface MonitorResult {
   price: number
   changePct: number
   volume: number            // day/session share volume (0 when the feed omits it, e.g. premarket)
+  /** Today's premarket share volume, measured off the extended-hours feed. Null outside premarket. */
+  premarketVolume: number | null
+  /** In premarket this is the premarket measure (vs this name's own typical premarket volume by
+   *  this time of day); in regular hours, the session-paced day RVOL. */
   relativeVolume: number | null
   spreadPct: number | null
   catalyst: string

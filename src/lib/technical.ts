@@ -4,7 +4,7 @@
  */
 
 import type { Candle, TechnicalData, SessionLevels, SupportResistanceZone } from '@/types'
-import { isPremarket, isRegularHours } from './market-hours'
+import { isPremarket, isRegularHours, etMinutesOfDay } from './market-hours'
 
 // ── Moving averages ────────────────────────────────────────────────────────
 
@@ -116,6 +116,25 @@ export function relativeVolume(
   if (!avgVolume || sessionFractionElapsed <= 0) return null
   const expectedAtThisPoint = avgVolume * sessionFractionElapsed
   return expectedAtThisPoint > 0 ? currentVolume / expectedAtThisPoint : null
+}
+
+/**
+ * Fraction of the 09:30–16:00 ET session elapsed — 0 before the open, 1 after
+ * the close. RVOL paces the day's volume against this, so it MUST be measured in
+ * ET: computing it off the host clock measured the *local* trading day, which on
+ * a London machine (BST, 5h ahead) read 0.77 at the 09:30 ET open and pinned to
+ * 1.0 from 11:00 ET onward. Morning RVOL therefore came out 10–20× too low —
+ * exactly when the momentum book trades — so the in-play gate (RVOL ≥ 2) and the
+ * runner extension cap (RVOL ≥ 5) were being asked of numbers that could not
+ * reach them. Before the open this is 0 and RVOL is null by design: there is no
+ * regular session to pace against yet (see `premarket-volume.ts` for the
+ * premarket measure).
+ */
+export function sessionFractionElapsed(ts: number = Date.now()): number {
+  const mins = etMinutesOfDay(ts)
+  const open = 9 * 60 + 30
+  const close = 16 * 60
+  return Math.min(Math.max((mins - open) / (close - open), 0), 1)
 }
 
 // ── Session levels ─────────────────────────────────────────────────────────
@@ -256,17 +275,7 @@ export function calculateTechnical(
   // ATR on intraday
   const atrVal = atr(intradayCandles.filter(c => c.time >= todayStart - 86400), 14)
 
-  // Session fraction
-  const nowEt = Date.now()
-  const marketOpen = new Date()
-  marketOpen.setHours(9, 30, 0, 0)
-  const marketClose = new Date()
-  marketClose.setHours(16, 0, 0, 0)
-  const totalMs = marketClose.getTime() - marketOpen.getTime()
-  const elapsedMs = nowEt - marketOpen.getTime()
-  const fraction = Math.min(Math.max(elapsedMs / totalMs, 0), 1)
-
-  const rvol = relativeVolume(currentVolume, avgVolume, fraction)
+  const rvol = relativeVolume(currentVolume, avgVolume, sessionFractionElapsed())
 
   // Volume trend
   const recentCandles = intradayCandles.slice(-6)
