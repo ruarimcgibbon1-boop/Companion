@@ -777,12 +777,16 @@ function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
   const vwap = sl.vwap
   if (vwap != null && price < vwap) return null
 
-  // Anti-spike: premarket "breakouts" are mostly a single print tagging the high
-  // then reversing (thin book) — those don't hold into the open. Demand that price
-  // was COILING near the premarket high first (a base), not spiking through it from
-  // far below. The bars before the break must have reached within ~3% of the high.
+  // Anti-spike: a premarket "breakout" that's a single print tagging the high from
+  // far below (thin book) doesn't hold into the open. But there are TWO healthy
+  // shapes into a break, not one: price COILED near the high (a base), OR it's
+  // climbing on HIGHER LOWS (a steady continuation). Require either — that still
+  // rejects the spike-from-nowhere while letting the many gappers that grind up to
+  // new premarket highs fire (they were the ones we were missing before the open).
   const priorHigh = Math.max(...candles.slice(0, -1).map(c => c.high))
-  if ((pmHigh - priorHigh) / pmHigh > PREMARKET_MAX_COIL_PCT) return null
+  const coiled = (pmHigh - priorHigh) / pmHigh <= PREMARKET_MAX_COIL_PCT
+  const continuation = makingHigherLows(candles)
+  if (!coiled && !continuation) return null
 
   // Break level = the premarket high; clearing the prior-day high too is extra strength.
   const band = (t.atr ?? price * 0.01) * 0.3
