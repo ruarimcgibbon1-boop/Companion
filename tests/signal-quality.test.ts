@@ -435,6 +435,29 @@ describe('premarket breakout', () => {
 // has to be worth scaling into and the ladder has to leave room for the runner.
 // 2026-07-31 rated AMCX's ORB T1 at +0.6% (seven cents on an 11.50 fill), which
 // is the shape of "we exit a 40% move at +3%".
+// Anti-fade gate (2026-08-04 CSV: breakouts fired 20-43% below the session high
+// won 20% vs 37% near the high). A chase-family break far under the day high is a
+// fade, not a breakout — it must not log a BUY.
+describe('anti-fade gate', () => {
+  // A break_of_structure (chase family) over rising swing highs.
+  const bosBars = () => bars([4.00, 4.06, 4.15, 4.08, 4.02, 4.12, 4.28, 4.20, 4.14, 4.24, 4.40, 4.32, 4.26, 4.36, 4.52, 4.46, 4.50, 4.54])
+  const bosAt = (distHigh: number) =>
+    detectSetups(ctx(bosBars(), 4.54, { technical: technical({ distanceFromDayHighPct: distHigh }) }))
+      .find(s => s.type === 'break_of_structure')
+
+  it('vetoes a chase-family break fired far below the session high (a fade)', () => {
+    const s = bosAt(-20)
+    expect(s).toBeTruthy()
+    expect(s!.qualityVetoed).toBe(true)   // stays visible as a watch, logs no BUY
+  })
+
+  it('allows the same break near the high', () => {
+    const s = bosAt(-1)
+    expect(s).toBeTruthy()
+    expect(s!.qualityVetoed).toBe(false)
+  })
+})
+
 describe('target ladder geometry', () => {
   function breakBars(): Candle[] {
     const closes = [4.85, 4.88, 4.90, 4.92, 4.95, 4.98, 5.02, 5.06, 5.10, 5.14, 5.18]

@@ -147,6 +147,16 @@ const STRENGTH_ENTRY_TYPES: SetupType[] = [
   'breakout', 'bull_flag', 'break_of_structure', 'opening_range_break', 'opening_drive',
   'vwap_reclaim', 'level_reclaim',
 ]
+// Anti-fade gate (2026-08-04 CSV, 70 signals / 27% win). A "breakout" fired well
+// BELOW the session high is not a breakout — it's a bounce on a name that already
+// topped and faded. That day, breaks >10% off the high won 20% vs 37% near the
+// high, and the generic breakout/BOS detectors (46+13 signals, ~20% win) were the
+// entire firehose. So a chase-family break can't fire when price sits more than
+// MAX_BELOW_HIGH_PCT under the session high. The early-momentum winners
+// (premarket_breakout, opening_drive, ORB, HOD) are NOT in this set — they fire at
+// or near the high by construction and are the setups that actually pay.
+const ANTI_FADE_TYPES: SetupType[] = ['breakout', 'break_of_structure']
+const MAX_BELOW_HIGH_PCT = 8
 // A target only a few basis points beyond the fill is noise, not a target: it
 // tanks R/R and books phantom "wins" (KUST/MWC/INM 2026-07-22). The first RATED
 // target must clear a meaningful reward — ≥ this fraction of the risk, a % of
@@ -557,7 +567,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
 
   // Observed (instantaneous) state from geometry + evidence.
   // A vetoed trigger cannot advance to `triggered` (so it logs no BUY) but stays visible.
-  const vetoed = args.vetoTrigger?.active ?? false
+  // Anti-fade: drop a chase-family break fired too far under the session high (see
+  // ANTI_FADE_TYPES). It stays visible as a watch; it just can't log a BUY.
+  const distFromHigh = t.distanceFromDayHighPct   // negative = below the high
+  const fadedChase = ANTI_FADE_TYPES.includes(type) && distFromHigh != null && distFromHigh < -MAX_BELOW_HIGH_PCT
+  const vetoed = (args.vetoTrigger?.active ?? false) || fadedChase
   // An over-extended long bounce is a chase, not a fillable trigger — drop it
   // entirely. The cap widens for a strength entry on a genuine runner (see
   // maxTriggerExtension) so the day's top gainers aren't refused for running fast.

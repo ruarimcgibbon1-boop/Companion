@@ -21,6 +21,18 @@ const MIN_BUY_VOLUME = 100_000
 // reads — UPC 625k / DFNS 678k pass; HYFM 5k, WLDS 10k, CNCK 1k (all dead premarket,
 // all "signals on names that don't move") do not.
 const MIN_PREMARKET_BUY_VOLUME = 50_000
+// Anti-spray pivot (2026-08-04 CSV: 70 signals, 27% win, avg win +4.9% / loss
+// −2.3%). Two of the four levers live here (the anti-fade gate is in the detector):
+//   Lever 2 — grade floor: 57% of that day's signals were grade 'below' at 25%
+//   win, so stop logging below-grade signals. The early-momentum winners
+//   (premarket_breakout 2/2, opening_drive 66%) are exempt — they carry the book
+//   and occasionally grade below.
+//   Lever 3 — per-symbol log cap: TNMG logged 8× as it climbed, ENSC 6×. Allow up
+//   to MAX_LOGS_PER_SYMBOL DISTINCT ideas on a name (the user will take a genuine
+//   second setup) but kill the 3rd+ repeat of a running name.
+const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['premarket_breakout', 'opening_drive'])
+const MAX_LOGS_PER_SYMBOL = 2
+const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session (premarket→close ≈ 12h)
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -352,7 +364,14 @@ export function useMonitor() {
           const allBuys = [...s.buySignals, ...newBuySignals]
           const standDown = BOUNCE_TYPES.has(setup.type) &&
             recentlyFailedBounce(setup.symbol, now, allStates)
-          const capped = symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys)
+          // Lever 3: cap logged ideas per name this session (2 distinct, not 8 repeats).
+          const symbolLogsThisSession = allBuys.filter(
+            b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS
+          ).length
+          const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
+          const capped = symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys) || overLogged
+          // Lever 2: quality floor — drop below-grade signals (exempt the early-momentum winners).
+          const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
           // The fill you'd actually get entering on the trigger — not the (often
           // unreachable) zone bottom. Computed BEFORE the dedup because the dedup
           // must compare like for like: it previously passed `zoneUpper` while the
@@ -380,7 +399,8 @@ export function useMonitor() {
               : r.volume === 0 || r.volume >= MIN_BUY_VOLUME
             if (!tradeable) funnel.droppedSession++
             else if (!volumeOk) funnel.droppedVolume++
-            else if (setup.qualityVetoed) funnel.droppedVeto++
+            // Grade floor folds into the veto bucket — both are "dropped for quality".
+            else if (setup.qualityVetoed || gradeFloorFail) funnel.droppedVeto++
             else if (standDown) funnel.droppedStandDown++
             else if (capped) funnel.droppedCapped++
             else if (dup) funnel.droppedDup++
