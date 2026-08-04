@@ -7,6 +7,7 @@ import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
 import { getSessionType, isPremarket } from '@/lib/market-hours'
 import { sessionFractionElapsed } from '@/lib/technical'
 import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-volume'
+import { getWebullGainers, type WebullRankType } from '@/lib/webull-client'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -170,24 +171,38 @@ export async function GET(request: Request) {
       cache.delete('yfActives')
       cache.delete('yfTrending')
       cache.delete('batchQuotes:gainers')
+      cache.delete('webullGainers:preMarket')
+      cache.delete('webullGainers:afterMarket')
+      cache.delete('webullGainers:1d')
     }
 
     // Universe strategy:
     // - Regular hours: Yahoo Finance day_gainers + most_actives (real-time, no auth)
     //   supplemented by FMP biggest-gainers for any symbols YF misses.
     // - Premarket: FMP biggest-gainers + most-active merged, then YF quote per symbol for gap%.
-    const [yfGainers, yfSmallCap, yfActives, yfTrendingSyms, fmpGainers, fmpMostActive] = await Promise.all([
+    // Webull is the ONLY source that surfaces fresh premarket rockets — FMP's
+    // biggest-gainers lags to the prior session and doesn't carry sub-$1 low-floats
+    // at all (QNME/ELPW had no FMP quote 2026-08-04), Yahoo's screeners are RTH +
+    // size-floored. Webull's own premarket board returned exactly the day's movers.
+    // Public ranking endpoint, no login; fails soft to [] so the scanner survives if
+    // Webull is unreachable. Rank tracks the session.
+    const webullRank: WebullRankType = inPremarket ? 'preMarket' : sessionType === 'afterhours' ? 'afterMarket' : '1d'
+
+    const [yfGainers, yfSmallCap, yfActives, yfTrendingSyms, fmpGainers, fmpMostActive, webullGainers] = await Promise.all([
       !inPremarket ? cached('yfGainers', TTL.GAINERS, () => getYFScreener('day_gainers', 50)).catch(() => []) : Promise.resolve([]),
       !inPremarket ? cached('yfSmallCap', TTL.GAINERS, () => getYFScreener('small_cap_gainers', 25)).catch(() => []) : Promise.resolve([]),
       !inPremarket ? cached('yfActives', TTL.GAINERS, () => getYFScreener('most_actives', 50)).catch(() => []) : Promise.resolve([]),
       cached('yfTrending', TTL.GAINERS, () => getYFTrending(40)).catch(() => [] as string[]),
       cached('gainers', TTL.GAINERS, getTopGainers),
       cached('mostActive', TTL.GAINERS, getMostActive),
+      cached(`webullGainers:${webullRank}`, TTL.GAINERS, () => getWebullGainers(webullRank)).catch(() => []),
     ])
 
     // Fetch YF quotes for trending symbols not already covered by screeners
     // (trending gives symbols only; we need price/change% from quote)
-    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfAvgVolume?: number | null; yfMarketCap?: number | null }
+    // wb* fields carry Webull's own price/change so a name no other feed covers
+    // (the sub-$1 rockets) still has real numbers to display and rank on.
+    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfAvgVolume?: number | null; yfMarketCap?: number | null; wbPrice?: number | null; wbChangePct?: number; webull?: boolean }
 
     const screenerSymbols = new Set([...yfGainers, ...yfSmallCap, ...yfActives].map(r => r.symbol))
     const trendingOnly = (yfTrendingSyms as string[]).filter(s => !screenerSymbols.has(s))
@@ -229,7 +244,21 @@ export async function GET(request: Request) {
     }))
     const fmpRows: UniverseEntry[] = [...fmpGainers, ...fmpMostActive]
 
-    const universe = [...yfRows, ...trendingRows, ...fmpRows].filter(g => {
+    const webullRows: UniverseEntry[] = webullGainers.map(w => ({
+      symbol: w.symbol,
+      name: '',
+      price: w.price ?? undefined,
+      changesPercentage: w.changePct,
+      exchange: w.exchange,
+      wbPrice: w.price,
+      wbChangePct: w.changePct,
+      webull: true,
+    }))
+
+    // Webull first so its fresh premarket movers seed the universe; FMP/Yahoo rows
+    // for the same symbol are deduped out but their richer data is re-joined by the
+    // per-symbol quote/candle fetches below.
+    const universe = [...webullRows, ...yfRows, ...trendingRows, ...fmpRows].filter(g => {
       if (!g.symbol || seen.has(g.symbol)) return false
       seen.add(g.symbol)
       if (filters.commonStocksOnly && isExcluded(g.name ?? '', g.symbol, g.exchange)) return false
@@ -279,6 +308,10 @@ export async function GET(request: Request) {
 
     // Premarket volume is inherently lower — relax the floor to 5% of normal.
     const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume
+    // Premarket: allow sub-$1 gappers (the day's low-float rockets — QNME $0.31,
+    // ELPW $0.10 — live below the $1 default floor). Highest-risk/thinnest names, by
+    // explicit choice. RTH keeps the normal floor.
+    const effectiveMinPrice = inPremarket ? Math.min(filters.minPrice, 0.05) : filters.minPrice
 
     const rows: ScannerRow[] = universe
       .map((g: UniverseEntry, i: number) => {
@@ -310,6 +343,13 @@ export async function GET(request: Request) {
           price = g.price
           changePct = g.yfChangePct
           prevClose = q?.previousClose ?? 0
+        } else if (g.webull && !q?.price && !(pm?.price)) {
+          // Webull-discovered name that no other feed covers (the sub-$1 rockets):
+          // use Webull's own price/change so it still displays and ranks instead of
+          // being dropped for a missing FMP/Yahoo quote.
+          price = g.wbPrice ?? 0
+          changePct = g.wbChangePct ?? 0
+          prevClose = price > 0 && changePct > -100 ? price / (1 + changePct / 100) : 0
         } else {
           // FMP-only row: use quote data
           price = q?.price ?? g.price ?? 0
@@ -317,6 +357,19 @@ export async function GET(request: Request) {
           changePct = prevClose > 0
             ? ((price - prevClose) / prevClose) * 100
             : (q?.changePercentage ?? Number(g.changesPercentage ?? 0))
+        }
+
+        // Webull is the premarket discovery authority for thin names. When the
+        // FMP/Yahoo enrichment disagrees and would drop a name Webull flags as a real
+        // gainer, trust Webull's own price/change. ELPW (2026-08-04): Yahoo's
+        // premarket path read $0.18 vs a stale $0.175 prevClose = +2.7% and the
+        // gainer filter dropped it, while FMP AND Webull agreed it was $0.10 / +67%.
+        // Only overrides UP to a real gainer — a higher fresh gap (RAIN via Yahoo,
+        // +111% > Webull's +97%) is left alone.
+        if (g.webull && g.wbChangePct != null && g.wbPrice && g.wbChangePct >= filters.minChangePct && g.wbChangePct > changePct) {
+          price = g.wbPrice
+          changePct = g.wbChangePct
+          prevClose = changePct > -100 ? price / (1 + changePct / 100) : prevClose
         }
 
         // NOTE: `||` not `??` on purpose. The premarket candle sum comes back as 0
@@ -331,12 +384,16 @@ export async function GET(request: Request) {
         const rvol = avgVol > 0 ? volume / (avgVol * scannerSessionFraction()) : null
 
 
-        if (price < filters.minPrice || price > filters.maxPrice) return null
+        if (price < effectiveMinPrice || price > filters.maxPrice) return null
         // During premarket only show upside gappers (positive change)
         const absPct = Math.abs(changePct)
         if (absPct < filters.minChangePct || absPct > filters.maxChangePct) return null
         if (inPremarket && changePct <= 0) return null  // skip stocks gapping down in premarket scanner
-        if (volume > 0 && volume < effectiveMinVolume) return null
+        // Volume floor: RTH only. In premarket the `volume` here is often a stale
+        // regular-session fallback (RAIN's 20k FMP volume tripped the floor and
+        // dropped a +110% gapper) — premarket volume is measured later in the
+        // backfill and screened there on the real number.
+        if (!inPremarket && volume > 0 && volume < effectiveMinVolume) return null
         if (filters.minRelativeVolume > 0 && rvol !== null && rvol < filters.minRelativeVolume) return null
 
         const float = floatMap.get(g.symbol) ?? null
