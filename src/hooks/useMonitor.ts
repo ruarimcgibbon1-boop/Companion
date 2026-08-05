@@ -3,6 +3,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
+import { etMinutesOfDay } from '@/lib/market-hours'
 import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel, PatternLogRecord } from '@/types'
 
 // One pattern log per symbol+pattern per ~10-min bucket, so a hit that persists
@@ -24,15 +25,24 @@ const MIN_PREMARKET_BUY_VOLUME = 50_000
 // Anti-spray pivot (2026-08-04 CSV: 70 signals, 27% win, avg win +4.9% / loss
 // −2.3%). Two of the four levers live here (the anti-fade gate is in the detector):
 //   Lever 2 — grade floor: 57% of that day's signals were grade 'below' at 25%
-//   win, so stop logging below-grade signals. The early-momentum winners
-//   (premarket_breakout 2/2, opening_drive 66%) are exempt — they carry the book
-//   and occasionally grade below.
+//   win, so stop logging below-grade signals. opening_drive is exempt — it carries
+//   the book (20-day replay: 47% / +2.03%/trade) and occasionally grades below.
+//   premarket_breakout was ALSO exempt on an 8/4 "2/2" read, but the 20-day FMP
+//   replay (2026-08-05) showed it is the single biggest drag — 31 signals, 29%
+//   win, −2.02%/trade, losing across every grade — and its below-grade fires were
+//   the bulk of the bleed. So it no longer skips the floor: only grade-C+ premarket
+//   breakouts (the quality gappers we still want) log now.
 //   Lever 3 — per-symbol log cap: TNMG logged 8× as it climbed, ENSC 6×. Allow up
 //   to MAX_LOGS_PER_SYMBOL DISTINCT ideas on a name (the user will take a genuine
 //   second setup) but kill the 3rd+ repeat of a running name.
-const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['premarket_breakout', 'opening_drive'])
+const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['opening_drive'])
 const MAX_LOGS_PER_SYMBOL = 2
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session (premarket→close ≈ 12h)
+// Late-session cutoff (20-day FMP replay, 2026-08-05): regular-hours entries after
+// 14:00 ET lost (−0.69%/trade over 17 signals) while the 10:00–14:00 window carried
+// the book (+1.72%/trade). Stop logging new regular-session BUYs past this time;
+// premarket is unaffected (it's judged on its own gates). ET minutes-of-day.
+const LATE_LOG_CUTOFF_ET_MIN = 14 * 60
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -51,6 +61,16 @@ function sendBrowserNotification(a: MonitorAlert) {
     tag: `${a.symbol}-${a.setupType}-${a.kind}`,
     requireInteraction: a.kind === 'triggered',
   })
+}
+
+// Fire-and-forget: the server route no-ops when Telegram isn't configured and
+// dedups replays, so the sweep never blocks or double-texts.
+function sendTelegramAlert(b: BuySignalRecord) {
+  fetch('/api/telegram', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ signal: b }),
+  }).catch(() => { /* alert delivery is best-effort */ })
 }
 
 let audioCtx: AudioContext | null = null
@@ -388,8 +408,10 @@ export function useMonitor() {
             const dup = isDuplicateBuy(setup.symbol, fill, now, allBuys)
             // After-close gate: a trigger printed once the market's shut (or
             // overnight) is untradeable — you can't act on it, and it fired off the
-            // closing print (2026-07-29 logged 3 at 16:01). Premarket + regular stay.
-            const tradeable = r.integrity.session === 'premarket' || r.integrity.session === 'regular'
+            // closing print (2026-07-29 logged 3 at 16:01). Premarket stays; regular
+            // hours stay only before the late-session cutoff (see LATE_LOG_CUTOFF).
+            const tradeable = r.integrity.session === 'premarket' ||
+              (r.integrity.session === 'regular' && etMinutesOfDay(now) < LATE_LOG_CUTOFF_ET_MIN)
             // Buy signals need real liquidity behind them. Premarket is measured on
             // its own scale; only a genuinely unmeasurable reading (null — the
             // extended-feed fetch failed) is exempt, so a data gap can't silently
@@ -410,7 +432,7 @@ export function useMonitor() {
               const rr = t1 != null && fill > setup.stopReference
                 ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
                 : setup.rewardRisk
-              newBuySignals.push({
+              const buy: BuySignalRecord = {
                 id: `${setup.id}:triggered:${Math.floor(now / 1000)}`,
                 setupId: setup.id,
                 symbol: setup.symbol,
@@ -434,7 +456,9 @@ export function useMonitor() {
                 ctxRelVol: r.relativeVolume,
                 ctxHigherHighsLows: r.technicals?.higherHighsLows ?? null,
                 ctxAtrPct: r.technicals?.atrPct ?? null,
-              })
+              }
+              newBuySignals.push(buy)
+              sendTelegramAlert(buy)
             }
           }
 

@@ -156,7 +156,10 @@ const STRENGTH_ENTRY_TYPES: SetupType[] = [
 // (premarket_breakout, opening_drive, ORB, HOD) are NOT in this set — they fire at
 // or near the high by construction and are the setups that actually pay.
 const ANTI_FADE_TYPES: SetupType[] = ['breakout', 'break_of_structure']
-const MAX_BELOW_HIGH_PCT = 8
+// Tightened 8%→5% after the 20-day FMP replay (2026-08-05): the −5%-to−8%-off-high
+// band bled (−1.01%/trade) while entries within 5% of the high carried the book, so
+// a chase-family break that fires 5%+ under the session high is now vetoed.
+const MAX_BELOW_HIGH_PCT = 5
 // A target only a few basis points beyond the fill is noise, not a target: it
 // tanks R/R and books phantom "wins" (KUST/MWC/INM 2026-07-22). The first RATED
 // target must clear a meaningful reward — ≥ this fraction of the risk, a % of

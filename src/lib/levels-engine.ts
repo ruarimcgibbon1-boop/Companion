@@ -78,10 +78,12 @@ export interface LevelsEngineInput {
   sessionLevels: SessionLevels
   technical: TechnicalData
   currentPrice: number
+  nowTs?: number   // simulated "now" for replay/backtest; defaults to live
 }
 
 export function buildKeyLevels(input: LevelsEngineInput): KeyLevel[] {
   const { intraday, daily, sessionLevels: sl, technical: t, currentPrice } = input
+  const nowTs = input.nowTs ?? Date.now()
   if (currentPrice <= 0) return []
 
   const atr = t.atr && t.atr > 0 ? t.atr : currentPrice * 0.01
@@ -220,7 +222,7 @@ export function buildKeyLevels(input: LevelsEngineInput): KeyLevel[] {
     if (actedBothSides) strength += 8                       // flipped S<->R
     // Recency: reactions within last 45 min score higher
     if (lastReactionAt) {
-      const ageMin = (Date.now() - lastReactionAt) / 60000
+      const ageMin = (nowTs - lastReactionAt) / 60000
       if (ageMin < 15) strength += 8
       else if (ageMin < 45) strength += 4
     }
