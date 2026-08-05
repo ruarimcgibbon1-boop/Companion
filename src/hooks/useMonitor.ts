@@ -32,9 +32,17 @@ const MIN_PREMARKET_BUY_VOLUME = 50_000
 //   win, −2.02%/trade, losing across every grade — and its below-grade fires were
 //   the bulk of the bleed. So it no longer skips the floor: only grade-C+ premarket
 //   breakouts (the quality gappers we still want) log now.
+//   NB: momentum_pullback was briefly exempted too (2026-08-05) on the theory that
+//   the best setup shouldn't be floored — but the replay showed the opposite:
+//   exempting it flooded the book with below-grade momentum_pullbacks that LOSE
+//   (17→89 signals, 60%→50% win, +2.23→−0.70%/trade). The grade floor was
+//   correctly filtering them, so it stays floored. Its edge lives in grade-C+ only.
 //   Lever 3 — per-symbol log cap: TNMG logged 8× as it climbed, ENSC 6×. Allow up
 //   to MAX_LOGS_PER_SYMBOL DISTINCT ideas on a name (the user will take a genuine
-//   second setup) but kill the 3rd+ repeat of a running name.
+//   second setup) but kill the 3rd+ repeat of a running name. NB: raising this 2→3
+//   was tested 2026-08-05 (to auto-flag a 3rd scale on a runner) and DILUTED the
+//   book (106→137 signals, 46%→42% win, +1.25→+0.81%/trade) — it re-admits repeat
+//   spam, not disciplined scale-ins. Kept at 2; manual scaling is the trader's call.
 const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['opening_drive'])
 const MAX_LOGS_PER_SYMBOL = 2
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session (premarket→close ≈ 12h)
@@ -230,9 +238,8 @@ function recentlyFailedBounce(sym: string, now: number, states: SetupStateRecord
 //   • one losing entry — INCLUDING an entry we only flagged (qualityVetoed) —
 //     stands the whole name down (gap A: a flag that then hits its stop is still
 //     a loss and must arm the stand-down),
-//   • or two banked wins stand it down too (gap C: stop pressing a name that's
-//     already paid out twice — the third+ fire is the late chase that gives it
-//     back).
+//   • or SYMBOL_WIN_CAP banked wins stand it down (stop pressing a name that's
+//     already paid out — the late re-fire tends to give it back).
 // The loss/win memory is read from the LATCHED setup LOG (outcome freezes once
 // it goes 'invalidated'/'target_hit'), not the live setup STATE. 2026-07-14 LEDS
 // showed why: it failed at 10:20/10:24, then ran back up so its setup re-armed

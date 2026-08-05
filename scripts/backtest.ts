@@ -47,7 +47,7 @@ const MIN_LEVEL_STRENGTH = 40            // store default notificationSettings.m
 // Buy-log gate constants (mirrored from useMonitor.ts)
 const MIN_BUY_VOLUME = 100_000
 const MIN_PREMARKET_BUY_VOLUME = 50_000
-const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])  // premarket_breakout dropped 2026-08-05 (biggest drag)
+const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])  // PMB dropped 2026-08-05; momentum_pullback exemption tested + reverted (flooded losers)
 const LATE_LOG_CUTOFF_HHMM = 1400  // no new regular-hours BUYs at/after 14:00 ET
 const MAX_LOGS_PER_SYMBOL = 2
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000
