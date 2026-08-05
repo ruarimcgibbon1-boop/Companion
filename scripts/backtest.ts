@@ -47,6 +47,7 @@ const MIN_LEVEL_STRENGTH = 40            // store default notificationSettings.m
 // Buy-log gate constants (mirrored from useMonitor.ts)
 const MIN_BUY_VOLUME = 100_000
 const MIN_PREMARKET_BUY_VOLUME = 50_000
+const PREMARKET_SURGE_RVOL = 10  // a strong RVOL surge clears the absolute floor (thin-float rockets, e.g. YXT 46×)
 const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])  // PMB dropped 2026-08-05; momentum_pullback exemption tested + reverted (flooded losers)
 const LATE_LOG_CUTOFF_HHMM = 1400  // no new regular-hours BUYs at/after 14:00 ET
 const MAX_LOGS_PER_SYMBOL = 2
@@ -322,7 +323,7 @@ function replaySymbolDay(
       const fill = setup.entryFill ?? setup.zoneUpper
       const dup = isDuplicateBuy(symbol, fill, nowTs, dayBuys)
       const volumeOk = session === 'premarket'
-        ? premarketVolForGate == null || premarketVolForGate >= MIN_PREMARKET_BUY_VOLUME
+        ? premarketVolForGate == null || premarketVolForGate >= MIN_PREMARKET_BUY_VOLUME || (technical.relativeVolume != null && technical.relativeVolume >= PREMARKET_SURGE_RVOL)
         : todayVol === 0 || todayVol >= MIN_BUY_VOLUME
       const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
       const standDown = BOUNCE_TYPES.has(setup.type) &&

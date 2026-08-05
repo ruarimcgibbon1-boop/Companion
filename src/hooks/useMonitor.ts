@@ -22,6 +22,16 @@ const MIN_BUY_VOLUME = 100_000
 // reads — UPC 625k / DFNS 678k pass; HYFM 5k, WLDS 10k, CNCK 1k (all dead premarket,
 // all "signals on names that don't move") do not.
 const MIN_PREMARKET_BUY_VOLUME = 50_000
+// …but an ABSOLUTE share floor punishes ultra-thin float rockets: YXT (2026-08-05,
+// +208% premarket) surged to 46× its own premarket norm on 46,263 shares — hugely
+// active for a name that trades ~6k shares/day — yet missed the 50k floor by 7.5%
+// and its clean grade-C premarket_breakout was silently dropped. Relative volume is
+// the real "is this in play" signal, so a strong RVOL surge clears the floor even
+// when the absolute count is short. Dead names don't qualify: they surge little
+// relative to their own norm (HYFM read 0.1× on 2026-08-03), so this stays well
+// clear of them. Only affects the 10k–50k measured band (below 10k is already
+// exempt as unmeasured; above 50k already passes).
+const PREMARKET_SURGE_RVOL = 10
 // Anti-spray pivot (2026-08-04 CSV: 70 signals, 27% win, avg win +4.9% / loss
 // −2.3%). Two of the four levers live here (the anti-fade gate is in the detector):
 //   Lever 2 — grade floor: 57% of that day's signals were grade 'below' at 25%
@@ -423,8 +433,12 @@ export function useMonitor() {
             // its own scale; only a genuinely unmeasurable reading (null — the
             // extended-feed fetch failed) is exempt, so a data gap can't silently
             // shut premarket down.
+            // Premarket: pass on absolute volume, an unmeasured (null) reading, OR a
+            // strong RVOL surge — the last one is what rescues thin-float rockets like
+            // YXT (46× on 46k shares) that the absolute floor wrongly rejects.
+            const premarketSurge = r.relativeVolume != null && r.relativeVolume >= PREMARKET_SURGE_RVOL
             const volumeOk = r.integrity.session === 'premarket'
-              ? r.premarketVolume == null || r.premarketVolume >= MIN_PREMARKET_BUY_VOLUME
+              ? r.premarketVolume == null || r.premarketVolume >= MIN_PREMARKET_BUY_VOLUME || premarketSurge
               : r.volume === 0 || r.volume >= MIN_BUY_VOLUME
             if (!tradeable) funnel.droppedSession++
             else if (!volumeOk) funnel.droppedVolume++
