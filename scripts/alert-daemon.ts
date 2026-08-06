@@ -11,7 +11,7 @@
  * Prereqs: the Next dev server running (`npm run dev`) + Telegram configured in
  * .env.local. Run:  npx tsx scripts/alert-daemon.ts
  */
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
@@ -27,6 +27,14 @@ const IDLE_MS = 5 * 60_000              // slow poll when the market is closed
 const MIN_LEVEL_STRENGTH = 40           // store default notificationSettings.minLevelStrength
 const TOP_GAINERS_UNIVERSE = 15         // matches useMonitor.gatherUniverse
 const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
+// Every triggered setup + its verdict, appended as JSONL. This is the session
+// audit trail: at end of day you can answer "did we miss X?" from data instead of
+// memory — including the NEAR-MISSES (triggered but gated), which the terminal
+// output never showed. One line per triggered setup per sweep-first-sighting.
+const DECISION_LOG = join(homedir(), `.companion-decisions-${new Date().toISOString().slice(0, 10)}.jsonl`)
+
+const HEARTBEAT_MS = 5 * 60_000         // "still alive" line when nothing is triggering
+let lastHeartbeat = 0
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a)
@@ -37,6 +45,16 @@ function loadBuys(): BuySignalRecord[] {
 }
 function saveBuys(buys: BuySignalRecord[]) {
   try { writeFileSync(STATE_FILE, JSON.stringify(buys)) } catch (e) { log('state save failed:', (e as Error).message) }
+}
+
+// Record each triggered setup's verdict once (a setup persists across sweeps, so
+// key on setup id + verdict to avoid one line every 15s).
+const seenDecisions = new Set<string>()
+function recordDecision(row: Record<string, unknown>) {
+  const key = `${row.setupId}:${row.verdict}`
+  if (seenDecisions.has(key)) return
+  seenDecisions.add(key)
+  try { appendFileSync(DECISION_LOG, JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
 }
 
 async function fetchUniverse(): Promise<string[]> {
@@ -89,6 +107,17 @@ async function sweep(buys: BuySignalRecord[]): Promise<BuySignalRecord[]> {
       // bounce stand-down no-op on empty logs/states; overLogged + dedup + the
       // strong-continuation override still apply, which is the alerting core.
       const { verdict, buy } = classifyBuy(setup, r, { now, priorBuys: state, priorLogs: [], priorStates: [] })
+      // Audit trail: every trigger + verdict, so end-of-session "did we miss X?"
+      // is answerable from data — near-misses included.
+      recordDecision({
+        ts: new Date(now).toISOString(),
+        etTime: new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(now),
+        symbol: setup.symbol, setupId: setup.id, setupType: setup.type,
+        grade: setup.grade, score: setup.score, verdict,
+        fill: setup.entryFill ?? setup.zoneUpper,
+        rvol: r.relativeVolume, offHighPct: r.technicals?.distanceFromDayHighPct ?? null,
+        session: r.integrity.session, price: r.price,
+      })
       if (verdict === 'logged' && buy) {
         state = [...state, buy]
         const tag = `${buy.symbol} ${buy.setupType} @ ${buy.entryHigh} (grade ${buy.grade}, rvol ${buy.ctxRelVol?.toFixed(0) ?? '—'}×)`
@@ -97,12 +126,18 @@ async function sweep(buys: BuySignalRecord[]): Promise<BuySignalRecord[]> {
       }
     }
   }
+  // Log on activity, or periodically so a quiet stretch is visibly alive (not hung).
   if (triggered) log(`swept ${universe.length} names · ${triggered} triggers · ${sent} new alerts`)
+  else if (now - lastHeartbeat > HEARTBEAT_MS) {
+    lastHeartbeat = now
+    log(`· alive — watching ${universe.length} names (${universe.slice(0, 5).join(' ')}${universe.length > 5 ? '…' : ''}), no triggers`)
+  }
   return state
 }
 
 async function main() {
-  log(`alert-daemon starting → ${BASE}${DRY_RUN ? ' [DRY_RUN]' : ''}${ONCE ? ' [ONCE]' : ''} (state: ${STATE_FILE})`)
+  log(`alert-daemon starting → ${BASE}${DRY_RUN ? ' [DRY_RUN]' : ''}${ONCE ? ' [ONCE]' : ''}`)
+  log(`decisions → ${DECISION_LOG}`)
   let buys = loadBuys()
   while (true) {
     const session = getSessionType()
