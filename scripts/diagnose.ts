@@ -24,20 +24,18 @@
  */
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
-import type { Candle, SetupType } from '@/types'
+import type { Candle, MonitorResult, BuySignalRecord } from '@/types'
 import { calculateSessionLevels, calculateTechnical } from '@/lib/technical'
 import { buildKeyLevels } from '@/lib/levels-engine'
 import { detectSetups, type DetectionContext } from '@/lib/setup-detectors'
 import { premarketVolumeProfile } from '@/lib/premarket-volume'
 import { getSessionType, minutesSinceOpen } from '@/lib/market-hours'
+// Use the SHARED gate stack — no local mirror, so the diagnostic always reflects
+// exactly what the live client + daemon would do (incl. the strong-continuation
+// override). Keeping a private copy here is what made this tool lie once.
+import { classifyBuy, passesTrackingFloor } from '@/lib/buy-log'
 
-// ── mirror of useMonitor gate stack (keep in sync) ──
-const MIN_SCORE_FLOOR = 55, MIN_LEVEL_STRENGTH = 40
-const MIN_BUY_VOLUME = 100_000, MIN_PREMARKET_BUY_VOLUME = 50_000, PREMARKET_SURGE_RVOL = 10
-const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])
-const LATE_LOG_CUTOFF_HHMM = 1400
-const MAX_LOGS_PER_SYMBOL = 2
-const ENTRY_SIMILARITY_PCT = 0.03, BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000
+const MIN_LEVEL_STRENGTH = 40   // store default notificationSettings.minLevelStrength
 
 const [SYM, DAY, FOCUS] = [process.argv[2]?.toUpperCase(), process.argv[3], process.argv[4]]
 if (!SYM || !DAY) { console.error('usage: npx tsx scripts/diagnose.ts <SYMBOL> <YYYY-MM-DD> [HHMM]'); process.exit(1) }
@@ -58,7 +56,6 @@ const etDay = (u: number) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Ameri
 const etHHMM = (ms: number) => { const s = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ms)); const [h, m] = s.split(':').map(Number); return h * 100 + m }
 const toC = (r: Raw[]): Candle[] => r.map(x => ({ time: etUnix(x.date), open: x.open, high: x.high, low: x.low, close: x.close, volume: x.volume ?? 0 })).sort((a, b) => a.time - b.time)
 
-interface Logged { entry: number; ts: number }
 
 async function main() {
   let m5: Raw[], dRaw: any
@@ -84,7 +81,7 @@ async function main() {
   console.log(`\n=== ${SYM} ${DAY} ===`)
   console.log(`prevClose ${prevClose} · avg daily vol(20d) ${avgVol.toFixed(0)} · ${dayRows.length} intraday bars${FOCUS ? ` · focus ~${FOCUS} ET` : ''}\n`)
 
-  const logged: Logged[] = []
+  const dayBuys: BuySignalRecord[] = []
   let anyTrigger = false, anyLog = false
   const focusMin = FOCUS ? Math.floor(+FOCUS / 100) * 60 + (+FOCUS % 100) : null
 
@@ -113,27 +110,36 @@ async function main() {
     const et = etHHMM(nowTs), etM = Math.floor(et / 100) * 60 + (et % 100)
     if (focusMin != null && Math.abs(etM - focusMin) > 20) continue
 
+    // Shape a MonitorResult the shared classifier can read (same fields monitor.ts fills).
+    const r = {
+      symbol: SYM, price, volume: todayVol, relativeVolume: tech.relativeVolume,
+      premarketVolume: session === 'premarket' ? pmVolGate : null,
+      integrity: { session },
+      technicals: {
+        distanceFromDayHighPct: tech.distanceFromDayHighPct, trend15m: tech.trend15m,
+        distanceFromVwapPct: tech.distanceFromVwapPct, higherHighsLows: tech.higherHighsLows,
+        atrPct: tech.atr != null && price > 0 ? (tech.atr / price) * 100 : null,
+      },
+    } as unknown as MonitorResult
+
     for (const s of setups) {
       if (!(s.direction === 'long' && s.triggeredRaw)) continue
       anyTrigger = true
       const fill = s.entryFill ?? s.zoneUpper
-      const meetsLevel = (s.breakdown.levelQuality / 20) * 100 >= MIN_LEVEL_STRENGTH * 0.2 || s.confidence >= MIN_LEVEL_STRENGTH
-      const surge = tech.relativeVolume != null && tech.relativeVolume >= PREMARKET_SURGE_RVOL
-      const volOk = session === 'premarket' ? (pmVolGate == null || pmVolGate >= MIN_PREMARKET_BUY_VOLUME || surge) : (todayVol === 0 || todayVol >= MIN_BUY_VOLUME)
-      const late = session === 'regular' && et >= LATE_LOG_CUTOFF_HHMM
-      const gradeFail = s.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(s.type)
-      const dup = logged.some(l => nowTs - l.ts <= BUY_DEDUP_COOLDOWN_MS && l.entry > 0 && Math.abs(fill - l.entry) / l.entry < ENTRY_SIMILARITY_PCT)
-      const capped = logged.filter(l => nowTs - l.ts < 12 * 3600 * 1000).length >= MAX_LOGS_PER_SYMBOL
-
       let verdict: string
-      if (s.score < MIN_SCORE_FLOOR && !meetsLevel) verdict = 'DISPLAY_FLOOR'
-      else if (late) verdict = 'LATE_CUTOFF'
-      else if (!volOk) verdict = `VOLUME (pm ${pmVolGate ?? '—'}, rvol ${tech.relativeVolume?.toFixed(0) ?? '—'})`
-      else if (s.qualityVetoed) verdict = 'QUALITY_VETO (anti-fade/rollover)'
-      else if (gradeFail) verdict = 'GRADE_FLOOR (below)'
-      else if (capped) verdict = 'CAP (per-symbol)'
-      else if (dup) verdict = 'DUP (entry cluster)'
-      else { verdict = 'LOGS ✅'; anyLog = true; logged.push({ entry: fill, ts: nowTs }) }
+      if (!passesTrackingFloor(s, MIN_LEVEL_STRENGTH)) verdict = 'DISPLAY_FLOOR'
+      else {
+        const res = classifyBuy(s, r, { now: nowTs, priorBuys: dayBuys, priorLogs: [], priorStates: [] })
+        // veto = quality veto OR grade floor; keep the distinction for readability.
+        const label: Record<string, string> = {
+          session: session === 'regular' && et >= 1400 ? 'LATE_CUTOFF' : 'SESSION',
+          volume: `VOLUME (pm ${pmVolGate ?? '—'}, rvol ${tech.relativeVolume?.toFixed(0) ?? '—'})`,
+          veto: s.qualityVetoed ? 'QUALITY_VETO (anti-fade/rollover)' : 'GRADE_FLOOR (below)',
+          standDown: 'STAND_DOWN', capped: 'CAP (per-symbol)', dup: 'DUP (entry cluster)', logged: 'LOGS ✅',
+        }
+        verdict = label[res.verdict]
+        if (res.verdict === 'logged' && res.buy) { anyLog = true; dayBuys.push(res.buy) }
+      }
 
       const offHigh = tech.distanceFromDayHighPct?.toFixed(1) ?? '—'
       console.log(`[${String(et).padStart(4, '0')}] ${s.type.padEnd(20)} g=${String(s.grade).padEnd(5)} sc=${s.score} rvol=${(tech.relativeVolume ?? 0).toFixed(0).padStart(3)}× fill=${fill.toFixed(2)} offHi=${offHigh}%  → ${verdict}`)
