@@ -45,7 +45,7 @@ const CACHE = '/private/tmp/claude-501/-Users-elonmusk-Companion/e73f584c-b4b9-4
 if (!existsSync(CACHE)) mkdirSync(CACHE, { recursive: true })
 
 interface Raw { date: string; open: number; high: number; low: number; close: number; volume: number }
-async function get(name: string, url: string): Promise<any> {
+async function get(name: string, url: string): Promise<unknown> {
   const f = join(CACHE, name + '.json')
   if (existsSync(f)) return JSON.parse(readFileSync(f, 'utf8'))
   const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -58,13 +58,13 @@ const toC = (r: Raw[]): Candle[] => r.map(x => ({ time: etUnix(x.date), open: x.
 
 
 async function main() {
-  let m5: Raw[], dRaw: any
+  let m5: Raw[], dRaw: unknown
   try {
     m5 = (await get(`m5_${SYM}_${DAY}`, `https://financialmodelingprep.com/stable/historical-chart/5min?symbol=${SYM}&from=${etDay(etUnix(DAY) - 14 * 86400)}&to=${DAY}&extended=true&apikey=${KEY}`) as Raw[]).slice().sort((a, b) => a.date.localeCompare(b.date))
     dRaw = await get(`daily_${SYM}`, `https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=${SYM}&from=2026-06-01&to=${DAY}&apikey=${KEY}`)
   } catch (e) { console.log(`>>> NO_DATA: FMP fetch failed for ${SYM} (${(e as Error).message}). Discovery/feed gap, not a logic gap.`); return }
 
-  const daily: Raw[] = (Array.isArray(dRaw) ? dRaw : dRaw.historical ?? []).slice().sort((a: Raw, b: Raw) => a.date.localeCompare(b.date))
+  const daily: Raw[] = (Array.isArray(dRaw) ? dRaw : (dRaw as { historical?: Raw[] }).historical ?? []).slice().sort((a: Raw, b: Raw) => a.date.localeCompare(b.date))
   const dayRows = m5.filter(r => r.date.slice(0, 10) === DAY)
   if (dayRows.length === 0) { console.log(`>>> NO_DATA: FMP has no ${DAY} intraday bars for ${SYM}. It may be a name no feed covers (board-only) or the date is wrong.`); return }
 
