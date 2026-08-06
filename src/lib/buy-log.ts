@@ -35,7 +35,23 @@ export const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])
 export const MAX_LOGS_PER_SYMBOL = 2
 export const MAX_LOGS_PER_SYMBOL_RUNNER = 4
 export const STRONG_CONT_MAX_BELOW_HIGH_PCT = 3   // within 3% of the session high
-export const STRONG_CONT_MIN_RVOL = 10            // ≥10× average = a real surge
+// RVOL is measured on DIFFERENT SCALES either side of the open, so one threshold
+// cannot serve both (2026-08-06 audit):
+//   • premarket RVOL = today's premarket volume ÷ this name's own median premarket
+//     volume at the same time of day → reads 100–900× on a real gapper.
+//   • regular-hours RVOL = day volume ÷ (avg daily volume × session fraction
+//     elapsed) → a genuine RTH surge reads 4–26×.
+// A flat 10× therefore fired reliably premarket and ALMOST NEVER during regular
+// hours, so the strong-continuation override effectively didn't exist in RTH —
+// grade-floor blocks were 48% of that day's misses (CELZ 10:55 ORB at 0.0% off
+// high on 5× RVOL was floored at a perfect location). Threshold per session.
+export const STRONG_CONT_MIN_RVOL_PREMARKET = 10
+export const STRONG_CONT_MIN_RVOL_RTH = 3
+
+/** The "this is a real surge" RVOL bar for the given session (see above). */
+export function strongContRvolThreshold(session: string): number {
+  return session === 'premarket' ? STRONG_CONT_MIN_RVOL_PREMARKET : STRONG_CONT_MIN_RVOL_RTH
+}
 export const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session
 
 // Entry-cluster dedup.
@@ -114,7 +130,7 @@ export function classifyBuy(setup: DetectedSetup, r: MonitorResult, ctx: Classif
   const offHighPct = r.technicals?.distanceFromDayHighPct ?? null   // negative = below the high
   const strongContinuation = !BOUNCE_TYPES.has(setup.type) &&
     offHighPct != null && offHighPct >= -STRONG_CONT_MAX_BELOW_HIGH_PCT &&
-    r.relativeVolume != null && r.relativeVolume >= STRONG_CONT_MIN_RVOL
+    r.relativeVolume != null && r.relativeVolume >= strongContRvolThreshold(r.integrity.session)
 
   const standDown = BOUNCE_TYPES.has(setup.type) && recentlyFailedBounce(setup.symbol, now, priorStates)
   const symbolLogsThisSession = priorBuys.filter(

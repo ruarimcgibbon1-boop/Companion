@@ -53,7 +53,12 @@ const LATE_LOG_CUTOFF_HHMM = 1400  // no new regular-hours BUYs at/after 14:00 E
 const MAX_LOGS_PER_SYMBOL = 2
 const MAX_LOGS_PER_SYMBOL_RUNNER = 4        // strong runner may be scaled past the normal cap
 const STRONG_CONT_MAX_BELOW_HIGH_PCT = 3    // within 3% of the session high
-const STRONG_CONT_MIN_RVOL = 10             // ≥10× average = a real surge
+// Session-aware RVOL bar (mirrors buy-log.ts). Overridable so a run can sweep the
+// RTH value: RTH_RVOL=5 npx tsx scripts/backtest.ts
+const STRONG_CONT_MIN_RVOL_PREMARKET = Number(process.env.PM_RVOL ?? 10)
+const STRONG_CONT_MIN_RVOL_RTH = Number(process.env.RTH_RVOL ?? 3)
+const strongContRvolThreshold = (session: string) =>
+  session === 'premarket' ? STRONG_CONT_MIN_RVOL_PREMARKET : STRONG_CONT_MIN_RVOL_RTH
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000
 const ENTRY_SIMILARITY_PCT = 0.03
 const BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000
@@ -333,7 +338,7 @@ function replaySymbolDay(
       const offHighPct = technical.distanceFromDayHighPct ?? null
       const strongContinuation = !BOUNCE_TYPES.has(setup.type) &&
         offHighPct != null && offHighPct >= -STRONG_CONT_MAX_BELOW_HIGH_PCT &&
-        technical.relativeVolume != null && technical.relativeVolume >= STRONG_CONT_MIN_RVOL
+        technical.relativeVolume != null && technical.relativeVolume >= strongContRvolThreshold(session)
       const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type) && !strongContinuation
       const standDown = BOUNCE_TYPES.has(setup.type) &&
         failedBounces.some(fb => fb.symbol === symbol && nowTs - fb.at < STANDDOWN_MS)
@@ -547,7 +552,8 @@ async function main() {
   lines.push('- All target/stop geometry, gates, and P/L come from the CURRENT committed code (branch improve-signal-quality).')
 
   const report = lines.join('\n')
-  const outPath = join(SCRATCH, 'backtest-july.md')
+  const tag = process.env.RUN_TAG ? `-${process.env.RUN_TAG}` : ''
+  const outPath = join(SCRATCH, `backtest-july${tag}.md`)
   writeFileSync(outPath, report)
   // Also dump the reconstructed signals as CSV.
   const csv = ['day,time_ET,symbol,setup,grade,entry,stop,t1,rvol,off_high_pct,outcome,scaled_pnl_pct']
@@ -556,7 +562,7 @@ async function main() {
     const t = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(r.timestamp))
     csv.push([day, t, r.symbol, r.setupType, r.grade, r.entryHigh.toFixed(2), r.stop.toFixed(2), r.targets[0]?.toFixed(2) ?? '', r.ctxRelVol?.toFixed(1) ?? '', r.ctxDistDayHighPct?.toFixed(1) ?? '', r.outcome, r.pnlPct.toFixed(2)].join(','))
   }
-  writeFileSync(join(SCRATCH, 'backtest-july-signals.csv'), csv.join('\n'))
+  writeFileSync(join(SCRATCH, `backtest-july${tag}-signals.csv`), csv.join('\n'))
 
   console.log(report)
   console.error(`\n\nReport → ${outPath}`)
