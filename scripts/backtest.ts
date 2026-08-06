@@ -51,14 +51,6 @@ const PREMARKET_SURGE_RVOL = 10  // a strong RVOL surge clears the absolute floo
 const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])  // PMB dropped 2026-08-05; momentum_pullback exemption tested + reverted (flooded losers)
 const LATE_LOG_CUTOFF_HHMM = 1400  // no new regular-hours BUYs at/after 14:00 ET
 const MAX_LOGS_PER_SYMBOL = 2
-const MAX_LOGS_PER_SYMBOL_RUNNER = 4        // strong runner may be scaled past the normal cap
-const STRONG_CONT_MAX_BELOW_HIGH_PCT = 3    // within 3% of the session high
-// Session-aware RVOL bar (mirrors buy-log.ts). Overridable so a run can sweep the
-// RTH value: RTH_RVOL=5 npx tsx scripts/backtest.ts
-const STRONG_CONT_MIN_RVOL_PREMARKET = Number(process.env.PM_RVOL ?? 10)
-const STRONG_CONT_MIN_RVOL_RTH = Number(process.env.RTH_RVOL ?? 3)
-const strongContRvolThreshold = (session: string) =>
-  session === 'premarket' ? STRONG_CONT_MIN_RVOL_PREMARKET : STRONG_CONT_MIN_RVOL_RTH
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000
 const ENTRY_SIMILARITY_PCT = 0.03
 const BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000
@@ -333,18 +325,14 @@ function replaySymbolDay(
       const volumeOk = session === 'premarket'
         ? premarketVolForGate == null || premarketVolForGate >= MIN_PREMARKET_BUY_VOLUME || (technical.relativeVolume != null && technical.relativeVolume >= PREMARKET_SURGE_RVOL)
         : todayVol === 0 || todayVol >= MIN_BUY_VOLUME
-      // Strong-continuation override (mirror of useMonitor): a proven runner near
-      // its high on a strong RVOL surge clears the grade floor + gets a higher cap.
-      const offHighPct = technical.distanceFromDayHighPct ?? null
-      const strongContinuation = !BOUNCE_TYPES.has(setup.type) &&
-        offHighPct != null && offHighPct >= -STRONG_CONT_MAX_BELOW_HIGH_PCT &&
-        technical.relativeVolume != null && technical.relativeVolume >= strongContRvolThreshold(session)
-      const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type) && !strongContinuation
+      // (The strong-continuation override lived here 2026-08-06→07; reverted after
+      // a clean A/B showed it cut expectancy +0.76% → +0.41%/trade.)
+      const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
       const standDown = BOUNCE_TYPES.has(setup.type) &&
         failedBounces.some(fb => fb.symbol === symbol && nowTs - fb.at < STANDDOWN_MS)
       const symbolLogsThisSession = dayBuys.filter(b => b.symbol === symbol && nowTs - b.timestamp < SYMBOL_LOG_WINDOW_MS).length
-      const overLogged = symbolLogsThisSession >= (strongContinuation ? MAX_LOGS_PER_SYMBOL_RUNNER : MAX_LOGS_PER_SYMBOL)
-      const capped = overLogged || (!strongContinuation && symbolCapReached(symbol, nowTs, [...dayLogs.values()], dayBuys))
+      const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
+      const capped = overLogged || symbolCapReached(symbol, nowTs, [...dayLogs.values()], dayBuys)
 
       // Late-session cutoff: regular-hours BUYs stop at 14:00 ET (premarket exempt).
       if (session === 'regular' && etHHMM(nowTs) >= LATE_LOG_CUTOFF_HHMM) { drops.session++; continue }

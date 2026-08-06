@@ -33,25 +33,6 @@ export const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])
 // surge may be scaled past the normal cap + grade floor, up to a higher-but-finite
 // ceiling (RITR/PAVS were floored/capped despite being the target profile).
 export const MAX_LOGS_PER_SYMBOL = 2
-export const MAX_LOGS_PER_SYMBOL_RUNNER = 4
-export const STRONG_CONT_MAX_BELOW_HIGH_PCT = 3   // within 3% of the session high
-// RVOL is measured on DIFFERENT SCALES either side of the open, so one threshold
-// cannot serve both (2026-08-06 audit):
-//   • premarket RVOL = today's premarket volume ÷ this name's own median premarket
-//     volume at the same time of day → reads 100–900× on a real gapper.
-//   • regular-hours RVOL = day volume ÷ (avg daily volume × session fraction
-//     elapsed) → a genuine RTH surge reads 4–26×.
-// A flat 10× therefore fired reliably premarket and ALMOST NEVER during regular
-// hours, so the strong-continuation override effectively didn't exist in RTH —
-// grade-floor blocks were 48% of that day's misses (CELZ 10:55 ORB at 0.0% off
-// high on 5× RVOL was floored at a perfect location). Threshold per session.
-export const STRONG_CONT_MIN_RVOL_PREMARKET = 10
-export const STRONG_CONT_MIN_RVOL_RTH = 3
-
-/** The "this is a real surge" RVOL bar for the given session (see above). */
-export function strongContRvolThreshold(session: string): number {
-  return session === 'premarket' ? STRONG_CONT_MIN_RVOL_PREMARKET : STRONG_CONT_MIN_RVOL_RTH
-}
 export const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session
 
 // Entry-cluster dedup.
@@ -125,20 +106,20 @@ export function classifyBuy(setup: DetectedSetup, r: MonitorResult, ctx: Classif
   const { now, priorBuys, priorLogs, priorStates } = ctx
   const fill = setup.entryFill ?? setup.zoneUpper
 
-  // A proven runner near its high on a strong RVOL surge may be scaled past the
-  // normal throttles (grade floor + cap + win/loss stand-down). Narrow by design.
-  const offHighPct = r.technicals?.distanceFromDayHighPct ?? null   // negative = below the high
-  const strongContinuation = !BOUNCE_TYPES.has(setup.type) &&
-    offHighPct != null && offHighPct >= -STRONG_CONT_MAX_BELOW_HIGH_PCT &&
-    r.relativeVolume != null && r.relativeVolume >= strongContRvolThreshold(r.integrity.session)
-
+  // NOTE: a "strong continuation" override (near-high + high-RVOL clears the grade
+  // floor and the per-symbol cap) was shipped 2026-08-06 on the strength of the
+  // RITR/PAVS misses, then REVERTED 2026-08-07 after a clean A/B on the same
+  // 148-symbol pool: it added 38 signals but cut expectancy from +0.76% to
+  // +0.41%/trade (net +98% → +70% over 20 days). Those two trades were real
+  // winners, but the class they belong to loses more than it makes. Do not
+  // reintroduce without a backtest showing otherwise.
   const standDown = BOUNCE_TYPES.has(setup.type) && recentlyFailedBounce(setup.symbol, now, priorStates)
   const symbolLogsThisSession = priorBuys.filter(
     b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS,
   ).length
-  const overLogged = symbolLogsThisSession >= (strongContinuation ? MAX_LOGS_PER_SYMBOL_RUNNER : MAX_LOGS_PER_SYMBOL)
-  const capped = overLogged || (!strongContinuation && symbolCapReached(setup.symbol, now, priorLogs, priorBuys))
-  const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type) && !strongContinuation
+  const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
+  const capped = overLogged || symbolCapReached(setup.symbol, now, priorLogs, priorBuys)
+  const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
   const dup = isDuplicateBuy(setup.symbol, fill, now, priorBuys)
 
   // After-close gate + late-session cutoff: premarket always tradeable; regular

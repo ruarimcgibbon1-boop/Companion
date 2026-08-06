@@ -42,10 +42,14 @@ describe('classifyBuy', () => {
     expect(classifyBuy(s, r, ctx()).verdict).toBe('veto')
   })
 
-  it('strong continuation (near high + high RVOL) clears the grade floor', () => {
+  // The grade floor holds even for a near-high, huge-RVOL breakout. A
+  // "strong continuation" override that exempted exactly this case was shipped
+  // 2026-08-06 and reverted 2026-08-07: a clean A/B showed it added 38 signals
+  // but cut expectancy from +0.76% to +0.41%/trade. Locking the behaviour in.
+  it('does NOT exempt a below-grade near-high high-RVOL breakout (reverted override)', () => {
     const s = mkSetup({ grade: 'below', type: 'break_of_structure' })
     const r = mkResult({ relativeVolume: 40, technicals: { distanceFromDayHighPct: -0.5 } as MonitorResult['technicals'] })
-    expect(classifyBuy(s, r, ctx()).verdict).toBe('logged')
+    expect(classifyBuy(s, r, ctx()).verdict).toBe('veto')
   })
 
   it('drops a premarket signal below the volume floor with no surge', () => {
@@ -62,12 +66,13 @@ describe('classifyBuy', () => {
     expect(classifyBuy(mkSetup(), r, ctx([], RTH)).verdict).toBe('logged')
   })
 
-  it('caps a normal name at 2 logs, but lets a strong runner scale past it', () => {
+  it('caps a name at 2 logs per session — including a strong runner', () => {
     const prior = [buyRec('AAA', 8.0, PM - 2000), buyRec('AAA', 8.4, PM - 1000)]  // 2 prior, >3% apart
     const s3 = mkSetup({ entryFill: 9.5, zoneUpper: 9.5, id: 'AAA:premarket_breakout:9.50' })
     expect(classifyBuy(s3, mkResult({ price: 9.5 }), ctx(prior)).verdict).toBe('capped')
+    // Near-high + 40× RVOL no longer buys a higher ceiling (see reverted override).
     const rStrong = mkResult({ price: 9.5, relativeVolume: 40, technicals: { distanceFromDayHighPct: -0.5 } as MonitorResult['technicals'] })
-    expect(classifyBuy(s3, rStrong, ctx(prior)).verdict).toBe('logged')
+    expect(classifyBuy(s3, rStrong, ctx(prior)).verdict).toBe('capped')
   })
 
   it('dedups a near-identical re-fire on the same name', () => {
