@@ -29,6 +29,7 @@ export function formatBuySignal(b: BuySignalRecord): string {
     `🚨 <b>BUY ${b.symbol}</b> — ${b.setupType.replace(/_/g, ' ')} triggered`,
     `Enter ~${px(b.entryHigh)} · Stop ${px(b.stop)} · Sell into ${targets}`,
     `R/R ${rr} · Score ${b.score} (${b.grade})${rvol} · Price ${px(b.priceAtSignal)}`,
+    `Plan: trim at T1 → move stop to breakeven → trail the rest`,
   ]
   return lines.join('\n')
 }

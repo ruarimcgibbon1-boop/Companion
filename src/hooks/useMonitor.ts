@@ -55,6 +55,17 @@ const PREMARKET_SURGE_RVOL = 10
 //   spam, not disciplined scale-ins. Kept at 2; manual scaling is the trader's call.
 const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['opening_drive'])
 const MAX_LOGS_PER_SYMBOL = 2
+// A PROVEN RUNNER — near its high on a strong RVOL surge — may be scaled PAST the
+// normal 2-log cap and the grade floor, up to this higher (still finite) ceiling.
+// Narrow by design (near-high AND high-RVOL) so it only rescues genuine
+// continuations, not the repeat spam a flat cap-raise re-admits (2→3 diluted the
+// book when tested bluntly, 2026-08-05). Motivated by RITR (8/05) + PAVS (8/06):
+// near-high 45–200× breakouts floored/capped despite being the exact target
+// profile. RVOL-as-primary-signal applied to the throttles. (Dedup + the Telegram
+// route's stable-key dedup still stop same-setup spam, so this can't runaway.)
+const MAX_LOGS_PER_SYMBOL_RUNNER = 4
+const STRONG_CONT_MAX_BELOW_HIGH_PCT = 3   // within 3% of the session high = still AT the high
+const STRONG_CONT_MIN_RVOL = 10            // trading ≥10× its average = a real surge
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session (premarket→close ≈ 12h)
 // Late-session cutoff (20-day FMP replay, 2026-08-05): regular-hours entries after
 // 14:00 ET lost (−0.69%/trade over 17 signals) while the 10:00–14:00 window carried
@@ -401,14 +412,25 @@ export function useMonitor() {
           const allBuys = [...s.buySignals, ...newBuySignals]
           const standDown = BOUNCE_TYPES.has(setup.type) &&
             recentlyFailedBounce(setup.symbol, now, allStates)
-          // Lever 3: cap logged ideas per name this session (2 distinct, not 8 repeats).
+          // A proven runner near its high on a strong RVOL surge is allowed to be
+          // SCALED past the normal throttles: it clears the grade floor, gets the
+          // higher per-symbol ceiling, and skips the win/loss stand-down. Kept
+          // narrow (near-high AND high-RVOL, momentum types only) so it rescues real
+          // continuations (RITR/PAVS) without re-admitting repeat spam.
+          const offHighPct = r.technicals?.distanceFromDayHighPct ?? null   // negative = below the high
+          const strongContinuation = !BOUNCE_TYPES.has(setup.type) &&
+            offHighPct != null && offHighPct >= -STRONG_CONT_MAX_BELOW_HIGH_PCT &&
+            r.relativeVolume != null && r.relativeVolume >= STRONG_CONT_MIN_RVOL
+          // Lever 3: cap logged ideas per name this session (2 distinct, not 8 repeats;
+          // a strong runner gets a higher-but-finite ceiling so it can be scaled).
           const symbolLogsThisSession = allBuys.filter(
             b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS
           ).length
-          const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
-          const capped = symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys) || overLogged
-          // Lever 2: quality floor — drop below-grade signals (exempt the early-momentum winners).
-          const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
+          const overLogged = symbolLogsThisSession >= (strongContinuation ? MAX_LOGS_PER_SYMBOL_RUNNER : MAX_LOGS_PER_SYMBOL)
+          const capped = overLogged || (!strongContinuation && symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys))
+          // Lever 2: quality floor — drop below-grade signals (exempt the early-momentum
+          // winners, and a strong near-high runner whose grade lags its RVOL).
+          const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type) && !strongContinuation
           // The fill you'd actually get entering on the trigger — not the (often
           // unreachable) zone bottom. Computed BEFORE the dedup because the dedup
           // must compare like for like: it previously passed `zoneUpper` while the
