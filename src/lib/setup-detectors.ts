@@ -226,11 +226,25 @@ const RUNNER_MAX_OFF_HIGH_PCT = 8
 // 10-bar low while sitting right on its trigger, and passed cleanly. This gate
 // closes that hole: it measures maturity of the move, not distance past the level.
 //
-// The threshold is NOT fitted here — 18 trades is far too few, and a tight cap
-// would have blocked STKH's 09:31 breakout (already +12.5% off its 09:30 low,
-// then ran to +90%). It is swept on the 20-day replay instead:
-//   MAX_LEG_RUNUP_PCT=20 npx tsx scripts/backtest.ts
-// Infinity disables the gate, which is the pre-2026-08-11 behaviour.
+// SWEPT AND REJECTED (2026-08-11). Left in, OFF, so the negative result is not
+// re-discovered. On the 20-day replay, versus a 151-signal / +0.55%-per-trade /
+// +83.5%-net baseline:
+//   cap 40%: 147 signals, +0.60%/trade, net +88.8%  <- looks better, ISN'T
+//   cap 25%: 140 signals, +0.60%/trade, net +84.1%  <- same illusion
+//   cap 20%: 135 signals, +0.39%/trade, net +52.2%  <- the truth once it binds
+// The first two only looked neutral because a veto RESHUFFLES the book rather
+// than subsetting it: a setup that never reaches `triggered` leaves per-symbol
+// cap slots and dedup windows unspent, which backfills different later signals.
+// Diffing the signal lists, cap-40 DROPPED 7 signals worth +23.9% (avg +3.42%)
+// and gained 3 that the baseline never fired, worth +29.2%. The apparent edge was
+// three lottery tickets. Lesson for any future gate: never read a summary line as
+// "baseline minus the bad trades" — diff the signal lists.
+//
+// The threshold was deliberately not fitted to the 18 live trades: a tight cap
+// would have blocked STKH's 09:31 breakout, already +12.5% off its 09:30 low and
+// then good for +90%.
+//   MAX_LEG_RUNUP_PCT=20 npx tsx scripts/backtest.ts   # to re-run the experiment
+// Infinity disables the gate, which is the shipped behaviour.
 // ── Thesis cut: quarantined triggers (2026-08-11) ────────────────────────────
 //
 // These detectors still RUN and stay visible as watch items — they just cannot
