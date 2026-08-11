@@ -1,0 +1,552 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+
+import { sizePosition, entryLimitPrice, exitLimitPrice } from '@/lib/execution/sizing'
+import { canOpenPosition, realizedPnlToday, openRisk } from '@/lib/execution/risk'
+import { decideExit, slippagePct, PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
+import { newPaperTrade, computeRealized } from '@/lib/execution/types'
+import type {
+  Broker, BrokerOrder, PaperTrade, LimitOrderRequest, StopOrderRequest,
+} from '@/lib/execution/types'
+import { mapStatus, roundToTick, AlpacaBroker } from '@/lib/execution/alpaca'
+import type { BuySignalRecord } from '@/types'
+
+// The store writes to $HOME; keep tests off the real filesystem.
+vi.mock('@/lib/execution/store', () => ({
+  loadTrades: () => [],
+  saveTrades: () => {},
+  appendEvent: () => {},
+  isHalted: () => false,
+  haltFile: () => '/tmp/.companion-halt',
+  etDayKey: () => '2026-08-07',
+  tradesFile: () => '/tmp/trades.json',
+  eventsFile: () => '/tmp/events.jsonl',
+}))
+
+// 10:00 ET on Friday 2026-08-07 — regular hours, so protective stops are in play.
+const REGULAR_HOURS = new Date('2026-08-07T14:00:00Z').getTime()
+
+function signal(overrides: Partial<BuySignalRecord> = {}): BuySignalRecord {
+  return {
+    id: 'sig-1', setupId: 'setup-1', symbol: 'TEST', timestamp: REGULAR_HOURS,
+    setupType: 'premarket_breakout', triggerPrice: 10, entryLow: 9.9, entryHigh: 10,
+    invalidation: 9.5, stop: 9.5, targets: [11, 12], score: 70, grade: 'strong',
+    rewardRisk: 2, priceAtSignal: 10, ...overrides,
+  } as BuySignalRecord
+}
+
+function trade(overrides: Partial<PaperTrade> = {}): PaperTrade {
+  return { ...newPaperTrade(signal(), 100, 10.05, REGULAR_HOURS), ...overrides }
+}
+
+// ── Sizing ───────────────────────────────────────────────────────────────────
+
+describe('sizePosition', () => {
+  const base = { equity: 100_000, buyingPower: 200_000, entry: 10, stop: 9.5 }
+
+  it('sizes off the risk budget and the stop distance', () => {
+    // 0.5% of 100k = $500 risk; $0.50 stop distance → 1000 shares.
+    const r = sizePosition(base)
+    expect(r.qty).toBe(1000)
+    expect(r.plannedRisk).toBeCloseTo(500)
+    expect(r.boundBy).toBe('risk')
+  })
+
+  it('caps notional so a tight stop cannot imply an absurd position', () => {
+    // A 1c stop would ask for 50,000 shares; 20% of equity at $10 allows 2,000.
+    const r = sizePosition({ ...base, stop: 9.99 })
+    expect(r.qty).toBe(2000)
+    expect(r.boundBy).toBe('notional')
+  })
+
+  it('caps participation against session volume', () => {
+    const r = sizePosition({ ...base, sessionVolume: 50_000 })
+    expect(r.qty).toBe(500)          // 1% of 50k
+    expect(r.boundBy).toBe('participation')
+  })
+
+  it('respects buying power', () => {
+    const r = sizePosition({ ...base, buyingPower: 3_000 })
+    expect(r.qty).toBe(300)
+    expect(r.boundBy).toBe('buying_power')
+  })
+
+  it('refuses a stop that is not below the entry', () => {
+    expect(sizePosition({ ...base, stop: 10.5 }).qty).toBe(0)
+    expect(sizePosition({ ...base, stop: 10 }).reason).toMatch(/not below/)
+  })
+
+  it('refuses an absurdly wide stop rather than sizing down to noise', () => {
+    const r = sizePosition({ ...base, stop: 8 })   // 20% away, limit is 15%
+    expect(r.qty).toBe(0)
+    expect(r.reason).toMatch(/exceeds max/)
+  })
+
+  it('refuses when the risk budget cannot buy a single share', () => {
+    const r = sizePosition({ equity: 1_000, buyingPower: 1_000, entry: 100, stop: 90 })
+    expect(r.qty).toBe(0)
+  })
+})
+
+describe('limit prices', () => {
+  it('caps what an entry will pay above the signal level', () => {
+    expect(entryLimitPrice(10, 0.5)).toBeCloseTo(10.05)
+  })
+  it('caps what an exit will give up below the trigger', () => {
+    expect(exitLimitPrice(10, 0.5)).toBeCloseTo(9.95)
+  })
+})
+
+// ── Risk governor ────────────────────────────────────────────────────────────
+
+describe('canOpenPosition', () => {
+  const state = {
+    equity: 100_000, startingEquity: 100_000, brokerBlocked: false,
+    openTrades: [] as PaperTrade[], closedToday: [] as PaperTrade[], halted: false,
+  }
+
+  it('allows a first position inside every limit', () => {
+    expect(canOpenPosition('TEST', 500, state).allowed).toBe(true)
+  })
+
+  it('treats the kill switch as terminal', () => {
+    const d = canOpenPosition('TEST', 500, { ...state, halted: true })
+    expect(d).toMatchObject({ allowed: false, terminal: true })
+  })
+
+  it('treats the daily loss limit as terminal', () => {
+    const closed = [trade({ state: 'closed', realizedPnl: -2_100 })]
+    const d = canOpenPosition('TEST', 500, { ...state, closedToday: closed })
+    expect(d).toMatchObject({ allowed: false, terminal: true })
+    if (!d.allowed) expect(d.reason).toMatch(/daily loss limit/)
+  })
+
+  it('blocks the concurrency limit without ending the day', () => {
+    const open = [trade({ symbol: 'A' }), trade({ symbol: 'B' }), trade({ symbol: 'C' })]
+    const d = canOpenPosition('TEST', 500, { ...state, openTrades: open })
+    expect(d).toMatchObject({ allowed: false, terminal: false })
+  })
+
+  it('refuses to pyramid into a symbol already held', () => {
+    const d = canOpenPosition('TEST', 500, { ...state, openTrades: [trade({ symbol: 'TEST' })] })
+    expect(d).toMatchObject({ allowed: false, terminal: false })
+    if (!d.allowed) expect(d.reason).toMatch(/already holding/)
+  })
+
+  it('caps total open risk across positions', () => {
+    const open = [trade({ symbol: 'A', plannedRisk: 1_400 })]
+    // 1400 + 500 = 1900 > 1.5% of 100k
+    const d = canOpenPosition('TEST', 500, { ...state, openTrades: open })
+    expect(d.allowed).toBe(false)
+  })
+
+  it('sums realized P&L and open risk', () => {
+    expect(realizedPnlToday([trade({ realizedPnl: 100 }), trade({ realizedPnl: -40 })])).toBe(60)
+    expect(openRisk([trade({ plannedRisk: 200 }), trade({ plannedRisk: 300 })])).toBe(500)
+  })
+})
+
+// ── Exit ladder ──────────────────────────────────────────────────────────────
+
+describe('decideExit', () => {
+  const open = () => trade({ state: 'open', openQty: 100, entryFillQty: 100, entryFillPrice: 10 })
+
+  it('does nothing between the stop and the first target', () => {
+    expect(decideExit(open(), 10.5, 600, 955)).toBeNull()
+  })
+
+  it('books half at T1', () => {
+    expect(decideExit(open(), 11.0, 600, 955)).toEqual({ reason: 't1', qty: 50, intendedPrice: 11 })
+  })
+
+  it('exits everything on the stop', () => {
+    expect(decideExit(open(), 9.4, 600, 955)).toEqual({ reason: 'stop', qty: 100, intendedPrice: 9.5 })
+  })
+
+  it('checks the stop before any target', () => {
+    // A polled scalar price can only sit on one side of a sane ladder, so this
+    // ordering bites only when the stop has been dragged above a target. It still
+    // has to match eod-resolver's adverse-first rule, where a single BAR really
+    // can span both and crediting the target would invent a win.
+    const t = trade({ state: 'open', openQty: 100, entryFillQty: 100, currentStop: 11.5 })
+    expect(decideExit(t, 11.4, 600, 955)?.reason).toBe('stop')
+  })
+
+  it('holds the remainder for T2 once T1 has booked', () => {
+    const t = trade({ state: 'open', openQty: 50, entryFillQty: 100, t1Done: true, currentStop: 10 })
+    expect(decideExit(t, 11.5, 600, 955)).toBeNull()
+    expect(decideExit(t, 12.0, 600, 955)).toEqual({ reason: 't2', qty: 50, intendedPrice: 12 })
+  })
+
+  it('flattens at the end-of-day cutoff', () => {
+    const d = decideExit(open(), 10.5, 955, 955)
+    expect(d?.reason).toBe('time')
+    expect(d?.qty).toBe(100)
+  })
+
+  it('exits a one-share position whole at T1 rather than skipping the leg', () => {
+    const t = trade({ state: 'open', openQty: 1, entryFillQty: 1 })
+    expect(decideExit(t, 11, 600, 955)).toMatchObject({ reason: 't1', qty: 1 })
+  })
+
+  it('ignores trades that are not open', () => {
+    expect(decideExit(trade({ state: 'pending_entry' }), 9, 600, 955)).toBeNull()
+  })
+})
+
+describe('slippagePct', () => {
+  it('is positive when a buy pays up', () => {
+    expect(slippagePct(10, 10.05)).toBeCloseTo(0.5)
+  })
+  it('is negative when a sell gives up', () => {
+    expect(slippagePct(10, 9.95)).toBeCloseTo(-0.5)
+  })
+})
+
+// ── Alpaca adapter ───────────────────────────────────────────────────────────
+
+describe('AlpacaBroker', () => {
+  it('collapses the status vocabulary to actionable outcomes', () => {
+    expect(mapStatus('pending_new')).toBe('open')
+    expect(mapStatus('filled')).toBe('filled')
+    expect(mapStatus('done_for_day')).toBe('expired')
+    expect(mapStatus('rejected')).toBe('rejected')
+    expect(mapStatus('something_new_alpaca_added')).toBe('unknown')
+  })
+
+  it('rounds to a tick the exchange will accept', () => {
+    expect(roundToTick(10.123456)).toBe(10.12)
+    expect(roundToTick(0.123456)).toBe(0.1235)
+  })
+
+  it('refuses to point at the live trading endpoint', () => {
+    expect(() => new AlpacaBroker({
+      keyId: 'k', secretKey: 's', baseUrl: 'https://api.alpaca.markets',
+    })).toThrow(/paper only/)
+  })
+
+  it('accepts the paper endpoint', () => {
+    expect(() => new AlpacaBroker({
+      keyId: 'k', secretKey: 's', baseUrl: 'https://paper-api.alpaca.markets',
+    })).not.toThrow()
+  })
+})
+
+// ── Executor lifecycle ───────────────────────────────────────────────────────
+
+/** In-memory broker: fills whatever is asked, at the limit price, on the next poll. */
+class FakeBroker implements Broker {
+  readonly name = 'fake'
+  equity = 100_000
+  tradable = true
+  orders = new Map<string, BrokerOrder>()
+  submitted: Array<LimitOrderRequest | StopOrderRequest> = []
+  canceled: string[] = []
+  /** Orders whose id is in here stay open instead of filling. */
+  neverFill = new Set<string>()
+  /** Same, by predicate — for orders the executor submits without telling the test their id. */
+  holdOrder: (o: BrokerOrder) => boolean = () => false
+  /** symbol → shares held, moved by fills. */
+  held = new Map<string, number>()
+  rejected: Array<{ qty: number; available: number }> = []
+  private seq = 0
+
+  async getAccount() {
+    return { equity: this.equity, cash: this.equity, buyingPower: this.equity * 2, daytradeCount: 0, blocked: false }
+  }
+  async getAsset(symbol: string) {
+    return this.tradable
+      ? { symbol, tradable: true, fractionable: false, shortable: true, exchange: 'NASDAQ' }
+      : null
+  }
+  async getPositions() {
+    return [...this.held.entries()].filter(([, q]) => q > 0).map(([symbol, qty]) => ({
+      symbol, qty, qtyAvailable: this.availableQty(symbol),
+      avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0,
+    }))
+  }
+
+  /**
+   * Shares a resting sell order has reserved. This is the real Alpaca
+   * constraint the executor has to size against — modelling it is the only way
+   * this suite can catch an oversized stop.
+   */
+  private availableQty(symbol: string): number {
+    let held = 0
+    for (const o of this.orders.values()) {
+      if (o.symbol === symbol && o.side === 'sell' && o.status === 'open') held += o.qty
+    }
+    return (this.held.get(symbol) ?? 0) - held
+  }
+
+  /** Mirrors Alpaca's 40310000 reject for a sell bigger than the free share count. */
+  private rejectSell(
+    symbol: string, qty: number, clientOrderId: string, limitPrice: number | null,
+  ): BrokerOrder | null {
+    const available = this.availableQty(symbol)
+    if (qty <= available) return null
+    this.rejected.push({ qty, available })
+    return {
+      id: '', clientOrderId, symbol, side: 'sell', status: 'rejected',
+      qty, filledQty: 0, filledAvgPrice: limitPrice, limitPrice,
+      submittedAt: Date.now(),
+      rejectReason: `{"available":"${available}","code":40310000,"message":"insufficient qty available for order (requested: ${qty}, available: ${available})","symbol":"${symbol}"}`,
+    }
+  }
+
+  async submitLimit(req: LimitOrderRequest): Promise<BrokerOrder> {
+    this.submitted.push(req)
+    if (req.side === 'sell') {
+      const reject = this.rejectSell(req.symbol, req.qty, req.clientOrderId, req.limitPrice)
+      if (reject) return reject
+    }
+    const id = `o${++this.seq}`
+    const order: BrokerOrder = {
+      id, clientOrderId: req.clientOrderId, symbol: req.symbol, side: req.side,
+      status: 'open', qty: req.qty, filledQty: 0, filledAvgPrice: null,
+      limitPrice: req.limitPrice, submittedAt: Date.now(), rejectReason: null,
+    }
+    this.orders.set(id, order)
+    return order
+  }
+
+  async submitStop(req: StopOrderRequest): Promise<BrokerOrder> {
+    this.submitted.push(req)
+    const reject = this.rejectSell(req.symbol, req.qty, req.clientOrderId, null)
+    if (reject) return reject
+    const id = `o${++this.seq}`
+    const order: BrokerOrder = {
+      id, clientOrderId: req.clientOrderId, symbol: req.symbol, side: 'sell',
+      status: 'open', qty: req.qty, filledQty: 0, filledAvgPrice: null,
+      limitPrice: null, submittedAt: Date.now(), rejectReason: null,
+    }
+    this.orders.set(id, order)
+    this.neverFill.add(id)   // a resting stop only fills if the test says so
+    return order
+  }
+
+  async getOrder(id: string): Promise<BrokerOrder | null> {
+    const o = this.orders.get(id)
+    if (!o) return null
+    if (o.status === 'open' && !this.neverFill.has(id) && !this.holdOrder(o)) {
+      o.status = 'filled'
+      o.filledQty = o.qty
+      o.filledAvgPrice = o.limitPrice
+      const before = this.held.get(o.symbol) ?? 0
+      this.held.set(o.symbol, before + (o.side === 'buy' ? o.filledQty : -o.filledQty))
+    }
+    return o
+  }
+
+  async cancelOrder(id: string) {
+    this.canceled.push(id)
+    const o = this.orders.get(id)
+    if (o && o.status === 'open') o.status = 'canceled'
+  }
+
+  async cancelOpenOrders(symbol: string) {
+    let n = 0
+    for (const o of this.orders.values()) {
+      if (o.symbol === symbol && o.status === 'open') { await this.cancelOrder(o.id); n++ }
+    }
+    return n
+  }
+}
+
+describe('PaperExecutor', () => {
+  let broker: FakeBroker
+  let price: number
+
+  const build = () => new PaperExecutor(
+    broker,
+    async (symbols: string[]) => new Map(symbols.map(s => [s, price])),
+    { ...DEFAULT_EXECUTOR },
+    () => {},
+  )
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(REGULAR_HOURS)
+    broker = new FakeBroker()
+    price = 10
+  })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('runs a signal through the full scale-out ladder', async () => {
+    const ex = build()
+    await ex.init()
+
+    const res = await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+    expect(res.taken).toBe(true)
+
+    const t = () => ex.allTrades()[0]
+    expect(t().state).toBe('pending_entry')
+    expect(t().qty).toBe(1000)                       // $500 risk / $0.50 stop
+
+    // Entry fills at the limit — 0.5% worse than the signal's assumed 10.00.
+    await ex.tick()
+    expect(t().state).toBe('open')
+    expect(t().entryFillPrice).toBeCloseTo(10.05)
+    expect(t().entrySlippagePct).toBeCloseTo(0.5)
+    expect(t().openQty).toBe(1000)
+
+    // T1: half out, stop to breakeven.
+    price = 11.2
+    await ex.tick()
+    expect(t().t1Done).toBe(true)
+    expect(t().openQty).toBe(500)
+    expect(t().currentStop).toBeCloseTo(10.05)
+
+    // T2: the remainder.
+    price = 12.3
+    await ex.tick()
+    expect(t().state).toBe('closed')
+    expect(t().openQty).toBe(0)
+    expect(t().exits.map(l => l.reason)).toEqual(['t1', 't2'])
+    expect(t().realizedPnl).toBeGreaterThan(0)
+    expect(t().fullyClosed).toBe(true)
+  })
+
+  it('places a protective stop while a position is open in regular hours', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()          // fills the entry
+    await ex.tick()          // nothing triggers → protective stop goes on
+    const stops = broker.submitted.filter(o => 'stopPrice' in o)
+    expect(stops).toHaveLength(1)
+    expect((stops[0] as StopOrderRequest).stopPrice).toBeCloseTo(9.5)
+    expect(ex.allTrades()[0].protectiveStopOrderId).toBeTruthy()
+  })
+
+  // Regression: 2026-08-07 paper session. Price tagged T1, the limit rested
+  // unfilled, price fell back — and the stop was then sized to the whole
+  // position, half of which the broker had already reserved. Alpaca rejected
+  // every attempt, so the position ran naked until the daemon's own poll caught it.
+  it('sizes the protective stop to shares a resting exit has not reserved', async () => {
+    broker.holdOrder = o => o.clientOrderId?.includes(':x:t1') ?? false
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()                       // entry fills: 1000 shares
+    await ex.tick()                       // protective stop on the full 1000
+
+    price = 11.2                          // tags T1 — limit for 500 goes out, rests
+    await ex.tick()
+    const t = ex.allTrades()[0]
+    expect(t.openQty).toBe(1000)          // nothing sold yet
+    expect(t.exits.filter(l => l.reason === 't1' && l.orderId)).toHaveLength(1)
+
+    price = 10.5                          // falls back between stop and T1
+    await ex.tick()
+
+    const stops = broker.submitted.filter(o => 'stopPrice' in o) as StopOrderRequest[]
+    expect(stops[stops.length - 1].qty).toBe(500)   // the unreserved half, not 1000
+    expect(broker.rejected).toEqual([])
+    expect(ex.allTrades()[0].protectiveStopOrderId).toBeTruthy()
+  })
+
+  it('does not place a stop when every open share is already working an exit', async () => {
+    broker.holdOrder = o => o.clientOrderId?.includes(':x:') ?? false
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()
+    price = 9.2                           // stop breaks — full-size exit rests unfilled
+    await ex.tick()
+    const before = broker.submitted.filter(o => 'stopPrice' in o).length
+
+    price = 9.6                           // back above the stop, exit still resting
+    await ex.tick()
+
+    expect(broker.submitted.filter(o => 'stopPrice' in o)).toHaveLength(before)
+    expect(broker.rejected).toEqual([])
+  })
+
+  it('cancels resting orders before selling, so it cannot double-sell', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()
+    await ex.tick()                       // protective stop resting
+    const stopId = ex.allTrades()[0].protectiveStopOrderId
+    price = 9.2                           // stop breaks
+    await ex.tick()
+    expect(broker.canceled).toContain(stopId)
+    expect(ex.allTrades()[0].state).toBe('closed')
+    expect(ex.allTrades()[0].exits[0].reason).toBe('stop')
+  })
+
+  it('abandons an entry that never fills instead of chasing', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    const orderId = ex.allTrades()[0].entryOrderId!
+    broker.neverFill.add(orderId)
+
+    await ex.tick()
+    expect(ex.allTrades()[0].state).toBe('pending_entry')
+
+    vi.setSystemTime(REGULAR_HOURS + DEFAULT_EXECUTOR.entryTimeoutMs + 1_000)
+    await ex.tick()
+    expect(ex.allTrades()[0].state).toBe('aborted')
+    expect(broker.canceled).toContain(orderId)
+  })
+
+  it('will not trade the same setup twice', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    const second = await ex.onSignal(signal({ id: 'sig-2' }))
+    expect(second.taken).toBe(false)
+    expect(second.reason).toMatch(/already traded/)
+    expect(ex.allTrades()).toHaveLength(1)
+  })
+
+  it('skips symbols the broker will not trade', async () => {
+    broker.tradable = false
+    const ex = build()
+    await ex.init()
+    const res = await ex.onSignal(signal())
+    expect(res.taken).toBe(false)
+    expect(res.reason).toMatch(/not tradable/)
+  })
+
+  it('flattens open positions on shutdown', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()
+    expect(ex.allTrades()[0].openQty).toBe(1000)
+
+    await ex.flattenAll('risk_halt')
+    expect(ex.allTrades()[0].state).toBe('closed')
+    expect(ex.allTrades()[0].exits[0].reason).toBe('risk_halt')
+  })
+
+  it('reports slippage in the session summary', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()
+    expect(ex.summary()).toMatch(/mean entry slip \+0\.50%/)
+  })
+})
+
+describe('computeRealized', () => {
+  it('books P&L against the actual entry fill, not the intended one', () => {
+    const t = trade({
+      entryFillPrice: 10.05, entryFillQty: 100,
+      exits: [
+        { qty: 50, reason: 't1', intendedPrice: 11, orderId: 'a', fillPrice: 11, filledAt: 1, slippagePct: 0 },
+        { qty: 50, reason: 't2', intendedPrice: 12, orderId: 'b', fillPrice: 12, filledAt: 2, slippagePct: 0 },
+      ],
+    })
+    const r = computeRealized(t)!
+    expect(r.pnl).toBeCloseTo(50 * 0.95 + 50 * 1.95)
+    expect(r.pnlPct).toBeCloseTo((r.pnl / (10.05 * 100)) * 100)
+  })
+
+  it('is null before anything fills', () => {
+    expect(computeRealized(trade())).toBeNull()
+  })
+})

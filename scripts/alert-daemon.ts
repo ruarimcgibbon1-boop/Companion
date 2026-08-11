@@ -1,5 +1,6 @@
 /**
- * Headless alert daemon — fires Telegram buy alerts WITHOUT a browser open.
+ * Headless alert daemon — fires Telegram buy alerts WITHOUT a browser open, and
+ * optionally paper-trades them.
  *
  * The scanner sweep normally runs client-side (useMonitor), so alerts only fire
  * while Companion is open in a tab. This daemon runs that sweep as a standalone
@@ -8,8 +9,14 @@
  * client uses), then posts each new BUY to /api/telegram. The route dedups on the
  * stable setup id, so the daemon and any open browser tab never double-text.
  *
+ * With PAPER_TRADE=1 the same BUYs are also routed to the Alpaca paper executor
+ * (src/lib/execution/), which sizes them, places real paper orders, and manages
+ * the position on the resolver's scale-out ladder. Alerts still fire either way —
+ * paper trading is additive, never a replacement.
+ *
  * Prereqs: the Next dev server running (`npm run dev`) + Telegram configured in
  * .env.local. Run:  npx tsx scripts/alert-daemon.ts
+ *                   PAPER_TRADE=1 npx tsx scripts/alert-daemon.ts
  */
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'fs'
 import { join } from 'path'
@@ -18,10 +25,17 @@ import { homedir } from 'os'
 import type { MonitorResult, BuySignalRecord, DetectedSetup } from '@/types'
 import { classifyBuy, passesTrackingFloor, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
 import { getSessionType } from '@/lib/market-hours'
+import { loadEnvLocal } from '@/lib/execution/env'
+import { AlpacaBroker } from '@/lib/execution/alpaca'
+import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
+import { isHalted, haltFile } from '@/lib/execution/store'
+
+loadEnvLocal()   // ALPACA_* live here; the daemon has no Next runtime to load them
 
 const BASE = process.env.COMPANION_URL || 'http://localhost:3000'
 const DRY_RUN = process.env.DRY_RUN === '1'   // log alerts instead of sending them
 const ONCE = process.env.ONCE === '1'         // run a single sweep then exit (testing)
+const PAPER_TRADE = process.env.PAPER_TRADE === '1'
 const SWEEP_MS = 15_000                 // active-session cadence (matches the client)
 const IDLE_MS = 5 * 60_000              // slow poll when the market is closed
 const MIN_LEVEL_STRENGTH = 40           // store default notificationSettings.minLevelStrength
@@ -88,7 +102,28 @@ async function sendAlert(buy: BuySignalRecord): Promise<boolean> {
   } catch (e) { log('telegram post failed:', (e as Error).message); return false }
 }
 
-async function sweep(buys: BuySignalRecord[]): Promise<BuySignalRecord[]> {
+/**
+ * Prices for the executor's open positions, from the same /api/monitor pipeline
+ * the signals come out of. Deliberately NOT the broker's feed: exit decisions and
+ * backtest decisions have to be made on identical data or the comparison between
+ * them means nothing.
+ */
+async function fetchPrices(symbols: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>()
+  if (symbols.length === 0) return out
+  for (const r of await fetchResults(symbols)) {
+    if (typeof r.price === 'number' && r.price > 0) out.set(r.symbol, r.price)
+  }
+  return out
+}
+
+async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): Promise<BuySignalRecord[]> {
+  // Manage open positions first: an exit that's already due shouldn't wait behind
+  // a universe scan, and it frees a concurrency slot for anything new this sweep.
+  if (executor) {
+    try { await executor.tick() } catch (e) { log('executor tick failed:', (e as Error).message) }
+  }
+
   const universe = await fetchUniverse()
   if (universe.length === 0) return buys
   const results = await fetchResults(universe)
@@ -104,7 +139,7 @@ async function sweep(buys: BuySignalRecord[]): Promise<BuySignalRecord[]> {
       if (!passesTrackingFloor(setup, MIN_LEVEL_STRENGTH)) continue
       triggered++
       // Daemon tracks buys only (no full log/state machine) — the win/loss cap and
-      // bounce stand-down no-op on empty logs/states; overLogged + dedup + the
+      // bounce stand-down no-op on empty logs/states; dedup + the
       // strong-continuation override still apply, which is the alerting core.
       const { verdict, buy } = classifyBuy(setup, r, { now, priorBuys: state, priorLogs: [], priorStates: [] })
       // Audit trail: every trigger + verdict, so end-of-session "did we miss X?"
@@ -123,6 +158,20 @@ async function sweep(buys: BuySignalRecord[]): Promise<BuySignalRecord[]> {
         const tag = `${buy.symbol} ${buy.setupType} @ ${buy.entryHigh} (grade ${buy.grade}, rvol ${buy.ctxRelVol?.toFixed(0) ?? '—'}×)`
         if (DRY_RUN) { sent++; log(`[dry-run] would alert ${tag}`) }
         else if (await sendAlert(buy)) { sent++; log(`ALERT ${tag}`) }
+
+        if (executor) {
+          try {
+            // Session volume caps position size to something that could actually
+            // fill — see sizing.ts. Premarket reports its own volume separately.
+            const sessionVolume = r.integrity.session === 'premarket'
+              ? r.premarketVolume ?? null
+              : r.volume || null
+            const res = await executor.onSignal(buy, { sessionVolume })
+            if (!res.taken) log(`  paper: skipped ${buy.symbol} — ${res.reason}`)
+          } catch (e) {
+            log(`  paper: executor failed on ${buy.symbol}:`, (e as Error).message)
+          }
+        }
       }
     }
   }
@@ -135,9 +184,49 @@ async function sweep(buys: BuySignalRecord[]): Promise<BuySignalRecord[]> {
   return state
 }
 
+async function buildExecutor(): Promise<PaperExecutor | null> {
+  if (!PAPER_TRADE) return null
+  const executor = new PaperExecutor(
+    new AlpacaBroker(),
+    fetchPrices,
+    { ...DEFAULT_EXECUTOR, dryRun: DRY_RUN },
+    (...a: unknown[]) => log('paper:', ...a),
+  )
+  await executor.init()
+  if (isHalted()) log(`NOTE: kill switch is engaged (${haltFile()} exists or HALT=1) — no new entries`)
+  return executor
+}
+
 async function main() {
-  log(`alert-daemon starting → ${BASE}${DRY_RUN ? ' [DRY_RUN]' : ''}${ONCE ? ' [ONCE]' : ''}`)
+  log(`alert-daemon starting → ${BASE}${DRY_RUN ? ' [DRY_RUN]' : ''}${ONCE ? ' [ONCE]' : ''}${PAPER_TRADE ? ' [PAPER_TRADE]' : ''}`)
   log(`decisions → ${DECISION_LOG}`)
+
+  let executor: PaperExecutor | null = null
+  try {
+    executor = await buildExecutor()
+  } catch (e) {
+    // Missing/invalid Alpaca credentials must not silently degrade to alerts-only:
+    // you'd spend a session believing you were paper trading when you weren't.
+    log('FATAL: paper trading requested but the executor could not start:', (e as Error).message)
+    process.exit(1)
+  }
+
+  // Exiting with shares outstanding leaves paper positions unmanaged and pollutes
+  // the day's stats, so flatten on the way out rather than just dropping the loop.
+  let shuttingDown = false
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    log(`${signal} — shutting down`)
+    if (executor) {
+      await executor.flattenAll('risk_halt').catch(e => log('flatten failed:', (e as Error).message))
+      log('paper session summary:\n' + executor.summary())
+    }
+    process.exit(0)
+  }
+  process.on('SIGINT', () => { void shutdown('SIGINT') })
+  process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+
   let buys = loadBuys()
   while (true) {
     const session = getSessionType()
@@ -146,12 +235,15 @@ async function main() {
       await sleep(IDLE_MS); continue
     }
     try {
-      buys = await sweep(buys)
+      buys = await sweep(buys, executor)
       if (!DRY_RUN) saveBuys(buys)
     } catch (e) {
       log('sweep error (is the dev server up?):', (e as Error).message)
     }
-    if (ONCE) return
+    if (ONCE) {
+      if (executor) log('paper session summary:\n' + executor.summary())
+      return
+    }
     await sleep(SWEEP_MS)
   }
 }
