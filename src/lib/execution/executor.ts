@@ -421,7 +421,10 @@ export class PaperExecutor {
       const stopOrder = await this.broker.getOrder(trade.protectiveStopOrderId)
       if (stopOrder && stopOrder.filledQty > 0 && stopOrder.filledAvgPrice != null) {
         const leg: ExitLeg = {
+          // A broker-side stop fires without us observing a price, so there is no
+          // decision price — the gap/concession split doesn't apply to this path.
           qty: stopOrder.filledQty, reason: 'stop', intendedPrice: trade.currentStop,
+          decisionPrice: null,
           orderId: stopOrder.id, fillPrice: null, filledAt: null, slippagePct: null,
         }
         trade.exits.push(leg)
@@ -456,6 +459,10 @@ export class PaperExecutor {
     appendEvent({
       event: 'exit_filled', symbol: trade.symbol, tradeId: trade.id, reason: leg.reason,
       qty, fillPrice: price, intendedPrice: leg.intendedPrice, slippagePct: leg.slippagePct,
+      decisionPrice: leg.decisionPrice,
+      // The actionable split: gap is latency (poll faster), concession is the limit tolerance.
+      gapPct: leg.decisionPrice != null ? slippagePct(leg.intendedPrice, leg.decisionPrice) : null,
+      concessionPct: leg.decisionPrice != null ? slippagePct(leg.decisionPrice, price) : null,
       openQtyAfter: trade.openQty,
     })
     if (trade.openQty <= 0) this.closeTrade(trade)
@@ -499,6 +506,7 @@ export class PaperExecutor {
     const limit = exitLimitPrice(Math.min(price, decision.intendedPrice), this.config.exitSlipTolerancePct)
     const leg: ExitLeg = {
       qty: decision.qty, reason: decision.reason, intendedPrice: decision.intendedPrice,
+      decisionPrice: price,
       orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
     }
 
@@ -590,7 +598,7 @@ export class PaperExecutor {
         const price = prices.get(trade.symbol)
         if (price == null) { this.touch(trade, 'flatten: no price'); continue }
         const leg: ExitLeg = {
-          qty: trade.openQty, reason, intendedPrice: price,
+          qty: trade.openQty, reason, intendedPrice: price, decisionPrice: price,
           orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
         }
         const order = await this.broker.submitLimit({
@@ -621,10 +629,16 @@ export class PaperExecutor {
     const exitSlips = this.trades.flatMap(t => t.exits.map(l => l.slippagePct)).filter((n): n is number => n != null)
     const mean = (xs: number[]) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null
     const fmt = (n: number | null) => n == null ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+    // Split exit slippage into what we can fix by polling faster (gap) vs what the
+    // limit tolerance costs (concession). On 2026-08-10 that was −2.35% / −0.50%.
+    const legs = this.trades.flatMap(t => t.exits).filter(l => l.fillPrice != null && l.decisionPrice != null)
+    const gaps = legs.map(l => slippagePct(l.intendedPrice, l.decisionPrice!)).filter((n): n is number => n != null)
+    const concessions = legs.map(l => slippagePct(l.decisionPrice!, l.fillPrice!)).filter((n): n is number => n != null)
     return [
       `signals→trades: ${this.trades.length} considered, ${filled.length} filled, ${aborted.length} never filled`,
       `closed ${closed.length} · ${wins}W/${closed.length - wins}L · P&L $${pnl.toFixed(2)}`,
       `mean entry slip ${fmt(mean(entrySlips))} · mean exit slip ${fmt(mean(exitSlips))}`,
+      `  exit slip split — market gap ${fmt(mean(gaps))} (latency) · concession ${fmt(mean(concessions))} (limit tolerance)`,
     ].join('\n')
   }
 }

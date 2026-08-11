@@ -38,6 +38,20 @@ const ONCE = process.env.ONCE === '1'         // run a single sweep then exit (t
 const PAPER_TRADE = process.env.PAPER_TRADE === '1'
 const SWEEP_MS = 15_000                 // active-session cadence (matches the client)
 const IDLE_MS = 5 * 60_000              // slow poll when the market is closed
+// Position management runs on its OWN loop, not inside the sweep.
+//
+// It used to be the first thing each sweep did, so an open position was only
+// checked once per sweep + universe fetch ≈ 20s. On 2026-08-10 that cost real
+// money: exits averaged −1.00% against the level, and decomposing the worst one
+// (AUUD −2.84%) put −2.35% of it in the gap between the stop breaking and us
+// noticing, vs −0.50% in our limit tolerance. 82% of the bleed was latency.
+//
+// A resting broker stop would remove the latency entirely, but Alpaca rejects
+// stop orders outside 09:30–16:00 and every slipped exit that day was premarket,
+// so the only lever there is looking more often. One symbol through /api/monitor
+// is ~0.5–0.9s warm, so a 3s cadence on the 1–3 names we hold is affordable.
+const POSITION_MS = 3_000               // held-position check cadence
+const POSITION_IDLE_MS = 10_000         // slower spin when flat
 const MIN_LEVEL_STRENGTH = 40           // store default notificationSettings.minLevelStrength
 const TOP_GAINERS_UNIVERSE = 15         // matches useMonitor.gatherUniverse
 const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
@@ -118,12 +132,9 @@ async function fetchPrices(symbols: string[]): Promise<Map<string, number>> {
 }
 
 async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): Promise<BuySignalRecord[]> {
-  // Manage open positions first: an exit that's already due shouldn't wait behind
-  // a universe scan, and it frees a concurrency slot for anything new this sweep.
-  if (executor) {
-    try { await executor.tick() } catch (e) { log('executor tick failed:', (e as Error).message) }
-  }
-
+  // NB: position management is NOT done here — it runs on its own faster loop
+  // (see positionLoop / POSITION_MS). Ticking here too would double-poll and, more
+  // importantly, would put exits back behind the universe scan.
   const universe = await fetchUniverse()
   if (universe.length === 0) return buys
   const results = await fetchResults(universe)
@@ -226,6 +237,23 @@ async function main() {
   }
   process.on('SIGINT', () => { void shutdown('SIGINT') })
   process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+
+  // Position loop — deliberately separate from the sweep so an exit never waits
+  // behind a universe scan. Sequential by construction, so ticks can't overlap.
+  // ONCE mode skips it: a single sweep has nothing to manage over time.
+  if (executor && !ONCE) {
+    void (async () => {
+      while (!shuttingDown) {
+        const session = getSessionType()
+        if (session === 'overnight' || session === 'closed') { await sleep(IDLE_MS); continue }
+        const holding = executor!.openTrades().length > 0
+        if (holding) {
+          try { await executor!.tick() } catch (e) { log('position tick failed:', (e as Error).message) }
+        }
+        await sleep(holding ? POSITION_MS : POSITION_IDLE_MS)
+      }
+    })()
+  }
 
   let buys = loadBuys()
   while (true) {

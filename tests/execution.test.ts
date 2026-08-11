@@ -523,6 +523,29 @@ describe('PaperExecutor', () => {
     expect(ex.allTrades()[0].exits[0].reason).toBe('risk_halt')
   })
 
+  it('records the decision price so exit slippage splits into gap vs concession', async () => {
+    // The whole point: on 2026-08-10 AUUD's −2.84% exit had to be reverse-engineered
+    // by hand into −2.35% latency + −0.50% tolerance. It must fall out of the record.
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal())
+    await ex.tick()                    // entry fills
+    price = 9.0                        // gaps well below the 9.50 stop before we look
+    await ex.tick()
+
+    const leg = ex.allTrades()[0].exits[0]
+    expect(leg.reason).toBe('stop')
+    expect(leg.decisionPrice).toBe(9.0)
+    expect(leg.intendedPrice).toBeCloseTo(9.5)
+    // gap = observed vs the level we aimed at; concession = fill vs observed.
+    const gap = ((leg.decisionPrice! - leg.intendedPrice) / leg.intendedPrice) * 100
+    const concession = ((leg.fillPrice! - leg.decisionPrice!) / leg.decisionPrice!) * 100
+    expect(gap).toBeCloseTo(-5.26, 1)
+    expect(concession).toBeCloseTo(-0.5, 1)
+    expect(ex.summary()).toMatch(/market gap -5\.26% \(latency\)/)
+    expect(ex.summary()).toMatch(/concession -0\.50% \(limit tolerance\)/)
+  })
+
   it('reports slippage in the session summary', async () => {
     const ex = build()
     await ex.init()
@@ -537,8 +560,8 @@ describe('computeRealized', () => {
     const t = trade({
       entryFillPrice: 10.05, entryFillQty: 100,
       exits: [
-        { qty: 50, reason: 't1', intendedPrice: 11, orderId: 'a', fillPrice: 11, filledAt: 1, slippagePct: 0 },
-        { qty: 50, reason: 't2', intendedPrice: 12, orderId: 'b', fillPrice: 12, filledAt: 2, slippagePct: 0 },
+        { qty: 50, reason: 't1', intendedPrice: 11, decisionPrice: 11, orderId: 'a', fillPrice: 11, filledAt: 1, slippagePct: 0 },
+        { qty: 50, reason: 't2', intendedPrice: 12, decisionPrice: 12, orderId: 'b', fillPrice: 12, filledAt: 2, slippagePct: 0 },
       ],
     })
     const r = computeRealized(t)!

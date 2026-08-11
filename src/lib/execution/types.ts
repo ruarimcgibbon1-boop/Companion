@@ -133,6 +133,17 @@ export interface ExitLeg {
   reason: ExitReason
   /** The level whose break triggered this leg — what the backtest would book. */
   intendedPrice: number
+  /**
+   * The price we actually observed when we decided to exit. Splits total slippage
+   * into the two things that cause it, which need different fixes:
+   *   market gap  = decisionPrice vs intendedPrice — how far price ran before we
+   *                 SAW it. Fixed by polling faster.
+   *   concession  = fillPrice vs decisionPrice — what we gave up to guarantee a
+   *                 fill. Fixed, if at all, by the limit tolerance.
+   * On 2026-08-10 AUUD's −2.84% was −2.35% gap and −0.50% concession: 82% latency.
+   * Without this field that split had to be reverse-engineered by hand.
+   */
+  decisionPrice: number | null
   orderId: string | null
   fillPrice: number | null
   filledAt: number | null
