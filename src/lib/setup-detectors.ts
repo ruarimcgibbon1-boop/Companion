@@ -209,6 +209,106 @@ const RUNNER_MIN_CHANGE_PCT = 20
 // the day high = still running; further off = faded, back to the strict 4% cap.
 const RUNNER_MAX_OFF_HIGH_PCT = 8
 
+// ── Leg-maturity gate (2026-08-11) ───────────────────────────────────────────
+//
+// Evidence, from resolving all 18 executed paper trades against the 5-min tape:
+// 12 of 18 were stopped out INSIDE the bar they entered (MFE +0.00% — never a tick
+// in our favour), and several of those names then ran hard the same day (CELZ
+// +37.6%, AUUD +16.1%, EVGN +12.5%, VATE +10.8%). So discovery was right and entry
+// timing was wrong. Segmenting by what was true at entry:
+//   • bought at the top of the 10-bar range (rangePos ≥ 0.98): 4/4 died in bar 1
+//   • leg already ran ≥5% off its 10-bar low:                  9/12 died, avg −$264
+//   • prior bar closed red (no green streak):                 10/12 died, avg −$279
+//   • prior bars green (streak ≥ 2):                           1/6 died, avg −$138
+//
+// `maxTriggerExtension` above already caps how far past the TRIGGER LEVEL price has
+// run. It says nothing about how far the LEG has run — AUUD entered 82% above its
+// 10-bar low while sitting right on its trigger, and passed cleanly. This gate
+// closes that hole: it measures maturity of the move, not distance past the level.
+//
+// The threshold is NOT fitted here — 18 trades is far too few, and a tight cap
+// would have blocked STKH's 09:31 breakout (already +12.5% off its 09:30 low,
+// then ran to +90%). It is swept on the 20-day replay instead:
+//   MAX_LEG_RUNUP_PCT=20 npx tsx scripts/backtest.ts
+// Infinity disables the gate, which is the pre-2026-08-11 behaviour.
+// ── Thesis cut: quarantined triggers (2026-08-11) ────────────────────────────
+//
+// These detectors still RUN and stay visible as watch items — they just cannot
+// reach `triggered`, so they log no BUY and place no order. Quarantine rather than
+// deletion keeps them on screen for the trader's own discretion and keeps the
+// recall harness able to measure them.
+//
+// Chosen from the 20-day FMP replay (151 signals) scored in R (P/L ÷ stop width),
+// which is the right metric because the live executor sizes by fixed dollar risk —
+// raw % flatters wide stops. Per-setup net R:
+//   opening_range_break  51  +0.277R  +14.1R   ← 52% of all profit
+//   opening_drive        15  +0.898R  +13.5R   ← best per trade
+//   break_of_structure   27  +0.207R   +5.6R
+//   hod_break             9  +0.144R   +1.3R
+//   momentum_pullback    24  -0.063R   -1.5R   ← +19% in raw %, NEGATIVE in R
+//   pullback              4  -0.409R   -1.6R
+//   ema21_bounce          1  -1.043R   -1.0R
+//   premarket_breakout   17  -0.607R  -10.3R   ← worst by a distance
+// Book with these four cut: 105 signals, 5.3/day, +0.396R/trade, net +41.6R
+// (baseline 151, 7.5/day, +0.179R, +27.1R). Cutting further RAISES avg/trade but
+// LOWERS net R — over-filtering. hod_break and break_of_structure stay for that reason.
+//
+// NOTE this is not a retreat from premarket, which is one of the best sessions in
+// the book (33 non-premarket_breakout premarket signals: 63% win, +0.415R, +13.7R,
+// led by break_of_structure at +0.706R). It is the premarket_breakout DETECTOR that
+// loses — corroborated live (SPCF + AUUD on 2026-08-10) and by an earlier 0/7 replay.
+//
+// Restore any of them by editing this set; CULL_ENABLED=0 disables the cut wholesale
+// for an A/B run.
+export const TRIGGERS_QUARANTINED = new Set<SetupType>(
+  envNum('CULL_ENABLED', 1) === 0 ? [] : [
+    'premarket_breakout',
+    'momentum_pullback',
+    'pullback',
+    'ema21_bounce',
+  ],
+)
+
+const LEG_LOOKBACK_BARS = 10
+const MAX_LEG_RUNUP_PCT = envNum('MAX_LEG_RUNUP_PCT', Infinity)
+// Require the move to still be pushing: at least this many consecutive up-closes
+// immediately before the trigger. 0 disables.
+const MIN_GREEN_STREAK = envNum('MIN_GREEN_STREAK', 0)
+
+/** Env override that is inert in the browser (Next replaces `process.env.X` with undefined). */
+function envNum(key: string, fallback: number): number {
+  const raw = typeof process !== 'undefined' && process.env ? process.env[key] : undefined
+  if (raw == null || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/**
+ * How far the current leg has already run: trigger price vs the lowest low of the
+ * last `LEG_LOOKBACK_BARS` bars. Null when there isn't enough tape to judge —
+ * callers must fail OPEN on null, never treat "unknown" as "over-extended" (the
+ * silent-`[]` trap that killed every premarket setup on 2026-07-20).
+ */
+export function legRunUpPct(candles: Candle[], price: number, lookback = LEG_LOOKBACK_BARS): number | null {
+  const recent = lastN(candles, lookback)
+  if (recent.length < 3 || !(price > 0)) return null
+  let lo = Infinity
+  for (const c of recent) if (c.low > 0 && c.low < lo) lo = c.low
+  if (!Number.isFinite(lo) || lo <= 0) return null
+  return ((price - lo) / lo) * 100
+}
+
+/** Consecutive up-closes immediately before the current (forming) bar. */
+export function greenStreak(candles: Candle[], lookback = LEG_LOOKBACK_BARS): number {
+  const recent = lastN(candles, lookback)
+  let n = 0
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].close > recent[i].open) n++
+    else break
+  }
+  return n
+}
+
 function maxTriggerExtension(ctx: DetectionContext, type: SetupType): number {
   if (!STRENGTH_ENTRY_TYPES.includes(type)) return MAX_TRIGGER_EXTENSION_PCT
   const t = ctx.technical
@@ -574,7 +674,17 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // ANTI_FADE_TYPES). It stays visible as a watch; it just can't log a BUY.
   const distFromHigh = t.distanceFromDayHighPct   // negative = below the high
   const fadedChase = ANTI_FADE_TYPES.includes(type) && distFromHigh != null && distFromHigh < -MAX_BELOW_HIGH_PCT
-  const vetoed = (args.vetoTrigger?.active ?? false) || fadedChase
+  // Leg-maturity veto (see LEG_LOOKBACK_BARS block). Longs only: this is about
+  // buying a move that has already gone, which has no short-side mirror here.
+  // Fails OPEN when the tape is too short to measure.
+  const runUp = direction === 'long' ? legRunUpPct(ctx.candles, price) : null
+  const lateInLeg = runUp != null && runUp > MAX_LEG_RUNUP_PCT
+  const unconfirmed = direction === 'long' && MIN_GREEN_STREAK > 0 &&
+    greenStreak(ctx.candles) < MIN_GREEN_STREAK
+  // Thesis cut: quarantined types stay visible but can never log a BUY.
+  const quarantined = TRIGGERS_QUARANTINED.has(type)
+  const vetoed = (args.vetoTrigger?.active ?? false) || fadedChase || lateInLeg ||
+    unconfirmed || quarantined
   // An over-extended long bounce is a chase, not a fillable trigger — drop it
   // entirely. The cap widens for a strength entry on a genuine runner (see
   // maxTriggerExtension) so the day's top gainers aren't refused for running fast.

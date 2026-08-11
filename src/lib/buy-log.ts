@@ -29,11 +29,36 @@ export const PREMARKET_SURGE_RVOL = 10
 // Grade floor: below-grade signals are dropped except the early-momentum winners.
 export const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])
 
-// Per-symbol log cap (anti-spray). A proven runner near its high on a strong RVOL
-// surge may be scaled past the normal cap + grade floor, up to a higher-but-finite
-// ceiling (RITR/PAVS were floored/capped despite being the target profile).
-export const MAX_LOGS_PER_SYMBOL = 2
+// PER-SYMBOL LOG CAP — removed 2026-08-07, RESTORED 2026-08-11.
+//
+// One session without it was decisive: on 2026-08-10 VATE logged and filled THREE
+// times (12.00, 12.65, 13.00) for −$1,306 — 65% of the day's −$2,012. The third
+// fill alone (−$356) is one the cap would have refused outright. Restored at 2,
+// and now swept alongside the leg-maturity gate rather than assumed:
+//   MAX_LOGS_PER_SYMBOL=3 npx tsx scripts/backtest.ts
+//
+// Original rationale and the history that led here:
+//
+// It caps a name at 2 logged ideas per session (anti-spray: TNMG logged 8× as it
+// climbed, ENSC 6×, on the 70-signal/27%-win day of 2026-08-04). Raising it 2→3 was
+// A/B'd on 2026-08-05 and DILUTED the book (106→137 signals, 46%→42% win,
+// +1.25→+0.81%/trade).
+//
+// KNOWN SHARP EDGE: the count is read from persisted buy history, which survives a
+// daemon restart — so signals logged by an EARLIER run consume the budget. On
+// 2026-08-07 CELZ was `capped` at 08:18 ET on slots used at 07:03/07:04 by a
+// previous daemon process. If that bites again, prune the history to the current
+// session on load rather than removing the cap.
+export const MAX_LOGS_PER_SYMBOL = envInt('MAX_LOGS_PER_SYMBOL', 2)
 export const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session
+
+/** Env override that is inert in the browser; lets the replay sweep the cap. */
+function envInt(key: string, fallback: number): number {
+  const raw = typeof process !== 'undefined' && process.env ? process.env[key] : undefined
+  if (raw == null || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
 
 // Entry-cluster dedup.
 export const ENTRY_SIMILARITY_PCT = 0.03

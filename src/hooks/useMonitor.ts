@@ -4,6 +4,10 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
 import { etMinutesOfDay } from '@/lib/market-hours'
+// Imported, not re-declared: this file already keeps local copies of the gate
+// helpers, and a third copy of the cap is exactly how the client and the daemon
+// drift apart. buy-log.ts is browser-safe.
+import { MAX_LOGS_PER_SYMBOL, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
 import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel, PatternLogRecord } from '@/types'
 
 // One pattern log per symbol+pattern per ~10-min bucket, so a hit that persists
@@ -47,15 +51,12 @@ const PREMARKET_SURGE_RVOL = 10
 //   exempting it flooded the book with below-grade momentum_pullbacks that LOSE
 //   (17→89 signals, 60%→50% win, +2.23→−0.70%/trade). The grade floor was
 //   correctly filtering them, so it stays floored. Its edge lives in grade-C+ only.
-//   Lever 3 — per-symbol log cap: TNMG logged 8× as it climbed, ENSC 6×. Allow up
-//   to MAX_LOGS_PER_SYMBOL DISTINCT ideas on a name (the user will take a genuine
-//   second setup) but kill the 3rd+ repeat of a running name. NB: raising this 2→3
-//   was tested 2026-08-05 (to auto-flag a 3rd scale on a runner) and DILUTED the
-//   book (106→137 signals, 46%→42% win, +1.25→+0.81%/trade) — it re-admits repeat
-//   spam, not disciplined scale-ins. Kept at 2; manual scaling is the trader's call.
+//   Lever 3 — per-symbol log cap: REMOVED 2026-08-07 at the user's direction (it was
+//   2 distinct ideas per name; TNMG had logged 8×, ENSC 6×). It kept consuming its
+//   budget on signals from earlier daemon runs, which starved the paper executor.
+//   Prior A/B on file: raising it 2→3 diluted the book (106→137 signals, 46%→42%
+//   win, +1.25→+0.81%/trade). Full rationale in src/lib/buy-log.ts.
 const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['opening_drive'])
-const MAX_LOGS_PER_SYMBOL = 2
-const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000  // one session (premarket→close ≈ 12h)
 // Late-session cutoff (20-day FMP replay, 2026-08-05): regular-hours entries after
 // 14:00 ET lost (−0.69%/trade over 17 signals) while the 10:00–14:00 window carried
 // the book (+1.72%/trade). Stop logging new regular-session BUYs past this time;
@@ -405,7 +406,8 @@ export function useMonitor() {
           // grade floor and the per-symbol cap) was shipped 2026-08-06 for the
           // RITR/PAVS misses and REVERTED 2026-08-07 — a clean A/B on the same pool
           // showed it added 38 signals but cut expectancy +0.76% → +0.41%/trade.
-          // Lever 3: cap logged ideas per name this session (2 distinct, not 8 repeats).
+          // Lever 3: cap logged ideas per name this session (restored 2026-08-11 —
+          // VATE filled 3× for −$1,306 on 08-10 without it). Shared constant now.
           const symbolLogsThisSession = allBuys.filter(
             b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS
           ).length

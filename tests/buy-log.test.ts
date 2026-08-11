@@ -67,12 +67,20 @@ describe('classifyBuy', () => {
   })
 
   it('caps a name at 2 logs per session — including a strong runner', () => {
-    const prior = [buyRec('AAA', 8.0, PM - 2000), buyRec('AAA', 8.4, PM - 1000)]  // 2 prior, >3% apart
+    // Restored 2026-08-11 after VATE filled 3× for −$1,306 (65% of that day's loss)
+    // with the cap off. Two priors >3% apart, so the third is caught by the CAP and
+    // not merely by the entry-cluster dedup.
+    const prior = [buyRec('AAA', 8.0, PM - 2000), buyRec('AAA', 8.4, PM - 1000)]
     const s3 = mkSetup({ entryFill: 9.5, zoneUpper: 9.5, id: 'AAA:premarket_breakout:9.50' })
     expect(classifyBuy(s3, mkResult({ price: 9.5 }), ctx(prior)).verdict).toBe('capped')
     // Near-high + 40× RVOL no longer buys a higher ceiling (see reverted override).
     const rStrong = mkResult({ price: 9.5, relativeVolume: 40, technicals: { distanceFromDayHighPct: -0.5 } as MonitorResult['technicals'] })
     expect(classifyBuy(s3, rStrong, ctx(prior)).verdict).toBe('capped')
+  })
+
+  it('dedups a near-identical re-fire before the cap is even reached', () => {
+    const prior = [buyRec('AAA', 9.0, PM - 1000)]
+    expect(classifyBuy(mkSetup(), mkResult(), ctx(prior)).verdict).toBe('dup')
   })
 
   it('dedups a near-identical re-fire on the same name', () => {

@@ -50,7 +50,10 @@ const MIN_PREMARKET_BUY_VOLUME = 50_000
 const PREMARKET_SURGE_RVOL = 10  // a strong RVOL surge clears the absolute floor (thin-float rockets, e.g. YXT 46×)
 const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])  // PMB dropped 2026-08-05; momentum_pullback exemption tested + reverted (flooded losers)
 const LATE_LOG_CUTOFF_HHMM = 1400  // no new regular-hours BUYs at/after 14:00 ET
-const MAX_LOGS_PER_SYMBOL = 2
+// Per-symbol log-count cap: REMOVED from the live gate stack 2026-08-07, so the
+// replay defaults to uncapped too. Overridable purely so the removal can be A/B'd
+// against the old behaviour on the same tape: MAX_LOGS_PER_SYMBOL=2 npx tsx scripts/backtest.ts
+const MAX_LOGS_PER_SYMBOL = Number(process.env.MAX_LOGS_PER_SYMBOL ?? Infinity)
 const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000
 const ENTRY_SIMILARITY_PCT = 0.03
 const BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000
