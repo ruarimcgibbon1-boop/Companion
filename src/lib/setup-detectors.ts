@@ -263,9 +263,21 @@ const RUNNER_MAX_OFF_HIGH_PCT = 8
 //   pullback              4  -0.409R   -1.6R
 //   ema21_bounce          1  -1.043R   -1.0R
 //   premarket_breakout   17  -0.607R  -10.3R   ← worst by a distance
-// Book with these four cut: 105 signals, 5.3/day, +0.396R/trade, net +41.6R
-// (baseline 151, 7.5/day, +0.179R, +27.1R). Cutting further RAISES avg/trade but
-// LOWERS net R — over-filtering. hod_break and break_of_structure stay for that reason.
+// VERIFIED by a full replay run, not by filtering the baseline's signal list:
+//   baseline  151 signals  7.5/day  40% win  +0.179R/trade  net +27.1R  (+83.5%)
+//   cull 4    113 signals  5.7/day  40% win  +0.345R/trade  net +38.9R  (+101.2%)
+// Avg loss also improves (-3.47% -> -2.83%) with win rate unchanged, so this is a
+// real change in the book's composition rather than a survivorship artifact.
+//
+// Filtering the baseline CSV predicted 105 signals and +41.6R; the true run came in
+// at 113 and +38.9R because 11 signals backfilled into cap/dedup slots freed by the
+// quarantined types, and those 11 were -5.1R. That gap IS the reshuffle effect — a
+// veto redistributes the book, it does not subtract from it. Always verify a gate
+// with a real run.
+//
+// Cutting further RAISES avg/trade but LOWERS net R — over-filtering. hod_break and
+// break_of_structure stay for that reason. Same trap on an RVOL>=5 filter: avg/trade
+// +0.179R -> +0.283R while removing 79 signals worth +9.2R. Better average, less money.
 //
 // NOTE this is not a retreat from premarket, which is one of the best sessions in
 // the book (33 non-premarket_breakout premarket signals: 63% win, +0.415R, +13.7R,
