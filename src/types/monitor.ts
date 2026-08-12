@@ -302,7 +302,16 @@ export const PATTERN_LABELS: Record<CandlePattern, string> = {
 /** A logged pattern occurrence — accumulated in the background to build a dataset
  *  of which candlestick patterns on which gainers actually pay off. */
 export interface PatternLogRecord {
-  id: string               // symbol:pattern:timeBucket — deduped per occurrence
+  /**
+   * symbol:pattern:priceBucket — deduped per occurrence AND per price.
+   *
+   * Was symbol:pattern:timeBucket, which re-logged the same pattern every 10-min
+   * bucket for as long as it persisted. With a stale feed that is unbounded:
+   * 2026-08-12's export had INLF's hammer 21x and PAVS's morning_star 20x at a
+   * price that never changed once (6.27 and 4.91 for 3+ hours), 40% of the file.
+   * Keying on price means a frozen quote logs once.
+   */
+  id: string
   timestamp: number        // epoch ms when first logged
   symbol: string
   pattern: CandlePattern
@@ -312,7 +321,23 @@ export interface PatternLogRecord {
   price: number            // price when the pattern logged (for later outcome resolution)
   changePct: number        // day change at log time (to filter to the top gainers)
   rvol: number | null
+  // ── Outcome, filled by the pattern resolver ────────────────────────────────
+  /** Which barrier the tape hit first inside the horizon. Null until resolved. */
+  outcome?: PatternOutcome
+  /** Best gain reached after the pattern, % — populated with the outcome. */
+  mfePct?: number | null
+  /** Worst drawdown reached after the pattern, % (negative). */
+  maePct?: number | null
+  resolvedAt?: number | null
 }
+
+/**
+ * Symmetric barriers, deliberately: ±2% within one hour. Because the up and down
+ * barriers are the same size, the WIN RATE is itself the edge measurement — above
+ * 50% means the pattern predicts direction, and no payoff-ratio assumptions are
+ * smuggled in. 'expired' = neither barrier touched inside the horizon.
+ */
+export type PatternOutcome = 'open' | 'win' | 'loss' | 'expired'
 
 // ── State machine record (persisted for restart restoration) ────────────────
 

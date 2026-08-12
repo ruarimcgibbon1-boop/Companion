@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Candle } from '@/types'
 import { useTradingStore } from '@/store/trading-store'
 import { resolveOpenLogs, resolveBuyPnl, normalizeCandles } from '@/lib/eod-resolver'
+import { resolvePatternLog } from '@/lib/pattern-resolver'
 
 async function fetchDayCandles(symbol: string): Promise<Candle[]> {
   const res = await fetch(`/api/candles?symbol=${encodeURIComponent(symbol)}&interval=5min`)
@@ -39,6 +40,7 @@ export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
   const unpricedCount = useTradingStore(s => s.buySignals.filter(b => b.pnlPct == null).length)
   const upsertSetupLog = useTradingStore(s => s.upsertSetupLog)
   const updateBuySignal = useTradingStore(s => s.updateBuySignal)
+  const updatePatternLogs = useTradingStore(s => s.updatePatternLogs)
   const [status, setStatus] = useState<Status>('idle')
   const [lastResolved, setLastResolved] = useState(0)
   const inFlight = useRef(false)
@@ -49,7 +51,7 @@ export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
     setStatus('running')
     try {
       // Read the freshest state at call time, not a stale closure.
-      const { setupLogs, buySignals } = useTradingStore.getState()
+      const { setupLogs, buySignals, patternLog } = useTradingStore.getState()
       const now = Date.now()
       const fetchCandles = makeCachedFetch()
 
@@ -59,7 +61,13 @@ export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
       const pricedBuys = await resolveBuyPnl(buySignals, now, fetchCandles)
       for (const b of pricedBuys) updateBuySignal(b.id, { pnlPct: b.pnlPct, pnlFullyClosed: b.pnlFullyClosed })
 
-      const total = resolvedLogs.length + pricedBuys.length
+      // Patterns resolve on the same pass and the same cached tape. Until this
+      // existed the pattern log recorded occurrences and never outcomes, so it
+      // could not answer which patterns pay — the only thing it's for.
+      const resolvedPatterns = await resolvePatternLog(patternLog, fetchCandles, now)
+      updatePatternLogs(resolvedPatterns)
+
+      const total = resolvedLogs.length + pricedBuys.length + resolvedPatterns.length
       setLastResolved(total)
       setStatus('done')
       return total
@@ -69,7 +77,7 @@ export function useEodResolution({ auto = false }: { auto?: boolean } = {}) {
     } finally {
       inFlight.current = false
     }
-  }, [upsertSetupLog, updateBuySignal])
+  }, [upsertSetupLog, updateBuySignal, updatePatternLogs])
 
   const autoRan = useRef(false)
   useEffect(() => {

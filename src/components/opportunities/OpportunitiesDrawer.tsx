@@ -524,6 +524,11 @@ function etTime(ts: number): string {
   return new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(ts))
 }
 
+/** ET calendar date, en-CA for a sortable YYYY-MM-DD. The trading day, not the local one. */
+function etDate(ts: number): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ts))
+}
+
 const OUTCOME_STYLE: Record<string, { label: string; cls: string }> = {
   target_hit: { label: 'Target hit', cls: 'text-emerald-300 bg-emerald-900/40' },
   invalidated: { label: 'Stopped', cls: 'text-red-300 bg-red-900/40' },
@@ -701,10 +706,20 @@ function PatternsTab({ onPick }: { onPick: () => void }) {
     .filter(r => r.hits.length > 0)
 
   const exportCsv = () => {
-    const head = ['time_ET', 'symbol', 'pattern', 'strength', 'at_support', 'volume_confirmed', 'price', 'change_pct', 'rvol']
+    // date_ET first: the log accumulates across sessions (the 2026-08-12 export had
+    // SEVEN days concatenated) and without a date the rows can't be split by day,
+    // which also made them impossible to resolve against the tape retrospectively.
+    const head = [
+      'date_ET', 'time_ET', 'symbol', 'pattern', 'strength', 'at_support', 'volume_confirmed',
+      'price', 'change_pct', 'rvol', 'outcome', 'mfe_pct', 'mae_pct',
+    ]
     const rows = patternLog.map(r => [
-      etTime(r.timestamp), r.symbol, r.pattern, r.strength, r.atSupport ? 1 : 0, r.volumeConfirmed ? 1 : 0,
+      etDate(r.timestamp), etTime(r.timestamp), r.symbol, r.pattern, r.strength,
+      r.atSupport ? 1 : 0, r.volumeConfirmed ? 1 : 0,
       r.price, r.changePct.toFixed(1), r.rvol == null ? '' : r.rvol.toFixed(1),
+      r.outcome ?? 'open',
+      r.mfePct == null ? '' : r.mfePct.toFixed(2),
+      r.maePct == null ? '' : r.maePct.toFixed(2),
     ].join(','))
     const url = URL.createObjectURL(new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' }))
     const a = document.createElement('a')

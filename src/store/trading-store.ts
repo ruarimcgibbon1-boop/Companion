@@ -164,6 +164,8 @@ interface TradingStore {
   clearMonitorAlerts: () => void
   clearBuySignals: () => void
   clearPatternLog: () => void
+  /** Write resolved outcomes back onto pattern-log rows, matched by id. */
+  updatePatternLogs: (records: PatternLogRecord[]) => void
   updateBuySignal: (id: string, patch: Partial<BuySignalRecord>) => void
   upsertSetupLog: (log: SetupLog) => void
   updateNotificationSettings: (patch: Partial<NotificationSettings>) => void
@@ -336,6 +338,12 @@ export const useTradingStore = create<TradingStore>()(
       clearMonitorAlerts: () => set({ monitorAlerts: [] }),
       clearBuySignals: () => set({ buySignals: [] }),
       clearPatternLog: () => set({ patternLog: [] }),
+
+      updatePatternLogs: (records) => set(s => {
+        if (records.length === 0) return {}
+        const byId = new Map(records.map(r => [r.id, r]))
+        return { patternLog: s.patternLog.map(r => byId.get(r.id) ?? r) }
+      }),
       updateBuySignal: (id, patch) => set(s => ({
         buySignals: s.buySignals.map(b => b.id === id ? { ...b, ...patch } : b),
       })),

@@ -4,15 +4,16 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
 import { etMinutesOfDay } from '@/lib/market-hours'
+import { patternLogId, shouldLogPattern } from '@/lib/pattern-log-gate'
 // Imported, not re-declared: this file already keeps local copies of the gate
 // helpers, and a third copy of the cap is exactly how the client and the daemon
 // drift apart. buy-log.ts is browser-safe.
 import { MAX_LOGS_PER_SYMBOL, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
 import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel, PatternLogRecord } from '@/types'
 
-// One pattern log per symbol+pattern per ~10-min bucket, so a hit that persists
-// across sweeps (the last candle is unchanged until a new bar closes) logs once.
-const PATTERN_LOG_BUCKET_MS = 10 * 60 * 1000
+// Pattern-log admission (dedup on price, close cutoff, falling-knife guard) lives
+// in pattern-log-gate.ts. The old ~10-min time bucket re-logged a persisting hit
+// every bucket, which against a stale quote never terminated.
 
 // A buy signal needs real liquidity behind it — at least this many shares traded on
 // the day. Screens out the thin illiquid names a fill can't get (SHPH-type).
@@ -347,16 +348,19 @@ export function useMonitor() {
         symbolSetups[r.symbol] = r.setups
         if (r.patterns && r.patterns.length > 0) {
           symbolPatterns[r.symbol] = r.patterns
-          // Quietly log each occurrence (deduped per ~10-min bucket) to build the dataset.
-          const bucket = Math.floor(now / PATTERN_LOG_BUCKET_MS)
+          // Log each occurrence to build the dataset — but only occurrences worth
+          // something at review time. Admission rules live in pattern-log-gate.ts
+          // so they're testable; see there for the evidence behind each one.
           for (const p of r.patterns) {
-            const id = `${r.symbol}:${p.pattern}:${bucket}`
-            if (loggedPatternIds.has(id)) continue
+            const id = patternLogId(r.symbol, p.pattern, r.price)
+            const verdict = shouldLogPattern(id, { now, changePct: r.changePct, loggedIds: loggedPatternIds })
+            if (!verdict.log) continue
             loggedPatternIds.add(id)
             newPatternLogs.push({
               id, timestamp: now, symbol: r.symbol, pattern: p.pattern,
               strength: p.strength, atSupport: p.atSupport, volumeConfirmed: p.volumeConfirmed,
               price: r.price, changePct: r.changePct, rvol: r.relativeVolume,
+              outcome: 'open', mfePct: null, maePct: null, resolvedAt: null,
             })
           }
         }
