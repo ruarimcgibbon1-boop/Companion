@@ -203,6 +203,95 @@ const MAX_BELOW_HIGH_PCT = 5
 // at +0.6% cannot pay for the losers. These are momentum names running 20–300% in
 // a day; the thesis is low-win/high-payoff, so a first target must be worth
 // taking. ATR does the scaling — 1 volatility unit on a 6%-ATR runner is ~6%.
+// ── SPACE gate (2026-08-12) ──────────────────────────────────────────────────
+//
+// "BREAKOUT LEVEL → OPEN PRICE SPACE → NEXT SUPPLY AREA." Room to the next
+// resistance is the variable this engine never measured, and its absence shows up
+// as a specific defect: the target floor below (MIN_T1_REWARD_*) SKIPS a level
+// that sits closer than the minimum reward and rates a further one as T1. So a
+// setup with genuine supply 0.5% overhead isn't refused — it's handed a
+// manufactured 2% target that makes its R/R look tradeable, and price stalls into
+// the level we pretended wasn't there.
+//
+// The gate asks the question the ladder can't: how far to the next REAL supply,
+// measured in units of the risk we're taking? Below MIN_SPACE_R there isn't
+// enough room to make even 1R before price meets sellers, so the trade is refused
+// outright rather than re-targeted.
+//
+// Fails OPEN: no level overhead means open space (the best case), never a veto.
+// A level under SPACE_LEVEL_MIN_STRENGTH is noise and must not block a trade —
+// same threshold the breakout detectors already use to decide what counts as
+// resistance worth reacting to.
+const MIN_SPACE_R = envNum('MIN_SPACE_R', 1.0)
+const SPACE_LEVEL_MIN_STRENGTH = 45
+
+// ── ACCEPTANCE (2026-08-12) ──────────────────────────────────────────────────
+//
+// "A trader who defines breakout as 'one cent above resistance' is vulnerable
+// because penny stocks frequently overshoot levels due to spread, stop orders,
+// thin liquidity, and momentum market orders. The real question is: did the market
+// ACCEPT above the level?"
+//
+// That is our trade. `triggeredRaw` fires the instant price crosses, so we buy the
+// print and never require the hold — and 12 of 18 executed paper trades were
+// stopped out INSIDE the bar they entered while the names went on to run (CELZ
+// +37.6% the same day). That is the failed-breakout wick, bought.
+//
+// DEFAULT OFF. This changes which setups can trigger at all, so it is swept on the
+// replay before shipping — though note a replay fills at the level and models no
+// spread, so it will UNDERSTATE the benefit of refusing to buy overshoot.
+//   ACCEPTANCE_BARS=1 npx tsx scripts/backtest.ts
+const ACCEPTANCE_BARS = envNum('ACCEPTANCE_BARS', 0)
+
+/**
+ * Has the market closed above `level` on the last `bars` candles?
+ *
+ * Acceptance is behaviour, not elapsed time — "a stock can spend five minutes
+ * above resistance with no demand" — so this asks for closes, not duration.
+ *
+ * Returns TRUE when there isn't enough tape to judge: unknown must never block a
+ * trade (the 2026-07-20 silent-`[]` trap that killed every premarket setup).
+ */
+export function closedAboveLevel(candles: Candle[], level: number, bars: number): boolean {
+  if (bars <= 0) return true
+  if (!(level > 0)) return true
+  const recent = lastN(candles, bars)
+  if (recent.length < bars) return true
+  return recent.every(c => c.close > level)
+}
+
+export interface SpaceRead {
+  /** Nearest meaningful supply beyond the fill, or null when the way is open. */
+  nextSupply: number | null
+  /** Distance to it as % of the fill. */
+  pct: number | null
+  /** Distance to it in R — how much of the risk we can earn before meeting sellers. */
+  r: number | null
+}
+
+/**
+ * Room from the entry fill to the next meaningful level in the trade direction.
+ * `riskDist` is the stop distance in price terms.
+ */
+export function spaceToNextSupply(
+  levels: KeyLevel[],
+  entryFill: number,
+  riskDist: number,
+  direction: 'long' | 'short',
+): SpaceRead {
+  const none: SpaceRead = { nextSupply: null, pct: null, r: null }
+  if (!(entryFill > 0)) return none
+  const forward = direction === 'long' ? levelsAbove(levels, entryFill) : levelsBelow(levels, entryFill)
+  const supply = forward.find(l => l.strength >= SPACE_LEVEL_MIN_STRENGTH)
+  if (!supply) return none                       // open space — fail open
+  const dist = Math.abs(supply.midpoint - entryFill)
+  return {
+    nextSupply: supply.midpoint,
+    pct: (dist / entryFill) * 100,
+    r: riskDist > 0 ? dist / riskDist : null,
+  }
+}
+
 const MIN_T1_REWARD_R = 0.8
 const MIN_T1_REWARD_PCT = 0.02
 const MIN_T1_REWARD_ATR_MULT = 1.0
@@ -754,8 +843,18 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     greenStreak(ctx.candles) < MIN_GREEN_STREAK
   // Thesis cut: quarantined types stay visible but can never log a BUY.
   const quarantined = TRIGGERS_QUARANTINED.has(type)
+  // SPACE: refuse a trade that meets real supply before it can earn 1R. Note this
+  // is measured against the LEVELS, independently of the target ladder — the
+  // ladder's reward floor can skip a nearby level and rate a further one as T1,
+  // which is exactly how a no-room setup used to look tradeable.
+  const space = spaceToNextSupply(levels, entryFill, riskDist, direction)
+  const noRoom = space.r != null && space.r < MIN_SPACE_R
+  // ACCEPTANCE: a print through the level is not a breakout. Strength entries only
+  // — a bounce is not claiming acceptance above anything. Default off; see above.
+  const unaccepted = direction === 'long' && STRENGTH_ENTRY_TYPES.includes(type) &&
+    !closedAboveLevel(ctx.candles, zoneUpper, ACCEPTANCE_BARS)
   const vetoed = (args.vetoTrigger?.active ?? false) || fadedChase || lateInLeg ||
-    unconfirmed || quarantined
+    unconfirmed || quarantined || noRoom || unaccepted
   // An over-extended long bounce is a chase, not a fillable trigger — drop it
   // entirely. The cap widens for a strength entry on a genuine runner (see
   // maxTriggerExtension) so the day's top gainers aren't refused for running fast.
