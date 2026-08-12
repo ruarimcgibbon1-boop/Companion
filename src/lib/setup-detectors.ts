@@ -222,7 +222,18 @@ const MAX_BELOW_HIGH_PCT = 5
 // A level under SPACE_LEVEL_MIN_STRENGTH is noise and must not block a trade —
 // same threshold the breakout detectors already use to decide what counts as
 // resistance worth reacting to.
-const MIN_SPACE_R = envNum('MIN_SPACE_R', 1.0)
+// SWEPT 2026-08-12 AND TURNED OFF AT 1.0R. Against the cull-4 baseline (113
+// signals, 5.9/day, +0.345R/trade, net +38.9R) a 1.0R gate gave 75 signals,
+// 4.2/day, +0.500R/trade, net +37.5R — avg/trade UP, net R DOWN, signals a third
+// lower. Decomposed: it dropped 58 signals worth +41.9% and only looked better
+// because 20 backfilled signals happened to be worth +44.6%.
+//
+// BUT the direction is right and worth another threshold: the dropped cohort
+// averaged +0.72% vs +1.14% for the kept, so the gate discriminates correctly and
+// simply cuts too deep, taking marginally-profitable trades with the bad tail.
+// Sweep looser values before discarding the idea:  MIN_SPACE_R=0.5 npx tsx scripts/backtest.ts
+// 0 disables it, which is the shipped default until a threshold beats +38.9R.
+const MIN_SPACE_R = envNum('MIN_SPACE_R', 0)
 const SPACE_LEVEL_MIN_STRENGTH = 45
 
 // ── ACCEPTANCE (2026-08-12) ──────────────────────────────────────────────────
