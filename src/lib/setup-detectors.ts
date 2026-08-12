@@ -140,7 +140,40 @@ const MIN_STOP_PCT = 0.015
 // trigger) the base-low stop balloons risk into a sub-0.1R trade that the R/R
 // gate then benches (NVEC 2026-07-23: fill 130.60, base stop 126.15 → 0.1R).
 const STOP_ATR_MULT = 1.3        // pivot stop sits ~1.3 ATR under the fill
-const MIN_STOP_FLOOR_PCT = 0.004 // absolute stop-width floor when ATR is missing/tiny
+
+/**
+ * ABSOLUTE STOP-WIDTH FLOOR, scaled to session friction (raised from a flat 0.4%
+ * on 2026-08-12).
+ *
+ * A stop must be several times the round-trip cost of the trade or the arithmetic
+ * cannot work. Friction is 0.15%/side in regular hours and 0.5%/side premarket
+ * (see SLIPPAGE_RTH / SLIPPAGE_EXTENDED in eod-resolver.ts), i.e. 0.3% and 1.0%
+ * round trip. The old 0.4% floor sat AT or BELOW that in every session, so a
+ * "stopped out" trade lost far more than 1R before price moved at all.
+ *
+ * Measured on 2026-08-12's 29 signals:
+ *   losing trades: mean stop 1.76%, mean loss -2.49%  =  -1.85R, not -1R
+ *   QMCO's 0.4% stop lost 1.39% — -3.48R on a move of under half a percent
+ * By bucket, net R:
+ *   stop <1%   13 signals  1W/12L  -13.5R
+ *   stop 1-2%   6 signals  1W/5L    -7.6R
+ *   stop 2-4%   5 signals  2W/2L    +0.2R
+ *   stop 4%+    5 signals  2W/3L    +0.1R
+ * Everything under 2% lost; two thirds of the book was under 2%, and it accounted
+ * for the entire day's -20.8R. The trades that worked (both BIVI entries at 2.7%
+ * and 4.2%, RMCF at 8.9%) all carried room.
+ *
+ * ~5x round-trip cost each side of the open. This does not tighten anything: it
+ * only ever widens a degenerate stop, and a setup whose R/R can't survive the
+ * wider stop is refused by the R/R gate — which is the intended outcome, because
+ * that trade was never playable.
+ */
+const MIN_STOP_FLOOR_RTH_PCT = 0.015        // 1.5% — 5x the 0.3% RTH round trip
+const MIN_STOP_FLOOR_EXTENDED_PCT = 0.03    // 3.0% — 3x the 1.0% premarket round trip
+
+function minStopFloorPct(session: SessionType): number {
+  return session === 'regular' ? MIN_STOP_FLOOR_RTH_PCT : MIN_STOP_FLOOR_EXTENDED_PCT
+}
 // The setups you enter on strength — the stop trails up to the pivot for these.
 // Mean-reversion bounces keep their structural stop under the level they bounce from.
 const STRENGTH_ENTRY_TYPES: SetupType[] = [
@@ -587,10 +620,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // fill — so a chased fill doesn't inherit the far base-low stop and a 0.1R trade.
   // We only ever TIGHTEN toward the pivot; never loosen past the structural
   // invalidation. Bounces keep their structural stop (with the legacy noise floor).
+  const sessionFloorPct = minStopFloorPct(ctx.session)
   let stopRef = invalidation
   if (STRENGTH_ENTRY_TYPES.includes(type)) {
-    const atr = t.atr != null && t.atr > 0 ? t.atr : entryFill * MIN_STOP_FLOOR_PCT
-    const stopDist = Math.max(atr * STOP_ATR_MULT, entryFill * MIN_STOP_FLOOR_PCT)
+    const atr = t.atr != null && t.atr > 0 ? t.atr : entryFill * sessionFloorPct
+    const stopDist = Math.max(atr * STOP_ATR_MULT, entryFill * sessionFloorPct)
     const pivotStop = direction === 'long' ? entryFill - stopDist : entryFill + stopDist
     stopRef = direction === 'long' ? Math.max(invalidation, pivotStop) : Math.min(invalidation, pivotStop)
   } else {
@@ -600,6 +634,17 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     if (direction === 'long' && entryRef - stopRef < minStopDist) stopRef = entryRef - minStopDist
     else if (direction === 'short' && stopRef - entryRef < minStopDist) stopRef = entryRef + minStopDist
   }
+
+  // FINAL floor, applied to every branch: no setup may leave here with a stop
+  // narrower than session friction can support. The strength branch could still
+  // land under it when `invalidation` sat tighter than the pivot, and the bounce
+  // branch used a flat 1.5% that is too tight for premarket's 1% round trip.
+  // Widens only — a trade whose R/R cannot survive the wider stop is then refused
+  // by the R/R gate, which is correct: it was never playable.
+  const floorDist = entryFill * sessionFloorPct
+  if (direction === 'long' && entryFill - stopRef < floorDist) stopRef = entryFill - floorDist
+  else if (direction === 'short' && stopRef - entryFill < floorDist) stopRef = entryFill + floorDist
+
   const riskDist = Math.abs(entryFill - stopRef)
 
   // Candidate targets: ranked levels in the trade direction, plus any synthetic
