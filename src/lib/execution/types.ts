@@ -19,6 +19,7 @@
  *    remove. The broker's only job is filling orders.
  */
 import type { BuySignalRecord, SetupType } from '@/types'
+import type { SessionType } from '@/lib/market-hours'
 
 // ── Broker surface ───────────────────────────────────────────────────────────
 
@@ -177,6 +178,11 @@ export interface PaperTrade {
   // ── Reality (what the broker did) ─────────────────────────────────────────
   entryOrderId: string | null
   entrySubmittedAt: number | null
+  /**
+   * Session the ENTRY filled in. Stored rather than derived so the premarket risk
+   * budget survives a restart, and so a day's stats can be split by session.
+   */
+  entrySession: SessionType | null
   entryFilledAt: number | null
   entryFillPrice: number | null
   entryFillQty: number
@@ -231,6 +237,7 @@ export function newPaperTrade(
     plannedRisk: qty * Math.max(intendedEntry - signal.stop, 0),
     entryOrderId: null,
     entrySubmittedAt: null,
+    entrySession: null,
     entryFilledAt: null,
     entryFillPrice: null,
     entryFillQty: 0,

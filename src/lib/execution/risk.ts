@@ -10,6 +10,7 @@
  * Deliberately conservative defaults. Paper trading is for measuring whether the
  * edge survives real fills — not for finding out how big the account can get.
  */
+import type { SessionType } from '@/lib/market-hours'
 import type { PaperTrade } from './types'
 
 export interface RiskConfig {
@@ -23,6 +24,24 @@ export interface RiskConfig {
   maxTradesPerDay: number
   /** No pyramiding — one live position per symbol. */
   maxPositionsPerSymbol: number
+  /**
+   * Premarket's OWN slice of the daily loss budget, as a fraction of starting
+   * equity. Without this, premarket can spend the entire day's allowance before
+   * the market opens — which is exactly what happened on 2026-08-10: all nine
+   * fills were premarket (06:34-08:19) and the daily limit tripped at 09:21, NINE
+   * MINUTES before the open, locking out STKH and AUUD (both 09:31, both ran hard).
+   *
+   * The 20-day replay says that budget was in the wrong session anyway:
+   *   open 09:30-10:00   33 signals  +0.541R/trade  +17.9R
+   *   midday             68          +0.086R         +5.9R
+   *   premarket          50          +0.068R         +3.4R
+   * The first half hour carries the book at ~8x premarket's per-trade edge. So
+   * premarket gets a quarter of the daily budget and the rest is reserved for the
+   * session that actually pays.
+   */
+  premarketLossLimitFraction: number
+  /** Premarket's slice of the daily trade count, for the same reason. */
+  maxPremarketTrades: number
 }
 
 export const DEFAULT_RISK: RiskConfig = {
@@ -31,6 +50,8 @@ export const DEFAULT_RISK: RiskConfig = {
   dailyLossLimitFraction: 0.02,
   maxTradesPerDay: 10,
   maxPositionsPerSymbol: 1,
+  premarketLossLimitFraction: 0.005,   // a quarter of the 2% day budget
+  maxPremarketTrades: 3,
 }
 
 export interface RiskState {
@@ -44,6 +65,16 @@ export interface RiskState {
   closedToday: PaperTrade[]
   /** Operator kill switch — halt file present or HALT=1. */
   halted: boolean
+  /**
+   * The session we are about to trade INTO. Passed in rather than read from a
+   * clock so this module stays pure and the same limits can be replayed.
+   */
+  session: SessionType
+}
+
+/** Trades whose ENTRY filled in premarket — the ones that spend the premarket budget. */
+export function premarketTrades(trades: PaperTrade[]): PaperTrade[] {
+  return trades.filter(t => t.entrySession === 'premarket')
 }
 
 export type RiskDecision =
@@ -93,6 +124,30 @@ export function canOpenPosition(
   const tradesToday = state.closedToday.length + state.openTrades.length
   if (tradesToday >= config.maxTradesPerDay) {
     return { allowed: false, terminal: true, reason: `max trades/day reached (${config.maxTradesPerDay})` }
+  }
+
+  // Premarket's own budget. NOT terminal: exhausting it stands premarket down but
+  // leaves the day's remaining allowance intact for 09:30 onward, which is the
+  // whole point — on 2026-08-10 premarket spent the lot and the open got nothing.
+  if (state.session === 'premarket') {
+    const pmClosed = premarketTrades(state.closedToday)
+    const pmRealized = realizedPnlToday(pmClosed)
+    const pmLimit = -Math.abs(state.startingEquity * config.premarketLossLimitFraction)
+    if (pmRealized <= pmLimit) {
+      return {
+        allowed: false,
+        terminal: false,
+        reason: `premarket loss budget spent: ${pmRealized.toFixed(2)} ≤ ${pmLimit.toFixed(2)} (day budget intact for the open)`,
+      }
+    }
+    const pmCount = pmClosed.length + premarketTrades(state.openTrades).length
+    if (pmCount >= config.maxPremarketTrades) {
+      return {
+        allowed: false,
+        terminal: false,
+        reason: `max premarket trades reached (${config.maxPremarketTrades})`,
+      }
+    }
   }
 
   if (state.openTrades.length >= config.maxConcurrentPositions) {

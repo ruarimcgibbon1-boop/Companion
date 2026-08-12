@@ -102,6 +102,7 @@ describe('canOpenPosition', () => {
   const state = {
     equity: 100_000, startingEquity: 100_000, brokerBlocked: false,
     openTrades: [] as PaperTrade[], closedToday: [] as PaperTrade[], halted: false,
+    session: 'regular' as const,
   }
 
   it('allows a first position inside every limit', () => {
@@ -137,6 +138,47 @@ describe('canOpenPosition', () => {
     // 1400 + 500 = 1900 > 1.5% of 100k
     const d = canOpenPosition('TEST', 500, { ...state, openTrades: open })
     expect(d.allowed).toBe(false)
+  })
+
+  // ── Premarket sub-budget ───────────────────────────────────────────────────
+  // On 2026-08-10 all nine fills were premarket and the DAY limit tripped at 09:21,
+  // nine minutes before the open, locking out the session the replay says pays ~8x
+  // more per trade. Premarket now gets its own slice.
+
+  it('stands premarket down at its own budget, WITHOUT ending the day', () => {
+    // -$600 premarket: past the 0.5% premarket budget, nowhere near the 2% day one.
+    const closed = [trade({ state: 'closed', realizedPnl: -600, entrySession: 'premarket' })]
+    const d = canOpenPosition('TEST', 500, { ...state, session: 'premarket', closedToday: closed })
+    expect(d).toMatchObject({ allowed: false, terminal: false })
+    if (!d.allowed) expect(d.reason).toMatch(/premarket loss budget/)
+  })
+
+  it('still allows the SAME loss to trade at the open — the whole point', () => {
+    const closed = [trade({ state: 'closed', realizedPnl: -600, entrySession: 'premarket' })]
+    expect(canOpenPosition('TEST', 500, { ...state, session: 'regular', closedToday: closed }).allowed).toBe(true)
+  })
+
+  it('counts only premarket-entered trades against the premarket budget', () => {
+    // A regular-hours loss must not stand premarket down the next morning.
+    const closed = [trade({ state: 'closed', realizedPnl: -900, entrySession: 'regular' })]
+    expect(canOpenPosition('TEST', 500, { ...state, session: 'premarket', closedToday: closed }).allowed).toBe(true)
+  })
+
+  it('caps premarket trade COUNT so it cannot spend the day on volume alone', () => {
+    const open = [
+      trade({ symbol: 'A', entrySession: 'premarket', plannedRisk: 1 }),
+      trade({ symbol: 'B', entrySession: 'premarket', plannedRisk: 1 }),
+      trade({ symbol: 'C', entrySession: 'premarket', plannedRisk: 1 }),
+    ]
+    const d = canOpenPosition('TEST', 1, { ...state, session: 'premarket', openTrades: [], closedToday: open })
+    expect(d).toMatchObject({ allowed: false, terminal: false })
+    if (!d.allowed) expect(d.reason).toMatch(/max premarket trades/)
+  })
+
+  it('keeps the day limit terminal even when premarket caused it', () => {
+    const closed = [trade({ state: 'closed', realizedPnl: -2_100, entrySession: 'premarket' })]
+    const d = canOpenPosition('TEST', 500, { ...state, session: 'regular', closedToday: closed })
+    expect(d).toMatchObject({ allowed: false, terminal: true })
   })
 
   it('sums realized P&L and open risk', () => {

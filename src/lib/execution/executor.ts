@@ -224,6 +224,7 @@ export class PaperExecutor {
       openTrades: this.openTrades(),
       closedToday: this.closedToday(),
       halted: isHalted(),
+      session: getSessionType(Date.now()),
     }, this.config.risk)
 
     if (!verdict.allowed) {
@@ -382,6 +383,8 @@ export class PaperExecutor {
 
   private bookEntryFill(trade: PaperTrade, qty: number, price: number, now: number): void {
     trade.state = 'open'
+    // Which session we got filled in decides which risk budget this trade spends.
+    trade.entrySession = getSessionType(now)
     trade.entryFillQty = qty
     trade.entryFillPrice = price
     trade.entryFilledAt = now
