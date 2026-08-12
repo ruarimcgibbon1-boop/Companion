@@ -10,7 +10,7 @@
  */
 
 import type { Candle, SetupLog, BuySignalRecord } from '@/types'
-import { getSessionType, type SessionType } from './market-hours'
+import { getSessionType, parseEtTimestampSec, type SessionType } from './market-hours'
 
 // ── Day helpers ──────────────────────────────────────────────────────────────
 
@@ -39,10 +39,14 @@ export function normalizeCandles(raw: unknown): Candle[] {
   for (const c of raw) {
     if (!c || typeof c !== 'object') continue
     const o = c as Record<string, unknown>
+    // `date` is an ET wall-clock string with no zone. Parsing it with `new Date()`
+    // resolved it in the HOST timezone, so on a non-ET machine every candle landed
+    // hours off (Europe/Madrid: 6 hours early — a 09:35 ET bar read as 03:35, which
+    // `sameEtDay` then matched to the WRONG DAY). See parseEtTimestamp.
     const time = typeof o.time === 'number'
       ? o.time
       : typeof o.date === 'string'
-      ? Math.floor(new Date(o.date).getTime() / 1000)
+      ? parseEtTimestampSec(o.date)
       : NaN
     if (!Number.isFinite(time)) continue
     out.push({

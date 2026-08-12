@@ -1,13 +1,14 @@
 import { NextResponse } from 'next/server'
-import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getPressReleases, getFloatShares, getDailyCandles, getExtendedIntradayCandles } from '@/lib/fmp-client'
+import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getPressReleases, getFloatShares, getDailyCandles, getExtendedIntradayCandles, getIntradayCandles } from '@/lib/fmp-client'
 import { getYFQuote, getYFScreener, getYFTrending, getYFCandles } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
 import { processNews, getBestCatalystSummary } from '@/lib/news-engine'
 import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
-import { getSessionType, isPremarket } from '@/lib/market-hours'
+import { getSessionType, isPremarket, parseEtTimestampSec } from '@/lib/market-hours'
 import { sessionFractionElapsed } from '@/lib/technical'
 import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-volume'
 import { getWebullGainers, type WebullRankType } from '@/lib/webull-client'
+import { readMomentum, compareByMomentum } from '@/lib/momentum-rank'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -99,6 +100,42 @@ async function backfillRelativeVolume(rows: ScannerRow[], inPremarket: boolean):
     const recent = daily.slice(-20)
     const avgVol = recent.reduce((s, c) => s + c.volume, 0) / recent.length
     if (avgVol > 0) r.relativeVolume = r.volume / (avgVol * scannerSessionFraction())
+  }))
+}
+
+/**
+ * How wide a candidate pool the momentum pass re-ranks. Day-change order is the
+ * thing we're correcting, so the pool must be big enough to contain names that are
+ * mid-leg but not yet near the top of the day-change list.
+ */
+const MOMENTUM_POOL_SIZE = 60
+
+/**
+ * Attach the "is it moving NOW" reading to each candidate.
+ *
+ * Shares the 5-min candle cache with the monitor, so this doesn't double-hit the
+ * feed. Fails OPEN per row: a name whose tape we can't fetch keeps a null score and
+ * falls back to day-change ordering rather than being buried for missing data.
+ */
+async function attachMomentum(rows: ScannerRow[], inPremarket: boolean): Promise<void> {
+  const now = Date.now()
+  await Promise.allSettled(rows.map(async r => {
+    try {
+      // Premarket needs the extended feed; regular hours the ordinary 5-min tape.
+      const candles = inPremarket
+        ? await cached(`xcandles5m:${r.symbol}`, TTL.CANDLES_5M, () => getExtendedIntradayCandles(r.symbol))
+        : await cached(`candles5m:${r.symbol}`, TTL.CANDLES_5M, () => getIntradayCandles(r.symbol, '5min'))
+      const normalized = candles.map(c => ({
+        time: parseEtTimestampSec(c.date),
+        open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+      })).filter(c => Number.isFinite(c.time))
+      const m = readMomentum(normalized, r.price, now)
+      r.rocPct = m.rocPct
+      r.offHighPct = m.offHighPct
+      r.momentumScore = m.score
+    } catch {
+      r.momentumScore = null   // fail open — ranked on day change instead
+    }
   }))
 }
 
@@ -433,9 +470,20 @@ export async function GET(request: Request) {
         } as ScannerRow
       })
       .filter((r): r is NonNullable<typeof r> => r !== null)
+      // Pre-rank on day change only to pick a CANDIDATE POOL — deliberately wider
+      // than maxResults, because the whole point of the momentum pass below is that
+      // day-change order is wrong. A name mid-leg can sit well down this list.
       .sort((a, b) => b.changePct - a.changePct)
-      .slice(0, filters.maxResults)
-      .map((r, i) => ({ ...r, rank: i + 1 }))
+      .slice(0, MOMENTUM_POOL_SIZE)
+
+    // Re-rank on how each name is moving NOW. See momentum-rank.ts: ranking by
+    // change-from-close surfaces names AFTER their move, at which point the
+    // anti-fade gate correctly refuses them — 9 of 12 top gainers on 2026-08-12
+    // were already >5% off their session high, and 46 setups on them triggered 0.
+    await attachMomentum(rows, inPremarket)
+    rows.sort(compareByMomentum)
+    rows.splice(filters.maxResults)
+    rows.forEach((r, i) => { r.rank = i + 1 })
 
     // RVOL backfill for the ranked rows only — before badges, which read it.
     await backfillRelativeVolume(rows, inPremarket)
