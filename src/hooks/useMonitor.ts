@@ -169,15 +169,39 @@ function ensureLog(setup: DetectedSetup, price: number, session: string, now: nu
   }
 }
 
-function updateLog(log: SetupLog, setup: DetectedSetup, rec: SetupStateRecord, price: number, now: number): SetupLog {
+/**
+ * Advance a setup log with the latest price.
+ *
+ * A RESOLVED log is frozen: once the stop or T1 is hit, its result fields stop
+ * moving. Without this the excursion metrics kept ratcheting on every later sweep,
+ * so a stopped-out trade on a name that then ran showed a huge maxFavorablePct and
+ * read at review time like a missed winner rather than a loss (2026-08-13: FGI
+ * stopped at −6.5% and then ran ~100%, which would have logged a ~100% MFE against
+ * a trade we were never in). The trade is over; what price did afterwards is not
+ * part of its record.
+ *
+ * The resolving sweep itself still counts — `favor`/`adverse` include the bar that
+ * triggered the exit, matching eod-resolver, which walks up to and including the
+ * stop bar before breaking. Only LATER sweeps are ignored.
+ */
+export function updateLog(log: SetupLog, setup: DetectedSetup, rec: SetupStateRecord, price: number, now: number): SetupLog {
+  // Already resolved on entry → freeze everything but the state trail.
+  if (log.outcome !== 'open') {
+    const seen = log.statesReached.includes(rec.state)
+      ? log.statesReached
+      : [...log.statesReached, rec.state]
+    return seen === log.statesReached ? log : { ...log, statesReached: seen }
+  }
   const dir = setup.direction === 'long' ? 1 : -1
   const favor = dir === 1 ? Math.max(log.maxFavorablePrice, price) : Math.min(log.maxFavorablePrice, price)
   const adverse = dir === 1 ? Math.min(log.maxAdversePrice, price) : Math.max(log.maxAdversePrice, price)
   const base = log.priceAtIdentification || price
   const statesReached = log.statesReached.includes(rec.state) ? log.statesReached : [...log.statesReached, rec.state]
 
-  let outcome = log.outcome
-  let outcomeReason = log.outcomeReason
+  // Explicitly typed: the early return above narrows log.outcome to 'open', so an
+  // inferred type would reject the assignments below.
+  let outcome: SetupLog['outcome'] = log.outcome
+  let outcomeReason: SetupLog['outcomeReason'] = log.outcomeReason
   let resolvedAt = log.resolvedAt
   let triggeredAt = log.triggeredAt
 
