@@ -316,7 +316,36 @@ export function spaceToNextSupply(
   }
 }
 
-const MIN_T1_REWARD_R = 0.8
+// T1's distance from the fill, as a multiple of risk. Swept 2026-08-12 — see below.
+//
+// At 0.8 the first target lands ~1R away, half books there, ~1% round-trip friction
+// takes a third of that, and the breakeven stop then strangles the runner. Result on
+// 2026-08-13: 11 winners averaging +0.64R against 10 losers at -1.20R, which needs a
+// 65% win rate to break even. We got 52%.
+//
+// FGI is the case in one row: entry 8.30, T1 8.70 (+4.8%, ~1R), stock ran ~100%.
+// We booked +1.06R. The stop was right; the target was not.
+// Swept on the 20-day replay 2026-08-12 (with cull 4 + SPACE 0.5R + stop floor):
+//   0.8   92 signals  4.8/day  43% win  +0.549R  net  +50.5R
+//   1.5  117          6.2      43%      +0.565R  net  +66.1R
+//   2.0  124          6.5      43%      +0.757R  net  +93.9R   <- shipped
+//   2.5  127          6.7      41%      +0.819R  net +104.0R
+//
+// Decomposed 0.8 -> 2.0, in R — the first change this week where every component
+// agrees rather than the headline riding on lucky backfills:
+//   the SAME 83 trades   +51.7R -> +65.1R  (win 46%->44%: pay accuracy, gain size)
+//   42 NEW (were R/R-gated)      +28.8R    avg +0.685R, in line with the book
+//   9 DROPPED                     -1.2R    correctly removed
+// The new trades were never bad — they were badly TARGETED. A near T1 made their
+// rated R/R fail the bestRR>=1.5 gate.
+//
+// 2.5 scores higher and is deliberately NOT taken. The curve is monotonic across
+// the whole range, so that is the edge of the test range rather than an optimum,
+// and two biases grow with the threshold: the scale-out model marks unsold
+// remainder to the CLOSE (wider targets => more mark-to-close, which flatters),
+// and the synthetic +10% runner leg substitutes for a real level more often
+// (4% of signals at 2.0, 7% at 2.5). Re-sweep past 2.5 before going further.
+const MIN_T1_REWARD_R = envNum('MIN_T1_REWARD_R', 2.0)
 const MIN_T1_REWARD_PCT = 0.02
 const MIN_T1_REWARD_ATR_MULT = 1.0
 // Targets that sit on top of each other are one target wearing three hats — the
