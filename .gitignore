@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Daily trade-log exports (data inputs, not source — resolved via scripts/research.ts)
+data/buy-signals-*.csv
+data/pattern-log-*.csv
