@@ -9,7 +9,7 @@
  * refused.
  */
 import { describe, it, expect } from 'vitest'
-import { spaceToNextSupply, closedAboveLevel } from '../src/lib/setup-detectors'
+import { spaceToNextSupply, closedAboveLevel, acceptedAbove } from '../src/lib/setup-detectors'
 import type { KeyLevel } from '../src/types'
 
 function level(midpoint: number, strength: number): KeyLevel {
@@ -111,5 +111,34 @@ describe('closedAboveLevel — acceptance', () => {
 
   it('passes on a nonsense level rather than vetoing every setup', () => {
     expect(closedAboveLevel([bar(9.5)], 0, 1)).toBe(true)
+  })
+})
+
+describe('acceptedAbove — drops the forming bar', () => {
+  // A bar whose close is the given price; the LAST element is the forming bar
+  // (its close = current price), exactly as the detectors see it live.
+  const bar = (close: number) => ({ time: 0, open: close, high: close, low: close, close, volume: 1 })
+
+  it('REFUSES a wick even though the forming bar is above the level', () => {
+    // The failed-breakout buy: prior completed bar closed 9.9 (below 10), the
+    // forming bar is printing 10.2 above it. The trigger fires on that print;
+    // acceptance must still refuse it, because no completed bar closed above.
+    expect(acceptedAbove([bar(9.9), bar(10.2)], 10, 1)).toBe(false)
+  })
+
+  it('accepts once a COMPLETED bar has closed above, forming bar aside', () => {
+    // Prior bar closed 10.2 (accepted); forming bar now printing 10.4.
+    expect(acceptedAbove([bar(9.8), bar(10.2), bar(10.4)], 10, 1)).toBe(true)
+  })
+
+  it('is a no-op at 0 bars — the pre-2026-08-15 default', () => {
+    expect(acceptedAbove([bar(9.9), bar(10.2)], 10, 0)).toBe(true)
+  })
+
+  it('fails OPEN with only a forming bar and nothing completed', () => {
+    // <2 bars: after dropping the forming one there is nothing to judge, so never
+    // block — the session-open case, consistent with the fail-open rule.
+    expect(acceptedAbove([bar(10.2)], 10, 1)).toBe(true)
+    expect(acceptedAbove([], 10, 1)).toBe(true)
   })
 })

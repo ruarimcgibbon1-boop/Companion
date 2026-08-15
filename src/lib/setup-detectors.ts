@@ -261,11 +261,18 @@ const SPACE_LEVEL_MIN_STRENGTH = 45
 // stopped out INSIDE the bar they entered while the names went on to run (CELZ
 // +37.6% the same day). That is the failed-breakout wick, bought.
 //
-// DEFAULT OFF. This changes which setups can trigger at all, so it is swept on the
-// replay before shipping — though note a replay fills at the level and models no
-// spread, so it will UNDERSTATE the benefit of refusing to buy overshoot.
-//   ACCEPTANCE_BARS=1 npx tsx scripts/backtest.ts
-const ACCEPTANCE_BARS = envNum('ACCEPTANCE_BARS', 0)
+// ENABLED at 1 on 2026-08-15 on LIVE evidence, not the replay. Two independent
+// live samples show the entry-bar death this targets: 12 of 18 executed paper
+// trades (2026-08-07/08-10) and 6 of 9 signals on 2026-08-14 stopped out INSIDE
+// their entry bar, MFE 0.00R — bought the wick, price failed back, then in the
+// clearest cases ran without us (ONFO +53.6%, VWAV +34.4% after stopping us out
+// on 08-14). Critically this survived the 2026-08-12 timezone fix, so the clock
+// was NOT its cause.
+//
+// The replay cannot judge this: it fills on a completed-bar close and so never
+// buys the wick in the first place. That is exactly why it ships on live evidence
+// and off by env (ACCEPTANCE_BARS=0) rather than a backtest verdict.
+const ACCEPTANCE_BARS = envNum('ACCEPTANCE_BARS', 1)
 
 /**
  * Has the market closed above `level` on the last `bars` candles?
@@ -282,6 +289,28 @@ export function closedAboveLevel(candles: Candle[], level: number, bars: number)
   const recent = lastN(candles, bars)
   if (recent.length < bars) return true
   return recent.every(c => c.close > level)
+}
+
+/**
+ * Genuine acceptance above `level`, for the trigger gate.
+ *
+ * THE SUBTLETY THAT MAKES OR BREAKS THIS: every trigger already keys on
+ * `candles[candles.length - 1].close > level` (the "lastCandle" in each detector).
+ * LIVE, that last element is the FORMING 5-min bar, whose `close` is the current
+ * print — so a mid-bar wick through the level fires the trigger, and re-checking
+ * that same bar would just re-confirm the wick. That is the failed-breakout buy.
+ *
+ * So acceptance must look at the last COMPLETED bar — we drop the forming bar
+ * before checking. With bars=1 that means: a full bar has closed above the level,
+ * not merely that price is above it right now.
+ *
+ * (In the replay the "current" bar is a completed historical bar, so this asks for
+ * TWO consecutive completed closes there — stricter, but coherent. The replay
+ * cannot see the wick problem anyway; it always fills on a completed-bar close.)
+ */
+export function acceptedAbove(candles: Candle[], level: number, bars: number): boolean {
+  if (bars <= 0) return true
+  return closedAboveLevel(candles.slice(0, -1), level, bars)
 }
 
 export interface SpaceRead {
@@ -902,12 +931,15 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // which is exactly how a no-room setup used to look tradeable.
   const space = spaceToNextSupply(levels, entryFill, riskDist, direction)
   const noRoom = space.r != null && space.r < MIN_SPACE_R
-  // ACCEPTANCE: a print through the level is not a breakout. Strength entries only
-  // — a bounce is not claiming acceptance above anything. Default off; see above.
-  const unaccepted = direction === 'long' && STRENGTH_ENTRY_TYPES.includes(type) &&
-    !closedAboveLevel(ctx.candles, zoneUpper, ACCEPTANCE_BARS)
   const vetoed = (args.vetoTrigger?.active ?? false) || fadedChase || lateInLeg ||
-    unconfirmed || quarantined || noRoom || unaccepted
+    unconfirmed || quarantined || noRoom
+  // ACCEPTANCE gates the TRIGGER, not quality. An un-accepted break has not really
+  // triggered — a wick through the level is not a breakout — so it reads as
+  // at_level, NOT as triggered-then-vetoed. Kept out of `vetoed`/`qualityVetoed`,
+  // which stay reserved for genuine quality problems (fade, rollover, no room).
+  // Strength entries only; a bounce claims acceptance above nothing.
+  const unaccepted = direction === 'long' && STRENGTH_ENTRY_TYPES.includes(type) &&
+    !acceptedAbove(ctx.candles, zoneUpper, ACCEPTANCE_BARS)
   // An over-extended long bounce is a chase, not a fillable trigger — drop it
   // entirely. The cap widens for a strength entry on a genuine runner (see
   // maxTriggerExtension) so the day's top gainers aren't refused for running fast.
@@ -915,7 +947,7 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   const extended = direction === 'long'
     ? price > zoneUpper * (1 + maxExt)
     : price < zoneLower * (1 - maxExt)
-  const rawTrigger = args.triggered && !extended
+  const rawTrigger = args.triggered && !extended && !unaccepted
   const inZone = price >= zoneLower && price <= zoneUpper
   let state: SetupState
   if (rawTrigger && !vetoed) state = 'triggered'

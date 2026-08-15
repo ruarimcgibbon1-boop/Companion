@@ -329,7 +329,9 @@ describe('confirmation-candle entry (buy the new high, not the dip)', () => {
 
 describe('opening-range break / gap-and-go', () => {
   // Rising into a fresh HOD with an expanding final bar (session: or15High 5.0, premarketHigh 5.1).
-  const orb = bars([4.88, 4.9, 4.95, 5.0, 5.05, 5.1, 5.15]).map((c, i, a) =>
+  // The second-to-last bar closes 5.12 — a COMPLETED close above the 5.1 break level, so the
+  // acceptance gate (added 2026-08-15) is satisfied: this is a held break, not a forming-bar wick.
+  const orb = bars([4.88, 4.9, 4.95, 5.0, 5.05, 5.12, 5.15]).map((c, i, a) =>
     i === a.length - 1 ? { ...c, volume: 350_000 } : c)
 
   it('fires a triggered opening_range_break when a green name breaks the range above VWAP on volume', () => {
@@ -337,6 +339,17 @@ describe('opening-range break / gap-and-go', () => {
     const s = setups.find(x => x.type === 'opening_range_break')
     expect(s).toBeTruthy()
     expect(s!.triggeredRaw).toBe(true)
+  })
+  it('does NOT trigger on a forming-bar wick — only the last bar broke the level (acceptance)', () => {
+    // Every COMPLETED bar is below the 5.1 break level; only the forming bar's
+    // close (5.15) pokes above it. That is the failed-breakout wick the acceptance
+    // gate exists to refuse: the break has not been held for a full bar.
+    const wick = bars([4.80, 4.85, 4.90, 4.95, 5.00, 5.05, 5.15]).map((c, i, a) =>
+      i === a.length - 1 ? { ...c, volume: 350_000 } : c)
+    const s = detectSetups(ctx(wick, 5.15, { changePct: 6, technical: technical({ trend5m: 'up' }) }))
+      .find(x => x.type === 'opening_range_break')
+    // The setup still exists as a watch, it just has not TRIGGERED.
+    if (s) expect(s.triggeredRaw).toBe(false)
   })
   it('does NOT fire once price has lost VWAP (a fade, not a go)', () => {
     // same tape but VWAP anchored above the quote — price has lost VWAP
