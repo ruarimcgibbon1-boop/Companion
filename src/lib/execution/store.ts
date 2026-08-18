@@ -40,10 +40,32 @@ export function isHalted(): boolean {
   return process.env.HALT === '1' || existsSync(haltFile())
 }
 
+// A trade persisted by an earlier build can be missing collection fields added
+// since (executionWarnings landed after FIGR opened 2026-08-17). Hydrating them as
+// undefined makes the first `.push` in manage/reconcile throw ("Cannot read
+// properties of undefined (reading 'push')"), and because it's caught per-trade
+// that position is then silently skipped every tick and never recovers. Default
+// every collection on load so no future field addition can strand an open trade.
+function normalizeTrade(t: PaperTrade): PaperTrade {
+  return {
+    ...t,
+    exits: t.exits ?? [],
+    notes: t.notes ?? [],
+    executionWarnings: t.executionWarnings ?? [],
+    targets: t.targets ?? [],
+    // Older records predate reconciliation; default to 'pending' so the reconcile
+    // loop actually picks them up (FIGR hydrated with a null status and would
+    // otherwise never promote to verified or force-flat).
+    reconciliationStatus: t.reconciliationStatus ?? 'pending',
+  }
+}
+
 export function loadTrades(day = etDayKey()): PaperTrade[] {
   const file = tradesFile(day)
   try {
-    return existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as PaperTrade[]) : []
+    if (!existsSync(file)) return []
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as PaperTrade[]
+    return Array.isArray(parsed) ? parsed.map(normalizeTrade) : []
   } catch {
     return []
   }
