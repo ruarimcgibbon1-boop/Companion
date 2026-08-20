@@ -62,7 +62,7 @@ describe('observer activation — passive, isolated, clean lifecycle', () => {
   it('starts when enabled and, with a HELD position, passes it into observation', async () => {
     const feed = new CountingFeed()
     const t = timers()
-    const loop = makeObserverLoop(heldSource([trade({})]), feed, { session: () => 'premarket', deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
+    const loop = makeObserverLoop(heldSource([trade({})]), feed, { record: () => {}, session: () => 'premarket', deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
     loop.start()
     expect(t.loopCount()).toBe(1)      // an interval was registered (observer running)
     t.tickLoop(); await flush()
@@ -73,7 +73,7 @@ describe('observer activation — passive, isolated, clean lifecycle', () => {
   it('NO held positions ⇒ ZERO market-data calls', async () => {
     const feed = new CountingFeed()
     const t = timers()
-    const loop = makeObserverLoop(heldSource([]), feed, { deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
+    const loop = makeObserverLoop(heldSource([]), feed, { record: () => {}, deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
     loop.start(); t.tickLoop(); await flush()
     expect(feed.calls).toBe(0)
     expect(loop.stats.dispatched).toBe(0)
@@ -82,7 +82,7 @@ describe('observer activation — passive, isolated, clean lifecycle', () => {
   it('observer timeout/failure does not block or alter the normal daemon path', async () => {
     const feed = new CountingFeed(); feed.hang = true
     const t = timers()
-    const loop = makeObserverLoop(heldSource([trade({})]), feed, { deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
+    const loop = makeObserverLoop(heldSource([trade({})]), feed, { record: () => {}, deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
     // Model the daemon's own path running concurrently, with no reference to the loop.
     let daemonTicks = 0
     const daemonPath = async () => { daemonTicks++ }
@@ -97,7 +97,7 @@ describe('observer activation — passive, isolated, clean lifecycle', () => {
   it('SHUTDOWN aborts in-flight reads and clears the interval — no dangling work', async () => {
     const feed = new CountingFeed(); feed.hang = true
     const t = timers()
-    const loop = makeObserverLoop(heldSource([trade({})]), feed, { deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
+    const loop = makeObserverLoop(heldSource([trade({})]), feed, { record: () => {}, deps: { setTimer: t.setTimer, setLoop: t.setLoop } })
     loop.start(); t.tickLoop(); await flush()
     expect(loop.inFlightSymbols()).toEqual(['UUU'])
     expect(feed.active).toBe(1)
@@ -129,7 +129,7 @@ describe('observer activation — passive, isolated, clean lifecycle', () => {
   })
 
   it('runs on its OWN cadence, independent of the position loop', () => {
-    const loop = makeObserverLoop(heldSource([]), new CountingFeed(), { cadenceMs: 2_000 })
+    const loop = makeObserverLoop(heldSource([]), new CountingFeed(), { record: () => {}, cadenceMs: 2_000 })
     // The loop was constructed with its own cadence; it does not read POSITION_MS.
     expect(loop).toBeDefined()
     // (Cadence independence is structural: makeObserverLoop never imports the daemon's
