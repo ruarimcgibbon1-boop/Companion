@@ -28,7 +28,10 @@ import { getSessionType } from '@/lib/market-hours'
 import { loadEnvLocal } from '@/lib/execution/env'
 import { AlpacaBroker } from '@/lib/execution/alpaca'
 import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
-import { isHalted, haltFile } from '@/lib/execution/store'
+import { isHalted, haltFile, etDayKey, decisionsFile } from '@/lib/execution/store'
+import { AlpacaMarketData } from '@/lib/execution/execution-quality'
+import { makeObserverLoop } from '@/lib/execution/observer-wiring'
+import type { ObserverLoop } from '@/lib/execution/observer-loop'
 
 loadEnvLocal()   // ALPACA_* live here; the daemon has no Next runtime to load them
 
@@ -36,6 +39,10 @@ const BASE = process.env.COMPANION_URL || 'http://localhost:3000'
 const DRY_RUN = process.env.DRY_RUN === '1'   // log alerts instead of sending them
 const ONCE = process.env.ONCE === '1'         // run a single sweep then exit (testing)
 const PAPER_TRADE = process.env.PAPER_TRADE === '1'
+// Passive execution-quality observer — opt-in, OFF by default so the daemon's
+// behaviour is byte-for-byte unchanged unless explicitly enabled. Read-only: it
+// witnesses open positions on an independent feed and writes only the EQ timeline.
+const EXEC_OBSERVER = process.env.EXEC_OBSERVER === '1'
 const SWEEP_MS = 15_000                 // active-session cadence (matches the client)
 const IDLE_MS = 5 * 60_000              // slow poll when the market is closed
 // Position management runs on its OWN loop, not inside the sweep.
@@ -59,7 +66,12 @@ const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
 // audit trail: at end of day you can answer "did we miss X?" from data instead of
 // memory — including the NEAR-MISSES (triggered but gated), which the terminal
 // output never showed. One line per triggered setup per sweep-first-sighting.
-const DECISION_LOG = join(homedir(), `.companion-decisions-${new Date().toISOString().slice(0, 10)}.jsonl`)
+// Keyed on the ET TRADING day, not the UTC calendar day, and the file is chosen at
+// APPEND TIME from the decision's own timestamp (decisionsFile(etDayKey(now))) — NOT
+// once at startup. A daemon running continuously across ET midnight therefore rolls
+// to the new day's file on its own, and a decision after 20:00 ET (= 00:00Z) never
+// spills into the wrong UTC day. etDayKey matches the paper-trades files so
+// decisions and trades for one session always share a date.
 
 const HEARTBEAT_MS = 5 * 60_000         // "still alive" line when nothing is triggering
 let lastHeartbeat = 0
@@ -78,11 +90,12 @@ function saveBuys(buys: BuySignalRecord[]) {
 // Record each triggered setup's verdict once (a setup persists across sweeps, so
 // key on setup id + verdict to avoid one line every 15s).
 const seenDecisions = new Set<string>()
-function recordDecision(row: Record<string, unknown>) {
+function recordDecision(row: Record<string, unknown>, now: number = Date.now()) {
   const key = `${row.setupId}:${row.verdict}`
   if (seenDecisions.has(key)) return
   seenDecisions.add(key)
-  try { appendFileSync(DECISION_LOG, JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
+  // Path derived from the decision's ET day AT APPEND TIME — rotates across ET midnight.
+  try { appendFileSync(decisionsFile(etDayKey(now)), JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
 }
 
 async function fetchUniverse(): Promise<string[]> {
@@ -163,7 +176,10 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
         fill: setup.entryFill ?? setup.zoneUpper,
         rvol: r.relativeVolume, offHighPct: r.technicals?.distanceFromDayHighPct ?? null,
         session: r.integrity.session, price: r.price,
-      })
+        // Additive signal-time geometry for the Shadow Journal (src/lib/research/shadow-journal.ts).
+        // Logging only — every field is already known at detection; nothing here changes a decision.
+        stop: setup.stopReference, targets: setup.targets.map(t => t.price), entryRef: setup.entryFill ?? setup.zoneUpper,
+      }, now)
       if (verdict === 'logged' && buy) {
         state = [...state, buy]
         const tag = `${buy.symbol} ${buy.setupType} @ ${buy.entryHigh} (grade ${buy.grade}, rvol ${buy.ctxRelVol?.toFixed(0) ?? '—'}×)`
@@ -210,7 +226,7 @@ async function buildExecutor(): Promise<PaperExecutor | null> {
 
 async function main() {
   log(`alert-daemon starting → ${BASE}${DRY_RUN ? ' [DRY_RUN]' : ''}${ONCE ? ' [ONCE]' : ''}${PAPER_TRADE ? ' [PAPER_TRADE]' : ''}`)
-  log(`decisions → ${DECISION_LOG}`)
+  log(`decisions → ${decisionsFile(etDayKey())} (rotates by ET day at append time)`)
 
   let executor: PaperExecutor | null = null
   try {
@@ -222,6 +238,23 @@ async function main() {
     process.exit(1)
   }
 
+  // Passive observer — a SEPARATE, read-only lifecycle. It only runs with paper
+  // trading (so there are positions to witness) and Alpaca creds, and only when
+  // explicitly enabled. It never feeds back into any trading decision; a failure
+  // here cannot crash, block, or delay the executor/alert path. Construction is
+  // guarded so a missing feed simply means no observer, never a daemon failure.
+  let observerLoop: ObserverLoop | null = null
+  if (EXEC_OBSERVER && PAPER_TRADE && executor && !ONCE) {
+    try {
+      observerLoop = makeObserverLoop(executor, new AlpacaMarketData())
+      log('execution-quality observer: ENABLED (passive, read-only)')
+    } catch (e) {
+      // No observer is a non-event — the trading path is entirely unaffected.
+      log('execution-quality observer: disabled —', (e as Error).message)
+      observerLoop = null
+    }
+  }
+
   // Exiting with shares outstanding leaves paper positions unmanaged and pollutes
   // the day's stats, so flatten on the way out rather than just dropping the loop.
   let shuttingDown = false
@@ -229,6 +262,7 @@ async function main() {
     if (shuttingDown) return
     shuttingDown = true
     log(`${signal} — shutting down`)
+    observerLoop?.stop()   // clear its interval + abort in-flight reads before we exit
     if (executor) {
       await executor.flattenAll('risk_halt').catch(e => log('flatten failed:', (e as Error).message))
       log('paper session summary:\n' + executor.summary())
@@ -237,6 +271,9 @@ async function main() {
   }
   process.on('SIGINT', () => { void shutdown('SIGINT') })
   process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+
+  // Start the observer on its OWN cadence, independent of the sweep/position loops.
+  observerLoop?.start()
 
   // Position loop — deliberately separate from the sweep so an exit never waits
   // behind a universe scan. Sequential by construction, so ticks can't overlap.

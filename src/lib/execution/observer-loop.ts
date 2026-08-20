@@ -45,7 +45,9 @@ export interface ObserverLoopDeps {
 export class ObserverLoop {
   private readonly inFlight = new Set<string>()   // by symbol — the one-per-symbol guard
   private readonly tracked = new Map<string, string>()  // symbol → tradeId currently observed
+  private readonly controllers = new Set<AbortController>()  // live requests, so stop() can abort them
   private cancelLoop: (() => void) | null = null
+  private stopped = false
   private readonly setTimer: (cb: () => void, ms: number) => () => void
   private readonly setLoop: (cb: () => void, ms: number) => () => void
   readonly stats: ObserverLoopStats = {
@@ -65,13 +67,19 @@ export class ObserverLoop {
 
   /** Begin sampling on the loop's own cadence. Idempotent. */
   start(): void {
-    if (this.cancelLoop) return
+    if (this.cancelLoop || this.stopped) return
     this.cancelLoop = this.setLoop(() => { void this.runRound() }, this.opts.cadenceMs)
   }
 
-  /** Stop sampling. In-flight samples are left to settle harmlessly (they only read + log). */
+  /**
+   * Stop sampling cleanly: clear the interval, abort every in-flight request (so no
+   * dangling fetch outlives shutdown), and refuse further dispatches. Idempotent.
+   */
   stop(): void {
+    this.stopped = true
     if (this.cancelLoop) { this.cancelLoop(); this.cancelLoop = null }
+    for (const c of this.controllers) c.abort()
+    // Each aborted request settles and clears itself from `controllers`/`inFlight`.
   }
 
   /**
@@ -80,6 +88,7 @@ export class ObserverLoop {
    * immediately — it never awaits the dispatches, so it cannot back-pressure.
    */
   async runRound(): Promise<void> {
+    if (this.stopped) return
     this.stats.rounds++
     const held = this.heldContexts()
     const heldSymbols = new Set(held.map(c => c.symbol))
@@ -116,6 +125,7 @@ export class ObserverLoop {
     this.inFlight.add(symbol)
     this.stats.dispatched++
     const controller = new AbortController()
+    this.controllers.add(controller)
     let timedOut = false
     const cancelTimeout = this.setTimer(() => {
       timedOut = true
@@ -128,6 +138,7 @@ export class ObserverLoop {
       .catch(() => { this.stats.errors++ })
       .finally(() => {
         cancelTimeout()
+        this.controllers.delete(controller)
         this.inFlight.delete(symbol)   // released only now — after the real request has settled
       })
   }
