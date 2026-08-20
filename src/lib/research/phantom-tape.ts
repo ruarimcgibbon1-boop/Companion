@@ -6,11 +6,17 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
+import { createHash } from 'crypto'
 import type { Candle } from '@/types'
 import { etStrToUnixSec } from '@/lib/replay-day'
 
 export interface RawFmpRow { date: string; open: number; high: number; low: number; close: number; volume?: number }
 export type TapeSource = 'cache' | 'network' | 'missing'
+
+/** SHA-256 of exact source content, so a report records the immutable snapshot it ran on. */
+export function sha256(text: string): string {
+  return createHash('sha256').update(text).digest('hex')
+}
 
 /** FMP rows (ET wall-time strings) → Candle[] (unix-sec, ET-correct via replay-day's parser). */
 export function normalizeFmpRows(rows: RawFmpRow[]): Candle[] {

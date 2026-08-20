@@ -4,15 +4,16 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import type { Candle } from '@/types'
 import { etStrToUnixSec } from '@/lib/replay-day'
-import { buildShadowCandidates, type DecisionLogRow, type ShadowCandidate } from '@/lib/research/shadow-journal'
+import { buildShadowCandidates, rejectionLayer, type DecisionLogRow, type ShadowCandidate } from '@/lib/research/shadow-journal'
 import {
   classifyCandidate,
+  operativeLayerOf,
   resolveWithFlatten,
   buildBooks,
   tapeState,
   type PhantomRow,
 } from '@/lib/research/phantom-book'
-import { loadTape } from '@/lib/research/phantom-tape'
+import { loadTape, sha256 } from '@/lib/research/phantom-tape'
 
 const FLATTEN = 15 * 60 + 55 // 955 — DEFAULT_EXECUTOR.flattenEtMinute
 const DAY = '2026-08-20'
@@ -172,6 +173,79 @@ describe('tape provenance labelling', () => {
     const now = tsOf('12:00:00')
     expect(tapeState('2026-08-20', now)).toBe('PROVISIONAL')
     expect(tapeState('2026-08-19', now)).toBe('FINAL')
+  })
+})
+
+describe('post-flatten session semantics', () => {
+  it('classifies a signal fired at/after 15:55 as post_flatten and excludes it from the primary phantom aggregates', () => {
+    const late = cand({ signalTs: tsOf('16:00:00'), setupId: 'LATE:breakout:1', terminalVerdict: 'session' })
+    expect(classifyCandidate(late, new Set(), FLATTEN)).toBe('post_flatten')
+
+    const winBar = [bar('09:35:00', 100, 111, 99, 110)]
+    const rows: PhantomRow[] = [
+      { candidate: late, klass: 'post_flatten', outcome: resolveWithFlatten(late, [], FLATTEN), actualR: null, hasTarget: true },
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'OK:breakout:2' }), 'phantom_primary', winBar),
+    ]
+    const books = buildBooks(rows)
+    expect(books.counts.postFlatten).toBe(1)
+    expect(books.counts.phantomPrimary).toBe(1)      // the post-flatten one is NOT counted
+    expect(books.idealPhantom.n).toBe(1)              // and NOT in the R aggregate
+    expect(books.counts.noFill).toBe(0)               // nor in the no-fill rate
+    expect(books.postFlatten).toHaveLength(1)         // still visible in the raw bucket
+  })
+
+  it('keeps a session-gated candidate that fired strictly BEFORE 15:55 evaluable as a normal phantom', () => {
+    const early = cand({ signalTs: tsOf('15:54:00'), setupId: 'EARLY:breakout:1', terminalVerdict: 'session' })
+    expect(classifyCandidate(early, new Set(), FLATTEN)).toBe('phantom_primary')
+  })
+})
+
+describe('acceptance is never relabelled by a later decision row', () => {
+  it('an opened trade whose day ended on a dup/veto row reads accepted, with the dup kept only as audit metadata', () => {
+    const c = cand({ signalTs: tsOf('06:20'), setupId: 'GDXU:bos:1', terminalVerdict: 'dup', everAccepted: false })
+    const klass = classifyCandidate(c, new Set(['GDXU:bos:1']), FLATTEN)
+    expect(klass).toBe('accepted')
+    expect(operativeLayerOf(klass, c.terminalVerdict)).toBe('accepted')        // primary attribution
+    expect(rejectionLayer(c.terminalVerdict)).toBe('duplicate_cooldown')  // audit only
+  })
+})
+
+describe('comparable vs target-missing split', () => {
+  it('separates target-present (comparable) from target-missing geometry in the headline books', () => {
+    const winBar = [bar('09:35:00', 100, 111, 99, 110)] // hits T1 → +2R for the target-present one
+    const stopBar = [bar('09:35:00', 100, 101, 94, 96)] // low ≤ stop 95 → -1R
+    const rows: PhantomRow[] = [
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'P:breakout:1', targets: [110] }), 'phantom_primary', winBar),
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'Q:breakout:2', targets: [] }), 'phantom_primary', stopBar),
+    ]
+    const books = buildBooks(rows)
+    expect(books.idealPhantom.n).toBe(2)             // all entered
+    expect(books.idealPhantomComparable.n).toBe(1)   // target-present only
+    expect(books.idealTargetMissing.n).toBe(1)       // target-missing only
+    expect(books.counts.comparablePhantom).toBe(1)
+    expect(books.idealPhantomComparable.netR).toBeCloseTo(2, 5)
+  })
+})
+
+describe('immutable input snapshot semantics', () => {
+  it('building from a frozen snapshot is unaffected by later appends to the source log', () => {
+    const rows = [
+      decisionRow({ setupId: 'A:breakout:1', verdict: 'veto' }),
+      decisionRow({ setupId: 'B:breakout:2', verdict: 'logged' }),
+    ]
+    const frozen = rows.slice()
+    const before = buildShadowCandidates(frozen)
+    rows.push(decisionRow({ setupId: 'C:breakout:3', verdict: 'veto' })) // production log "grows"
+    const after = buildShadowCandidates(frozen)                          // still the frozen snapshot
+    expect(after).toEqual(before)
+    expect(after).toHaveLength(2)
+  })
+
+  it('sha256 is stable for identical content and changes when content changes', () => {
+    const text = '{"a":1}\n{"b":2}'
+    expect(sha256(text)).toBe(sha256(text))
+    expect(sha256(text)).not.toBe(sha256(text + '\n{"c":3}'))
+    expect(sha256(text)).toMatch(/^[0-9a-f]{64}$/)
   })
 })
 

@@ -35,6 +35,8 @@ import {
   rejectionLayer,
   type ShadowCandidate,
   type ShadowOutcome,
+  type ShadowVerdict,
+  type RejectionLayer,
 } from '@/lib/research/shadow-journal'
 
 const round = (v: number) => Math.round(v * 100) / 100
@@ -123,20 +125,43 @@ export function resolveWithFlatten(
 
 // ── Classification ───────────────────────────────────────────────────────────
 
-export type CandidateClass = 'accepted' | 'phantom_primary' | 'phantom_dup' | 'not_simulatable'
+export type CandidateClass =
+  | 'accepted'
+  | 'phantom_primary'
+  | 'phantom_dup'
+  | 'post_flatten' // STRUCTURALLY_UNTRADEABLE_POST_FLATTEN — signal fired at/after 15:55
+  | 'not_simulatable'
 
 /**
- * Classify a candidate for the books. Executed OR ever-accepted ⇒ accepted (its
- * later re-logs as dup/veto do not demote it). A never-accepted candidate whose
- * terminal block was the entry-cluster/stand-down cooldown is a duplicate — not an
- * independent opportunity — and is excluded from the primary phantom aggregate.
- * Missing entry or stop ⇒ not-simulatable (never guessed).
+ * Classify a candidate for the books, in priority order:
+ *   1. accepted — executed OR ever-accepted. Acceptance is the OPERATIVE role: a
+ *      setup that actually opened is ACCEPTED regardless of how its later re-logs
+ *      (dup/veto) ended the day. Attribution must never relabel an opened trade.
+ *   2. post_flatten — the setup's FIRST signal fired at/after `flattenEtMinute`
+ *      (15:55 ET), so it could never have become a same-session position. It stays
+ *      in the raw audit but is excluded from the phantom population, the no-fill
+ *      rate, and every R aggregate. (Default Infinity ⇒ off, so old callers are
+ *      unaffected; the runner passes DEFAULT_EXECUTOR.flattenEtMinute.)
+ *   3. not_simulatable — no entry or stop (never guessed).
+ *   4. phantom_dup — never accepted, terminal block was the entry-cluster/stand-down
+ *      cooldown: not an independent opportunity, excluded from the primary aggregate.
+ *   5. phantom_primary — a genuine prevented opportunity.
  */
-export function classifyCandidate(c: ShadowCandidate, executedSetupIds: Set<string>): CandidateClass {
+export function classifyCandidate(
+  c: ShadowCandidate,
+  executedSetupIds: Set<string>,
+  flattenEtMinute: number = Number.POSITIVE_INFINITY,
+): CandidateClass {
   if (executedSetupIds.has(c.setupId) || c.everAccepted) return 'accepted'
+  if (etMinutesOfDay(c.signalTs) >= flattenEtMinute) return 'post_flatten'
   if (c.entryRef == null || c.stop == null) return 'not_simulatable'
   if (rejectionLayer(c.terminalVerdict) === 'duplicate_cooldown') return 'phantom_dup'
   return 'phantom_primary'
+}
+
+/** Operative layer for primary attribution: an accepted trade reads 'accepted', never its later dup/veto row. */
+export function operativeLayerOf(klass: CandidateClass, terminalVerdict: ShadowVerdict): RejectionLayer | 'accepted' {
+  return klass === 'accepted' ? 'accepted' : rejectionLayer(terminalVerdict)
 }
 
 // ── Book aggregation ─────────────────────────────────────────────────────────
@@ -171,7 +196,12 @@ export interface PhantomRow {
 
 export interface PhantomBooks {
   idealAccepted: BookSummary
+  /** Accepted, target-present only (comparable geometry). */
+  idealAcceptedComparable: BookSummary
+  /** ALL entered primary phantoms. */
   idealPhantom: BookSummary
+  /** Entered primary phantoms with a target present (comparable geometry) — the headline-safe cut. */
+  idealPhantomComparable: BookSummary
   actualExecuted: BookSummary
   /** Target-missing subgroup (accepted + primary phantom, hasTarget === false) — reported separately. */
   idealTargetMissing: BookSummary
@@ -179,47 +209,70 @@ export interface PhantomBooks {
   duplicates: PhantomRow[]
   /** Candidates with insufficient evidence to simulate. */
   notSimulatable: PhantomRow[]
-  counts: { accepted: number; phantomPrimary: number; phantomDup: number; notSimulatable: number; noFill: number; targetMissing: number }
+  /** Signals that fired at/after the flatten — structurally untradeable, excluded from every aggregate and the no-fill rate. */
+  postFlatten: PhantomRow[]
+  counts: {
+    accepted: number
+    phantomPrimary: number
+    phantomDup: number
+    postFlatten: number
+    notSimulatable: number
+    noFill: number
+    targetMissing: number
+    comparablePhantom: number
+  }
 }
 
 const enteredR = (r: PhantomRow): number | null =>
   r.outcome.entered && r.outcome.hypotheticalR != null ? r.outcome.hypotheticalR : null
 
 /**
- * Partition rows into the three books. dup_cooldown is excluded from all aggregates
- * (not an independent opportunity) but returned raw. Only entered candidates with a
- * defined R feed the ideal aggregates; no-fills are counted, never scored.
+ * Partition rows into the books. post_flatten and dup_cooldown are excluded from all
+ * aggregates and the no-fill rate (neither is a genuine same-session opportunity) but
+ * both are returned raw. Only entered candidates with a defined R feed the ideal
+ * aggregates; no-fills are counted, never scored. The *Comparable variants drop
+ * target-missing geometry so a headline conclusion can be stated on comparable trades.
  */
 export function buildBooks(rows: PhantomRow[]): PhantomBooks {
   const accepted = rows.filter((r) => r.klass === 'accepted')
   const phantom = rows.filter((r) => r.klass === 'phantom_primary')
   const duplicates = rows.filter((r) => r.klass === 'phantom_dup')
+  const postFlatten = rows.filter((r) => r.klass === 'post_flatten')
   const notSimulatable = rows.filter((r) => r.klass === 'not_simulatable')
 
   const rOf = (rs: PhantomRow[]) => rs.map(enteredR).filter((r): r is number => r != null)
+  const withTarget = (rs: PhantomRow[]) => rs.filter((r) => r.hasTarget)
 
   const idealAccepted = summarizeR(rOf(accepted))
+  const idealAcceptedComparable = summarizeR(rOf(withTarget(accepted)))
   const idealPhantom = summarizeR(rOf(phantom))
+  const idealPhantomComparable = summarizeR(rOf(withTarget(phantom)))
   const actualExecuted = summarizeR(accepted.map((r) => r.actualR).filter((r): r is number => r != null))
   const idealTargetMissing = summarizeR(rOf([...accepted, ...phantom].filter((r) => !r.hasTarget)))
 
-  const noFill = rows.filter((r) => r.klass !== 'phantom_dup' && r.klass !== 'not_simulatable' && !r.outcome.entered).length
+  // No-fill rate is over the eligible phantom population only (post_flatten/dup excluded by class).
+  const noFill = phantom.filter((r) => !r.outcome.entered).length
   const targetMissing = [...accepted, ...phantom].filter((r) => !r.hasTarget).length
 
   return {
     idealAccepted,
+    idealAcceptedComparable,
     idealPhantom,
+    idealPhantomComparable,
     actualExecuted,
     idealTargetMissing,
     duplicates,
     notSimulatable,
+    postFlatten,
     counts: {
       accepted: accepted.length,
       phantomPrimary: phantom.length,
       phantomDup: duplicates.length,
+      postFlatten: postFlatten.length,
       notSimulatable: notSimulatable.length,
       noFill,
       targetMissing,
+      comparablePhantom: withTarget(phantom).length,
     },
   }
 }
