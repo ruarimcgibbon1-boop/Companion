@@ -31,6 +31,16 @@ export function eventsFile(day = etDayKey()): string {
   return join(homedir(), `.companion-paper-events-${day}.jsonl`)
 }
 
+/**
+ * The daemon's decision-audit file for an ET trading day. Call with the DECISION's
+ * timestamp (`decisionsFile(etDayKey(now))`) at APPEND time, never once at startup:
+ * a daemon running continuously across ET midnight must roll to the new day's file
+ * on its own. The default binds to "now", so a call with no argument still rotates.
+ */
+export function decisionsFile(day = etDayKey()): string {
+  return join(homedir(), `.companion-decisions-${day}.jsonl`)
+}
+
 /** Operator kill switch: `touch ~/.companion-halt` stops all new entries. */
 export function haltFile(): string {
   return join(homedir(), '.companion-halt')

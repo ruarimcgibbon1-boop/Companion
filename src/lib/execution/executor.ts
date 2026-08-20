@@ -249,7 +249,7 @@ export class PaperExecutor {
     }, this.config.sizing)
 
     if (sizing.qty < 1) {
-      appendEvent({ event: 'entry_skipped', symbol: signal.symbol, reason: sizing.reason ?? 'zero size' })
+      appendEvent({ event: 'entry_skipped', symbol: signal.symbol, setupId: signal.setupId, reason: sizing.reason ?? 'zero size' })
       return { taken: false, reason: sizing.reason ?? 'zero size' }
     }
 
@@ -268,7 +268,7 @@ export class PaperExecutor {
         this.haltedForDay = verdict.reason
         this.log(`RISK HALT — ${verdict.reason}`)
       }
-      appendEvent({ event: 'entry_blocked', symbol: signal.symbol, reason: verdict.reason, terminal: verdict.terminal })
+      appendEvent({ event: 'entry_blocked', symbol: signal.symbol, setupId: signal.setupId, reason: verdict.reason, terminal: verdict.terminal })
       return { taken: false, reason: verdict.reason }
     }
 
@@ -276,7 +276,7 @@ export class PaperExecutor {
     // this strategy that is a meaningful miss rate, so record it explicitly.
     const asset = await this.broker.getAsset(signal.symbol)
     if (!asset || !asset.tradable) {
-      appendEvent({ event: 'entry_skipped', symbol: signal.symbol, reason: 'not tradable at broker' })
+      appendEvent({ event: 'entry_skipped', symbol: signal.symbol, setupId: signal.setupId, reason: 'not tradable at broker' })
       return { taken: false, reason: `${signal.symbol} not tradable at ${this.broker.name}` }
     }
 
@@ -312,7 +312,7 @@ export class PaperExecutor {
       this.trades.push(trade)
       this.persist()
       this.log(`REJECT ${signal.symbol}: ${order.rejectReason}`)
-      appendEvent({ event: 'entry_rejected', symbol: signal.symbol, tradeId: trade.id, reason: order.rejectReason })
+      appendEvent({ event: 'entry_rejected', symbol: signal.symbol, setupId: signal.setupId, tradeId: trade.id, reason: order.rejectReason })
       return { taken: false, reason: `broker rejected: ${order.rejectReason}` }
     }
 
@@ -322,7 +322,7 @@ export class PaperExecutor {
     this.persist()
     this.log(`ENTRY ${signal.symbol} ${sizing.qty} sh @ ≤${limit.toFixed(4)} (risk $${sizing.plannedRisk.toFixed(0)}, ${sizing.boundBy})`)
     appendEvent({
-      event: 'entry_submitted', symbol: signal.symbol, tradeId: trade.id, orderId: order.id,
+      event: 'entry_submitted', symbol: signal.symbol, setupId: signal.setupId, tradeId: trade.id, orderId: order.id,
       qty: sizing.qty, limitPrice: limit, intendedEntry: signal.entryHigh, stop: signal.stop,
       targets: signal.targets, plannedRisk: sizing.plannedRisk, boundBy: sizing.boundBy,
     })
@@ -420,7 +420,7 @@ export class PaperExecutor {
         trade.state = 'aborted'
         this.touch(trade, `entry timed out unfilled after ${Math.round(this.config.entryTimeoutMs / 1000)}s`)
         this.log(`NO FILL ${trade.symbol} — limit ${trade.limitPrice.toFixed(4)} never traded`)
-        appendEvent({ event: 'entry_timeout', symbol: trade.symbol, tradeId: trade.id, limitPrice: trade.limitPrice })
+        appendEvent({ event: 'entry_timeout', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id, limitPrice: trade.limitPrice })
       }
     }
   }
