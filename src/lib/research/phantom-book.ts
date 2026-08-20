@@ -223,6 +223,56 @@ export interface PhantomBooks {
   }
 }
 
+/** Per-symbol tape status the fail-closed gate needs (a lite view of TapeResult). */
+export interface TapeStatusLite { source: string; targetDayBars: number }
+
+/** A required symbol whose tape cannot support a headline book. */
+export interface RequiredTapeFailure {
+  symbol: string
+  klass: CandidateClass
+  reason: string
+  status: string
+  targetDayBars: number
+}
+
+const REQUIRED_CLASSES: readonly CandidateClass[] = ['accepted', 'phantom_primary']
+
+function failureReason(status: string | undefined): string {
+  switch (status) {
+    case 'empty_cache': return 'EMPTY_TAPE_CACHE (poisoned zero-bar cache)'
+    case 'fetch_failed': return 'fetch returned no rows'
+    case 'missing': return 'no tape (offline cache miss)'
+    case 'cache':
+    case 'network': return 'tape present but 0 bars for PHANTOM_DAY'
+    default: return 'tape not loaded'
+  }
+}
+
+/**
+ * FAIL-CLOSED gate: every symbol feeding a headline book (IDEAL_ACCEPTED or primary
+ * IDEAL_PHANTOM) must have ≥1 bar on the requested ET day. post_flatten / dup /
+ * not_simulatable symbols are NOT required — their missing tape can never block the
+ * primary book, because they are excluded from the research aggregates. Returns one
+ * failure per required symbol lacking real target-day tape; an empty result means the
+ * headline books may be produced.
+ */
+export function requiredTapeFailures(rows: PhantomRow[], tapeBySymbol: ReadonlyMap<string, TapeStatusLite>): RequiredTapeFailure[] {
+  const required = new Map<string, CandidateClass>() // symbol → strongest required class
+  for (const r of rows) {
+    if (!REQUIRED_CLASSES.includes(r.klass)) continue
+    const prior = required.get(r.candidate.symbol)
+    if (prior !== 'accepted') required.set(r.candidate.symbol, r.klass) // accepted outranks phantom_primary
+  }
+  const failures: RequiredTapeFailure[] = []
+  for (const [symbol, klass] of required) {
+    const tape = tapeBySymbol.get(symbol)
+    if (!tape || tape.targetDayBars === 0) {
+      failures.push({ symbol, klass, reason: failureReason(tape?.source), status: tape?.source ?? 'not_loaded', targetDayBars: tape?.targetDayBars ?? 0 })
+    }
+  }
+  return failures
+}
+
 const enteredR = (r: PhantomRow): number | null =>
   r.outcome.entered && r.outcome.hypotheticalR != null ? r.outcome.hypotheticalR : null
 

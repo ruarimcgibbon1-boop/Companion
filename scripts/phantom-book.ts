@@ -39,12 +39,13 @@ import {
   buildBooks,
   classifyCandidate,
   operativeLayerOf,
+  requiredTapeFailures,
   resolveWithFlatten,
   tapeState,
   type BookSummary,
   type PhantomRow,
 } from '@/lib/research/phantom-book'
-import { loadTape, sha256, type RawFmpRow } from '@/lib/research/phantom-tape'
+import { loadTape, sha256, type RawFmpRow, type TapeResult } from '@/lib/research/phantom-tape'
 
 const FLATTEN = DEFAULT_EXECUTOR.flattenEtMinute // 15:55 ET — the canonical session boundary
 const HOME = homedir()
@@ -113,8 +114,8 @@ async function resolveRows(
   candidates: ShadowCandidate[],
   executedIds: Set<string>,
   actualR: Map<string, number | null>,
-): Promise<{ rows: PhantomRow[]; tapeHash: string; loaded: string[]; missing: string[] }> {
-  const tapeBySymbol = new Map<string, Awaited<ReturnType<typeof loadTape>>>()
+): Promise<{ rows: PhantomRow[]; tapeBySymbol: Map<string, TapeResult>; tapeHash: string; loaded: string[]; missing: string[] }> {
+  const tapeBySymbol = new Map<string, TapeResult>()
   const rows: PhantomRow[] = []
   const tapeDigests: string[] = []
   for (const c of candidates) {
@@ -135,11 +136,13 @@ async function resolveRows(
     rows.push({ candidate: c, klass, outcome, actualR: actualR.get(c.setupId) ?? null, hasTarget: c.targets.length > 0 })
   }
   const entries = [...tapeBySymbol.entries()]
+  const ok = (s: string) => s === 'cache' || s === 'network'
   return {
     rows,
+    tapeBySymbol,
     tapeHash: sha256(tapeDigests.sort().join('|')),
-    loaded: entries.filter(([, t]) => t.source !== 'missing').map(([s]) => s),
-    missing: entries.filter(([, t]) => t.source === 'missing').map(([s]) => s),
+    loaded: entries.filter(([, t]) => ok(t.source)).map(([s]) => s),
+    missing: entries.filter(([, t]) => !ok(t.source)).map(([s, t]) => `${s}(${t.source})`),
   }
 }
 
@@ -193,13 +196,45 @@ function report(snap: Snapshot, rows: PhantomRow[], tape: { hash: string; loaded
   return L.join('\n')
 }
 
+function reportDataIncomplete(snap: Snapshot, day: string, failures: ReturnType<typeof requiredTapeFailures>): string {
+  const L: string[] = []
+  L.push(`# PHANTOM BOOK — ${day}`)
+  L.push('')
+  L.push('PHANTOM BOOK VERDICT: DATA_INCOMPLETE')
+  L.push('')
+  L.push('Required market tape is missing for a symbol that feeds a headline book, so the')
+  L.push('gate-quality aggregates (IDEAL_ACCEPTED / IDEAL_PHANTOM) are REFUSED. This is the')
+  L.push('fail-closed guard against a transient FMP failure masquerading as an empty book.')
+  L.push('')
+  L.push('symbol | required-by | reason | cache/network status | PHANTOM_DAY bar count')
+  for (const f of failures) L.push(`${f.symbol} | ${f.klass} | ${f.reason} | ${f.status} | ${f.targetDayBars}`)
+  L.push('')
+  L.push(`runner commit ${snap.commit} · decisions ${snap.decisions.count} rows (${snap.decisions.hash.slice(0, 12)}…) · snapshot ${snap.takenAt}`)
+  L.push('')
+  L.push('No headline R aggregates were produced. Refetch the required tape (settled day) and re-run.')
+  return L.join('\n')
+}
+
 async function main() {
   const day = process.env.PHANTOM_DAY || etTradingDay(Date.now())
   const snap = freezeSnapshot(day)
   const state = tapeState(day)
   const candidates = buildShadowCandidates(snap.decisions.rows) // frozen snapshot only
   const { ids, actualR } = executedFrom(snap.trades.rows)
-  const { rows, tapeHash, loaded, missing } = await resolveRows(candidates, ids, actualR)
+  const { rows, tapeBySymbol, tapeHash, loaded, missing } = await resolveRows(candidates, ids, actualR)
+
+  // FAIL CLOSED: never emit IDEAL_ACCEPTED n=0 / IDEAL_PHANTOM n=0 as a "valid" book
+  // when a required symbol's tape is missing or has zero bars for the requested day.
+  const failures = requiredTapeFailures(rows, tapeBySymbol)
+  if (failures.length > 0) {
+    const text = reportDataIncomplete(snap, day, failures)
+    console.log(text)
+    const out = process.env.OUT
+    if (out) writeFileSync(out, text)
+    process.exitCode = 2
+    return
+  }
+
   const text = report(snap, rows, { hash: tapeHash, loaded, missing }, state)
   console.log(text)
   const out = process.env.OUT

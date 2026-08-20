@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'fs'
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import type { Candle } from '@/types'
@@ -8,10 +8,12 @@ import { buildShadowCandidates, rejectionLayer, type DecisionLogRow, type Shadow
 import {
   classifyCandidate,
   operativeLayerOf,
+  requiredTapeFailures,
   resolveWithFlatten,
   buildBooks,
   tapeState,
   type PhantomRow,
+  type TapeStatusLite,
 } from '@/lib/research/phantom-book'
 import { loadTape, sha256 } from '@/lib/research/phantom-tape'
 
@@ -260,6 +262,7 @@ describe('offline cached-tape mode', () => {
       const hit = await loadTape({ symbol: 'X', day: DAY, offline: true, cacheDir: dir, fetchRows })
       expect(hit.source).toBe('cache')
       expect(hit.bars).toHaveLength(1)
+      expect(hit.targetDayBars).toBe(1)
       expect(fetchRows).not.toHaveBeenCalled()
 
       const miss = await loadTape({ symbol: 'Y', day: DAY, offline: true, cacheDir: dir, fetchRows })
@@ -269,5 +272,114 @@ describe('offline cached-tape mode', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('fail-closed tape hardening', () => {
+  const fmpRow = (hhmmss: string, px: number) => ({ date: `${DAY} ${hhmmss}`, open: px, high: px, low: px, close: px, volume: 1 })
+
+  it('does NOT cache a network fetch that returns [] (no poisoned file written)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'phantom-fc-'))
+    try {
+      const fetchRows = vi.fn().mockResolvedValue([])
+      const res = await loadTape({ symbol: 'X', day: DAY, offline: false, cacheDir: dir, fetchRows, retries: 1, retryDelayMs: 0 })
+      expect(res.source).toBe('fetch_failed')
+      expect(res.bars).toHaveLength(0)
+      expect(existsSync(join(dir, `m1_X_${DAY}.json`))).toBe(false) // never cached
+      expect(fetchRows).toHaveBeenCalledTimes(2) // initial + 1 retry
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an empty cache in OFFLINE mode (EMPTY_TAPE_CACHE)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'phantom-fc-'))
+    try {
+      writeFileSync(join(dir, `m1_X_${DAY}.json`), '[]')
+      const fetchRows = vi.fn().mockResolvedValue([])
+      const res = await loadTape({ symbol: 'X', day: DAY, offline: true, cacheDir: dir, fetchRows })
+      expect(res.source).toBe('empty_cache')
+      expect(res.targetDayBars).toBe(0)
+      expect(fetchRows).not.toHaveBeenCalled()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refetches an empty cache when online, and overwrites it with real bars', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'phantom-fc-'))
+    try {
+      const file = join(dir, `m1_X_${DAY}.json`)
+      writeFileSync(file, '[]')
+      const fetchRows = vi.fn().mockResolvedValue([fmpRow('09:35:00', 100)])
+      const res = await loadTape({ symbol: 'X', day: DAY, offline: false, cacheDir: dir, fetchRows, retries: 0, retryDelayMs: 0 })
+      expect(res.source).toBe('network')
+      expect(res.bars).toHaveLength(1)
+      expect(fetchRows).toHaveBeenCalledTimes(1)
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toHaveLength(1) // poisoned file replaced
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('counts a non-empty tape with no PHANTOM_DAY bars as zero for the requested day', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'phantom-fc-'))
+    try {
+      // bars for a DIFFERENT day only
+      const other: Candle[] = [{ time: etStrToUnixSec('2026-08-18 09:35:00'), open: 1, high: 1, low: 1, close: 1, volume: 1 }]
+      writeFileSync(join(dir, `m1_X_${DAY}.json`), JSON.stringify(other))
+      const res = await loadTape({ symbol: 'X', day: DAY, offline: true, cacheDir: dir, fetchRows: vi.fn() })
+      expect(res.bars.length).toBeGreaterThan(0)
+      expect(res.targetDayBars).toBe(0) // no bars for 2026-08-20
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('DATA_INCOMPLETE when a required ACCEPTED symbol has zero target-day bars', () => {
+    const rows: PhantomRow[] = [
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'G:bos:1', symbol: 'GDXU', everAccepted: true }), 'accepted', []),
+    ]
+    const tape = new Map<string, TapeStatusLite>([['GDXU', { source: 'fetch_failed', targetDayBars: 0 }]])
+    const fails = requiredTapeFailures(rows, tape)
+    expect(fails).toHaveLength(1)
+    expect(fails[0]).toMatchObject({ symbol: 'GDXU', klass: 'accepted', status: 'fetch_failed', targetDayBars: 0 })
+  })
+
+  it('DATA_INCOMPLETE when a required PRIMARY-PHANTOM symbol has zero target-day bars', () => {
+    const rows: PhantomRow[] = [
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'A:breakout:1', symbol: 'AZI' }), 'phantom_primary', []),
+    ]
+    const tape = new Map<string, TapeStatusLite>([['AZI', { source: 'empty_cache', targetDayBars: 0 }]])
+    const fails = requiredTapeFailures(rows, tape)
+    expect(fails).toHaveLength(1)
+    expect(fails[0]).toMatchObject({ symbol: 'AZI', klass: 'phantom_primary', targetDayBars: 0 })
+    expect(fails[0].reason).toMatch(/EMPTY_TAPE_CACHE/)
+  })
+
+  it('a missing post-flatten-only symbol does NOT invalidate the primary book', () => {
+    const winBar = [bar('09:35:00', 100, 111, 99, 110)]
+    const rows: PhantomRow[] = [
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'OK:breakout:1', symbol: 'OK' }), 'phantom_primary', winBar),
+      { candidate: cand({ signalTs: tsOf('16:10:00'), setupId: 'LATE:breakout:2', symbol: 'LATE' }), klass: 'post_flatten', outcome: resolveWithFlatten(cand({ signalTs: tsOf('16:10:00'), setupId: 'LATE:breakout:2', symbol: 'LATE' }), [], FLATTEN), actualR: null, hasTarget: true },
+    ]
+    const tape = new Map<string, TapeStatusLite>([
+      ['OK', { source: 'cache', targetDayBars: 400 }],
+      ['LATE', { source: 'fetch_failed', targetDayBars: 0 }], // post_flatten symbol missing — must not block
+    ])
+    expect(requiredTapeFailures(rows, tape)).toHaveLength(0)
+  })
+
+  it('valid tape passes the gate cleanly (no failures)', () => {
+    const winBar = [bar('09:35:00', 100, 111, 99, 110)]
+    const rows: PhantomRow[] = [
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'A:breakout:1', symbol: 'AAA', everAccepted: true }), 'accepted', winBar, 1.4),
+      row(cand({ signalTs: tsOf('09:35'), setupId: 'B:breakout:2', symbol: 'BBB' }), 'phantom_primary', winBar),
+    ]
+    const tape = new Map<string, TapeStatusLite>([
+      ['AAA', { source: 'cache', targetDayBars: 390 }],
+      ['BBB', { source: 'network', targetDayBars: 405 }],
+    ])
+    expect(requiredTapeFailures(rows, tape)).toHaveLength(0)
   })
 })
