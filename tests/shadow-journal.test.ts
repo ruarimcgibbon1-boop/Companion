@@ -121,6 +121,25 @@ describe('deterministic shadow ↔ executor join — by setupId, never symbol', 
     expect(bosOut.reason).toBeNull()
   })
 
+  it('TERMINAL selection is deterministic with mixed/missing/malformed timestamps (input order wins)', () => {
+    const c = buildShadowCandidates([row({ setupId: 'XYZ:opening_drive:9' })])[0]
+    // Same setupId, several events; some lack ts, one is malformed. Input order = occurrence order.
+    const events: ExecutorEvent[] = [
+      { event: 'entry_blocked', setupId: 'XYZ:opening_drive:9', reason: 'max concurrent', ts: '2026-08-19T13:31:00Z' },
+      { event: 'entry_blocked', setupId: 'XYZ:opening_drive:9', reason: 'still blocked' },              // no ts
+      { event: 'entry_submitted', setupId: 'XYZ:opening_drive:9', ts: 'not-a-date' },                    // malformed ts, TERMINAL
+    ]
+    // Run repeatedly — must be stable and always pick the LAST input event.
+    for (let i = 0; i < 20; i++) {
+      const out = joinExecutorOutcome(c, events)
+      expect(out.layer).toBe('accepted')       // the terminal entry_submitted
+      expect(out.event).toBe('entry_submitted')
+    }
+    // Reordering the input changes the terminal deterministically (proves it's input-order, not ts-sorted).
+    const reordered = [events[2], events[0], events[1]]
+    expect(joinExecutorOutcome(c, reordered).event).toBe('entry_blocked')
+  })
+
   it('an event with no setupId is unjoinable (never guessed by symbol)', () => {
     const c = buildShadowCandidates([row({ setupId: 'XYZ:opening_drive:9' })])[0]
     const out = joinExecutorOutcome(c, [{ event: 'entry_blocked', symbol: 'XYZ', reason: 'x' }])  // no setupId

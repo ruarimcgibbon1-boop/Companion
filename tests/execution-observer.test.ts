@@ -87,6 +87,62 @@ describe('ExecutionObserver — passive, read-only, bid/trade evidence separate'
     expect(out.observedBid).toBeNull()
   })
 
+  it('FEED STATUS: quote ok / trade ok → not dropped, both statuses ok', async () => {
+    const feed = new FakeFeed()
+    feed.quote = { symbol: 'UUU', bidPrice: 4.90, askPrice: 4.92, sourceTs: 1 }
+    feed.trade = { symbol: 'UUU', price: 4.91, sourceTs: 1 }
+    const out = await new ExecutionObserver(feed, () => {}, () => 1).observe(ctx())
+    expect(out.quoteStatus).toBe('ok'); expect(out.tradeStatus).toBe('ok')
+    expect(out.observationDropped).toBe(false)
+  })
+
+  it('FEED STATUS: quote ok / trade FAILS → partial, not dropped, quote preserved', async () => {
+    const feed = new FakeFeed(); feed.throwTrade = true
+    feed.quote = { symbol: 'UUU', bidPrice: 4.90, askPrice: 4.92, sourceTs: 7 }
+    const out = await new ExecutionObserver(feed, () => {}, () => 1).observe(ctx())
+    expect(out.quoteStatus).toBe('ok'); expect(out.tradeStatus).toBe('error')
+    expect(out.observationDropped).toBe(false)          // we DID obtain the quote
+    expect(out.observedBid).toBe(4.90)                  // preserved
+    expect(out.observedTradePrice).toBeNull()           // failed leg → null, not fabricated
+  })
+
+  it('FEED STATUS: quote FAILS / trade ok → partial, not dropped, trade preserved', async () => {
+    const feed = new FakeFeed(); feed.throwQuote = true
+    feed.trade = { symbol: 'UUU', price: 4.70, sourceTs: 9 }
+    const out = await new ExecutionObserver(feed, () => {}, () => 1).observe(ctx())
+    expect(out.quoteStatus).toBe('error'); expect(out.tradeStatus).toBe('ok')
+    expect(out.observationDropped).toBe(false)
+    expect(out.observedBid).toBeNull()
+    expect(out.observedTradePrice).toBe(4.70)
+    expect(out.observedTradeAtOrBelowStop).toBe(true)   // real breach evidence still usable
+  })
+
+  it('FEED STATUS: BOTH fail → DROPPED (a transport failure, never a clean observation)', async () => {
+    const feed = new FakeFeed(); feed.throwQuote = true; feed.throwTrade = true
+    const out = await new ExecutionObserver(feed, () => {}, () => 1).observe(ctx())
+    expect(out.quoteStatus).toBe('error'); expect(out.tradeStatus).toBe('error')
+    expect(out.observationDropped).toBe(true)           // impossible to mistake for a clean read
+    expect(out.observedBreach).toBe(false)
+  })
+
+  it('FEED STATUS: clean-but-EMPTY (both ok, values null) is NOT dropped and is distinguishable from a failure', async () => {
+    const feed = new FakeFeed()                          // quote=null, trade=null, but no throw
+    const out = await new ExecutionObserver(feed, () => {}, () => 1).observe(ctx())
+    expect(out.quoteStatus).toBe('ok'); expect(out.tradeStatus).toBe('ok')  // requests succeeded
+    expect(out.observationDropped).toBe(false)           // NOT a transport failure
+    expect(out.observedBid).toBeNull(); expect(out.observedTradePrice).toBeNull()
+    expect(out.observedBreach).toBe(false)               // no evidence, no fabricated breach
+  })
+
+  it('FEED STATUS: aborted → statuses aborted, dropped', async () => {
+    const feed = new FakeFeed(); feed.quote = { symbol: 'UUU', bidPrice: 1, askPrice: 1.1, sourceTs: 1 }
+    const ac = new AbortController(); ac.abort()
+    const out = await new ExecutionObserver(feed, () => {}, () => 1).observe(ctx(), { signal: ac.signal })
+    expect(out.quoteStatus).toBe('aborted'); expect(out.tradeStatus).toBe('aborted')
+    expect(out.observationDropped).toBe(true)
+    expect(out.observedBreach).toBe(false)
+  })
+
   it('EFFECTIVE cadence is measured from wall-clock, not the configured 3s', async () => {
     const feed = new FakeFeed(); feed.trade = { symbol: 'UUU', price: 5, sourceTs: 1 }
     let t = 1000
@@ -173,6 +229,7 @@ describe('deriveLatencies — bid vs trade kept separate, unknown ≠ zero', () 
   const obs = (over: Partial<ExecutionQualityObservation>): ExecutionQualityObservation => ({
     observedAt: '2026-08-19T13:34:59Z', tradeId: 'pt:UUU:1', setupId: null, symbol: 'UUU', session: 'premarket',
     stopPrice: 4.84, executionPath: 'polled', observedFeed: 'fake-iex', feedConsolidated: false,
+    quoteStatus: 'ok', tradeStatus: 'ok',
     observedTradePrice: null, observedTradeTs: null, observedBid: null, observedAsk: null, observedQuoteTs: null,
     observedBidAtOrBelowStop: null, observedTradeAtOrBelowStop: null, observedBreach: false, observationDropped: false,
     monitorPrice: 4.86, monitorRequestStartTs: 900, monitorResponseTs: 1000, monitorQuoteTs: null,

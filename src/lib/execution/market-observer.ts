@@ -37,6 +37,16 @@ export interface MarketTrade {
 export interface FetchOpts { signal?: AbortSignal }
 
 /**
+ * Per-leg fetch outcome, so research can tell three cases apart that used to look
+ * identical (all-null fields):
+ *   • 'ok'      — the request completed; its value may be a real price OR a genuine
+ *                 null (the leg simply had no value, e.g. no recent trade).
+ *   • 'error'   — the request FAILED (transport/parse). No value obtained.
+ *   • 'aborted' — the request was cancelled (timeout/close) or never attempted.
+ */
+export type LegStatus = 'ok' | 'error' | 'aborted'
+
+/**
  * A read-only market-data feed. Deliberately NARROW: no order entry/cancel/mutate,
  * so an observer built on it structurally cannot affect execution. `consolidated`
  * states whether this is full-market SIP truth (false for a single venue like IEX).
@@ -74,6 +84,9 @@ export interface ExecutionQualityObservation {
   // ── Independent (observer) evidence — a SINGLE-VENUE feed, not SIP ────────
   observedFeed: string
   feedConsolidated: boolean
+  /** Per-leg request outcome — distinguishes a genuine empty value from a transport failure. */
+  quoteStatus: LegStatus
+  tradeStatus: LegStatus
   observedTradePrice: number | null
   observedTradeTs: number | null
   observedBid: number | null
@@ -115,17 +128,31 @@ export class ExecutionObserver {
     const prev = this.lastObservedAt.get(ctx.tradeId) ?? null
     this.lastObservedAt.set(ctx.tradeId, wall)
 
-    let quote: MarketQuote | null = null
-    let trade: MarketTrade | null = null
-    if (!opts?.dropped) {
-      try { quote = await this.source.latestQuote(ctx.symbol, { signal: opts?.signal }) } catch { quote = null }
-      try { trade = await this.source.latestTrade(ctx.symbol, { signal: opts?.signal }) } catch { trade = null }
+    // Each leg is fetched independently and its OUTCOME recorded, so a failed
+    // transport ('error') is never confused with a successful-but-empty read ('ok'
+    // + null). An abort is 'aborted'. A leg not attempted (whole sample dropped) is
+    // 'aborted' too.
+    const runLeg = async <T>(fn: () => Promise<T | null>): Promise<{ status: LegStatus; value: T | null }> => {
+      if (opts?.dropped) return { status: 'aborted', value: null }
+      try { return { status: 'ok', value: await fn() } }
+      catch (e) {
+        const aborted = (opts?.signal?.aborted ?? false) || (e instanceof Error && e.name === 'AbortError')
+        return { status: aborted ? 'aborted' : 'error', value: null }
+      }
     }
-    // An abort mid-flight makes this a dropped sample — we did not get a clean read.
-    const dropped = !!opts?.dropped || (opts?.signal?.aborted ?? false)
+    const q = await runLeg(() => this.source.latestQuote(ctx.symbol, { signal: opts?.signal }))
+    const tr = await runLeg(() => this.source.latestTrade(ctx.symbol, { signal: opts?.signal }))
+    const quoteStatus = q.status, tradeStatus = tr.status
+    const quote = q.value, trade = tr.value
 
-    const bid = dropped ? null : quote?.bidPrice ?? null
-    const tradePrice = dropped ? null : trade?.price ?? null
+    // DROPPED = no usable market evidence obtained: explicitly dropped, or NEITHER
+    // leg completed (both errored/aborted). A partial (one leg 'ok') is NOT dropped,
+    // and a clean-but-empty sample (both 'ok', values null) is NOT dropped — so a
+    // total transport failure can never be mistaken for a clean observation.
+    const dropped = !!opts?.dropped || !(quoteStatus === 'ok' || tradeStatus === 'ok')
+
+    const bid = quote?.bidPrice ?? null
+    const tradePrice = trade?.price ?? null
     const bidAtOrBelow = bid == null ? null : bid <= ctx.stopPrice
     const tradeAtOrBelow = tradePrice == null ? null : tradePrice <= ctx.stopPrice
     const observedBreach = !dropped && (bidAtOrBelow === true || tradeAtOrBelow === true)
@@ -140,6 +167,8 @@ export class ExecutionObserver {
       executionPath: ctx.executionPath,
       observedFeed: this.source.name,
       feedConsolidated: this.source.consolidated,
+      quoteStatus,
+      tradeStatus,
       observedTradePrice: tradePrice,
       observedTradeTs: dropped ? null : trade?.sourceTs ?? null,
       observedBid: bid,

@@ -118,11 +118,12 @@ export function executorEventLayer(ev: ExecutorEvent): RejectionLayer | null {
 export function joinExecutorOutcome(candidate: ShadowCandidate, events: ExecutorEvent[]): ExecutorOutcome {
   const mine = events.filter(e => e.setupId != null && e.setupId === candidate.setupId)
   if (mine.length === 0) return { layer: null, event: null, reason: null }
-  // Terminal event = the last one for this setup (chronological if ts present, else input order).
-  const ordered = mine.some(e => e.ts)
-    ? mine.slice().sort((a, b) => Date.parse(a.ts ?? '') - Date.parse(b.ts ?? ''))
-    : mine
-  const last = ordered[ordered.length - 1]
+  // Terminal event = the LAST in INPUT (append/log) order. The event streams are
+  // append-only and read top-to-bottom, so input order IS occurrence order — the
+  // authoritative sequence. We deliberately do NOT sort on `ts`: a missing or
+  // malformed timestamp would make Date.parse return NaN and the ordering
+  // non-deterministic. Input order is deterministic regardless of ts presence.
+  const last = mine[mine.length - 1]
   return { layer: executorEventLayer(last), event: last.event, reason: last.reason ?? null }
 }
 
