@@ -17,7 +17,7 @@
  */
 import type {
   Broker, BrokerAccount, BrokerOrder, BrokerOrderStatus, BrokerPosition,
-  AssetInfo, LimitOrderRequest, StopOrderRequest,
+  AssetInfo, LimitOrderRequest, StopOrderRequest, BrokerFill,
 } from './types'
 
 const PAPER_BASE = 'https://paper-api.alpaca.markets'
@@ -181,7 +181,7 @@ export class AlpacaBroker implements Broker {
     return (rows ?? []).map(p => toPosition(p))
   }
 
-  private async getPosition(symbol: string): Promise<BrokerPosition | null> {
+  async getPosition(symbol: string): Promise<BrokerPosition | null> {
     try {
       return toPosition(await this.req<Record<string, unknown>>(`/v2/positions/${encodeURIComponent(symbol)}`))
     } catch (e) {
@@ -243,6 +243,30 @@ export class AlpacaBroker implements Broker {
       if (e instanceof AlpacaBrokerError && e.status === 404) return null
       throw e
     }
+  }
+
+  /**
+   * Fills for one symbol at/after `sinceMs`, oldest first — read from the account
+   * activity ledger (`FILL`), which records EVERY execution including orders this
+   * daemon never placed (a dashboard flatten, a broker liquidation). That is
+   * exactly what reconciliation needs to price an external close from broker truth.
+   * One page (100) is ample: this is called to settle a single symbol's close.
+   */
+  async getRecentFills(symbol: string, sinceMs: number): Promise<BrokerFill[]> {
+    const after = new Date(sinceMs).toISOString()
+    const rows = await this.req<Array<Record<string, unknown>>>(
+      `/v2/account/activities/FILL?after=${encodeURIComponent(after)}&direction=asc&page_size=100`,
+    )
+    return (rows ?? [])
+      .filter(a => a.symbol === symbol)
+      .map(a => ({
+        symbol: String(a.symbol),
+        side: a.side === 'sell' ? 'sell' as const : 'buy' as const,
+        qty: num(a.qty),
+        price: num(a.price),
+        filledAt: a.transaction_time ? new Date(String(a.transaction_time)).getTime() : sinceMs,
+        orderId: (a.order_id as string) ?? null,
+      }))
   }
 
   async cancelOrder(id: string): Promise<void> {

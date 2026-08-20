@@ -101,17 +101,37 @@ export interface StopOrderRequest {
   clientOrderId: string
 }
 
+/** One broker-side execution — a single fill, the atomic unit of the account's truth. */
+export interface BrokerFill {
+  symbol: string
+  side: 'buy' | 'sell'
+  qty: number
+  price: number
+  filledAt: number
+  /** The order this fill belongs to, so fills from our own legs can be told apart from external ones. */
+  orderId: string | null
+}
+
 export interface Broker {
   readonly name: string
   getAccount(): Promise<BrokerAccount>
   getAsset(symbol: string): Promise<AssetInfo | null>
   getPositions(): Promise<BrokerPosition[]>
+  /** The broker's position for one symbol — the authority on what we actually hold. Null = flat. */
+  getPosition(symbol: string): Promise<BrokerPosition | null>
   submitLimit(req: LimitOrderRequest): Promise<BrokerOrder>
   submitStop(req: StopOrderRequest): Promise<BrokerOrder>
   getOrder(id: string): Promise<BrokerOrder | null>
   cancelOrder(id: string): Promise<void>
   /** Cancel every resting order for a symbol — called before we sell, so a resting stop can't fight the exit. */
   cancelOpenOrders(symbol: string): Promise<number>
+  /**
+   * Fills for one symbol at/after `sinceMs`, oldest first. Optional: a broker that
+   * can't report its own fills simply omits it, and reconciliation falls back to
+   * leaving an externally-closed trade's P&L unreconstructed (manual_review, null).
+   * When present it lets the executor price an external close from broker truth.
+   */
+  getRecentFills?(symbol: string, sinceMs: number): Promise<BrokerFill[]>
 }
 
 // ── Paper trade record ───────────────────────────────────────────────────────
@@ -128,6 +148,9 @@ export type ExitReason =
   | 'stop'            // initial stop, or breakeven stop after T1
   | 'time'            // end-of-day flatten (the resolver's mark-to-close)
   | 'risk_halt'       // governor pulled the plug mid-trade
+  | 'external'        // closed by an order the daemon never placed (dashboard flatten,
+                      //   broker liquidation) — priced from the broker's own fills so
+                      //   P&L reconciles, but kept out of learning (manual_review)
 
 export interface ExitLeg {
   qty: number
@@ -212,6 +235,28 @@ export interface PaperTrade {
   updatedAt: number
   /** Anything worth reading at review time: rejects, retries, gate notes. */
   notes: string[]
+
+  // ── Broker-authoritative reconciliation (ledger v1, 2026-08-18) ─────────────
+  // The daemon used to treat its own local state as truth. On 2026-08-17 that
+  // desynced from Alpaca: CAPR's stop filled in two partials but only the first
+  // was recorded (local believed 2007 still open, broker was flat); FIGR was
+  // flattened by an EXTERNAL order the daemon never saw, so it kept a stale 553
+  // open and re-submitted a protective stop that expired. Alpaca is the authority
+  // for what actually executed; local state only expresses INTENT.
+  /**
+   * Where local state stands relative to the broker:
+   *   pending        — not yet reconciled against the broker
+   *   verified       — broker position matches local; safe for research/learning
+   *   discrepancy    — broker and local disagreed; local was corrected to broker
+   *   manual_review  — closed on broker truth but P&L can't be reconstructed
+   * Only `verified` trades may auto-enter the research/learning dataset.
+   */
+  reconciliationStatus: 'pending' | 'verified' | 'discrepancy' | 'manual_review'
+  /** Broker's position qty at the last reconcile — the fact local must not override. */
+  brokerVerifiedQty: number | null
+  lastReconciledAt: number | null
+  /** Execution anomalies worth surfacing: stale-state closes, qty mismatches, rejects. */
+  executionWarnings: string[]
 }
 
 export function newPaperTrade(
@@ -252,6 +297,10 @@ export function newPaperTrade(
     createdAt: now,
     updatedAt: now,
     notes: [],
+    reconciliationStatus: 'pending',
+    brokerVerifiedQty: null,
+    lastReconciledAt: null,
+    executionWarnings: [],
   }
 }
 

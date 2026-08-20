@@ -60,12 +60,33 @@ function normalizeTrade(t: PaperTrade): PaperTrade {
   }
 }
 
+/**
+ * Records that belong to ET trading `day` (by signal-creation), PLUS any trade
+ * still ACTIVE regardless of day so a position opened before an ET-midnight
+ * rollover stays managed to flat.
+ *
+ * A per-ET-day file/report must never mix sessions. On 2026-08-18 it did: the
+ * daemon's in-memory list carried Monday's TERMINAL trades across the ET-midnight
+ * rollover and a mid-morning restart rehydrated them from the (already
+ * contaminated) Tuesday file, so Monday's closed STFS (+$1,782, broker-verified)
+ * surfaced in Tuesday's summary, skewed the daily loss-limit math, and would have
+ * passed the learning gate. `createdAt` is the signal-creation instant, so its ET
+ * day is the trade's true session — the authority for which file/report it belongs
+ * to. Only closed/aborted trades from OTHER days are dropped; today's stay, and
+ * open/pending stay for management. This self-heals the file on the next save.
+ */
+export function scopeToTradingDay(trades: PaperTrade[], day = etDayKey()): PaperTrade[] {
+  return trades.filter(
+    t => etDayKey(t.createdAt) === day || t.state === 'pending_entry' || t.state === 'open',
+  )
+}
+
 export function loadTrades(day = etDayKey()): PaperTrade[] {
   const file = tradesFile(day)
   try {
     if (!existsSync(file)) return []
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as PaperTrade[]
-    return Array.isArray(parsed) ? parsed.map(normalizeTrade) : []
+    return Array.isArray(parsed) ? scopeToTradingDay(parsed.map(normalizeTrade), day) : []
   } catch {
     return []
   }
@@ -73,7 +94,7 @@ export function loadTrades(day = etDayKey()): PaperTrade[] {
 
 export function saveTrades(trades: PaperTrade[], day = etDayKey()): void {
   try {
-    writeFileSync(tradesFile(day), JSON.stringify(trades, null, 2))
+    writeFileSync(tradesFile(day), JSON.stringify(scopeToTradingDay(trades, day), null, 2))
   } catch (e) {
     console.error('paper-trade state save failed:', (e as Error).message)
   }

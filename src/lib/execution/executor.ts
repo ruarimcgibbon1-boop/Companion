@@ -22,7 +22,7 @@ import type { Broker, PaperTrade, ExitReason, ExitLeg } from './types'
 import { newPaperTrade, computeRealized } from './types'
 import { sizePosition, entryLimitPrice, exitLimitPrice, DEFAULT_SIZING, type SizingConfig } from './sizing'
 import { canOpenPosition, DEFAULT_RISK, type RiskConfig } from './risk'
-import { loadTrades, saveTrades, appendEvent, isHalted } from './store'
+import { loadTrades, saveTrades, appendEvent, isHalted, etDayKey } from './store'
 
 export interface ExecutorConfig {
   sizing: SizingConfig
@@ -116,6 +116,19 @@ export function slippagePct(intended: number, fill: number): number | null {
   return ((fill - intended) / intended) * 100
 }
 
+/**
+ * Does this broker rejection mean our local qty is ahead of the broker — i.e. we
+ * tried to sell more than we hold, or a position that is already flat? These all
+ * signal "reconcile, don't retry blind" rather than "try again":
+ *   - "cannot be sold short"                (FIGR: sold a position already flat)
+ *   - "insufficient qty available"          (FIGR: local 553 vs broker 0/6)
+ *   - "stop price must be less than ..."     (WOK: price already through the stop)
+ */
+export function isQtyOrShortRejection(reason: string | null): boolean {
+  if (!reason) return false
+  return /cannot be sold short|insufficient qty|must be less than current price|held_for_orders/i.test(reason)
+}
+
 export class PaperExecutor {
   private trades: PaperTrade[] = []
   private startingEquity = 0
@@ -164,8 +177,31 @@ export class PaperExecutor {
     return this.trades.filter(t => t.state === 'pending_entry' || t.state === 'open')
   }
 
+  /**
+   * Trades belonging to the current ET session — the ONLY correct basis for any
+   * "today" accounting. `this.trades` accumulates across ET days in a
+   * long-running process (and a restart can rehydrate a prior day), so every
+   * daily count/P&L/loss-limit input MUST scope by the signal-creation day, not
+   * read the raw list. See store.scopeToTradingDay for the 2026-08-18 incident.
+   */
+  private todaysTrades(): PaperTrade[] {
+    const day = etDayKey()
+    return this.trades.filter(t => etDayKey(t.createdAt) === day)
+  }
+
   closedToday(): PaperTrade[] {
-    return this.trades.filter(t => t.state === 'closed')
+    return this.todaysTrades().filter(t => t.state === 'closed')
+  }
+
+  /**
+   * THE LEARNING GATE. Only broker-`verified` closed trades may feed research or
+   * post-trade review — a trade whose local record disagreed with Alpaca
+   * (discrepancy / manual_review) is not trustworthy evidence and must be excluded
+   * until a human confirms it. Any future live→learning ingestion must read from
+   * HERE, never from allTrades().
+   */
+  verifiedClosedTrades(): PaperTrade[] {
+    return this.todaysTrades().filter(t => t.state === 'closed' && t.reconciliationStatus === 'verified')
   }
 
   allTrades(): PaperTrade[] {
@@ -343,6 +379,14 @@ export class PaperExecutor {
         this.log(`manage failed ${trade.symbol}: ${(e as Error).message}`)
       }
     }
+    // Post-close verification: a trade that closed cleanly this tick is still
+    // `pending` until the broker confirms it flat. reconcile stamps it `verified`
+    // (or flags a discrepancy) — the gate the learning dataset reads.
+    for (const trade of this.trades) {
+      if (trade.state === 'closed' && trade.reconciliationStatus === 'pending') {
+        try { await this.reconcile(trade, now) } catch { /* leave pending; retried next tick */ }
+      }
+    }
     this.persist()
   }
 
@@ -471,6 +515,43 @@ export class PaperExecutor {
     if (trade.openQty <= 0) this.closeTrade(trade)
   }
 
+  /**
+   * Price the shares an EXTERNAL order closed (dashboard flatten, broker
+   * liquidation) from the broker's own fill ledger, so realized P&L reconciles
+   * instead of being lost as null. Books one synthetic `external` exit leg for the
+   * unaccounted remainder at the volume-weighted price of the sell fills that did
+   * NOT come from our own legs. Accounting only — it places no order and changes no
+   * exit decision; the trade stays `manual_review` and out of learning.
+   */
+  private async bookExternalClose(trade: PaperTrade): Promise<void> {
+    const remainder = trade.openQty
+    if (remainder <= 0 || !this.broker.getRecentFills) return
+    const since = trade.entryFilledAt ?? trade.entrySubmittedAt ?? trade.createdAt
+    const fills = await this.broker.getRecentFills(trade.symbol, since)
+    // Fills already accounted for by our own legs (and the resting stop) must not be
+    // double-counted; anything left is the external close.
+    const ours = new Set<string>()
+    for (const leg of trade.exits) if (leg.orderId) ours.add(leg.orderId)
+    if (trade.protectiveStopOrderId) ours.add(trade.protectiveStopOrderId)
+    const external = fills.filter(f => f.side === 'sell' && f.qty > 0 && !(f.orderId && ours.has(f.orderId)))
+    const extQty = external.reduce((s, f) => s + f.qty, 0)
+    if (extQty <= 0) return
+    const qty = Math.min(remainder, extQty)
+    const vwap = external.reduce((s, f) => s + f.price * f.qty, 0) / extQty
+    const leg: ExitLeg = {
+      qty, reason: 'external', intendedPrice: trade.currentStop, decisionPrice: null,
+      orderId: null, fillPrice: vwap, filledAt: external[external.length - 1]?.filledAt ?? Date.now(),
+      slippagePct: null,
+    }
+    trade.exits.push(leg)
+    trade.openQty = Math.max(0, trade.openQty - qty)
+    appendEvent({
+      event: 'external_close_priced', symbol: trade.symbol, tradeId: trade.id,
+      qty, vwap, extFills: external.length,
+    })
+    this.log(`EXTERNAL CLOSE ${trade.symbol} ${qty} sh @ ${vwap.toFixed(4)} (${external.length} broker fills) — priced for reporting, kept in manual_review`)
+  }
+
   private closeTrade(trade: PaperTrade): void {
     trade.state = 'closed'
     trade.fullyClosed = trade.exits.every(l => l.reason !== 'time')
@@ -490,7 +571,80 @@ export class PaperExecutor {
     })
   }
 
+  /**
+   * Broker-authoritative reconciliation — Alpaca is the fact, local state is only
+   * intent. Returns the broker's position qty. The single place local qty is
+   * allowed to be overwritten. Cheap in the common case (one getPosition, compare);
+   * the corrective branches fire only on a real disagreement.
+   */
+  private async reconcile(trade: PaperTrade, now: number = Date.now()): Promise<number> {
+    let brokerQty: number
+    try {
+      const pos = await this.broker.getPosition(trade.symbol)
+      brokerQty = pos?.qty ?? 0
+    } catch (e) {
+      // Can't reach broker truth → do NOT act on a guess; leave state untouched.
+      this.log(`reconcile: broker query failed ${trade.symbol}: ${(e as Error).message}`)
+      return trade.openQty
+    }
+    trade.brokerVerifiedQty = brokerQty
+    trade.lastReconciledAt = now
+    const localQty = trade.openQty
+
+    if (brokerQty === localQty) {
+      // Broker agrees. Promote a finished trade to verified — the only path into
+      // the research/learning dataset (see verifiedClosedTrades).
+      if (trade.state === 'closed' && trade.reconciliationStatus === 'pending') {
+        trade.reconciliationStatus = 'verified'
+      }
+      return brokerQty
+    }
+
+    if (brokerQty === 0 && localQty > 0) {
+      // We believe we hold; the broker is flat. Settle our own working legs first
+      // in case one of ours just filled — that turns this into a clean close.
+      await this.reconcileExits(trade).catch(() => {})
+      if (trade.openQty > 0) {
+        // Still unaccounted → closed by an unrecorded or EXTERNAL order (FIGR
+        // 2026-08-17; EL/FSM 2026-08-19). Force flat on broker truth. The trade is
+        // still quarantined from learning (manual_review), but its P&L is NOT lost:
+        // we price the closed remainder from the broker's own fills so the daily
+        // $/R report is correct. On 2026-08-19 the naive path booked EL/FSM as $0
+        // and understated the session by ~$885. Only if the broker can't report its
+        // fills (no getRecentFills, or none found) does P&L stay unreconstructed.
+        const warn = `broker flat but local held ${trade.openQty} — closed by an unrecorded/external order`
+        trade.executionWarnings.push(warn)
+        this.touch(trade, warn)
+        appendEvent({ event: 'reconcile_forced_flat', symbol: trade.symbol, tradeId: trade.id, localQty: trade.openQty, brokerQty: 0 })
+        await this.bookExternalClose(trade).catch(e => this.log(`external-close pricing failed ${trade.symbol}: ${(e as Error).message}`))
+        trade.openQty = 0
+        trade.reconciliationStatus = 'manual_review'
+        this.closeTrade(trade)
+      }
+      await this.broker.cancelOpenOrders(trade.symbol).catch(() => {})
+      trade.protectiveStopOrderId = null
+      return 0
+    }
+
+    // Both nonzero but different (e.g. a partial fill we under-recorded, CAPR
+    // 2026-08-17) → adopt broker qty, flag the discrepancy.
+    const warn = `qty mismatch: local ${localQty}, broker ${brokerQty} — adopting broker`
+    trade.executionWarnings.push(warn)
+    trade.openQty = brokerQty
+    trade.reconciliationStatus = 'discrepancy'
+    this.touch(trade, warn)
+    appendEvent({ event: 'reconcile_qty_mismatch', symbol: trade.symbol, tradeId: trade.id, localQty, brokerQty })
+    if (brokerQty <= 0) this.closeTrade(trade)
+    return brokerQty
+  }
+
   private async manageOpen(trade: PaperTrade, price: number, etMinute: number, now: number): Promise<void> {
+    // BROKER TRUTH FIRST. Never manage a position the broker no longer shows, and
+    // never size an exit off a local qty the broker disagrees with. reconcile may
+    // close the trade outright (e.g. FIGR closed externally on 2026-08-17).
+    const brokerQty = await this.reconcile(trade, now)
+    if (trade.state !== 'open' || brokerQty <= 0) return
+
     const decision = decideExit(trade, price, etMinute, this.config.flattenEtMinute)
 
     if (!decision) {
@@ -505,17 +659,21 @@ export class PaperExecutor {
     await this.broker.cancelOpenOrders(trade.symbol)
     trade.protectiveStopOrderId = null
 
+    // Sell no more than the broker actually holds (openQty is broker-verified above).
+    const sellQty = Math.min(decision.qty, trade.openQty)
+    if (sellQty <= 0) return
+
     const session = getSessionType(now)
     const limit = exitLimitPrice(Math.min(price, decision.intendedPrice), this.config.exitSlipTolerancePct)
     const leg: ExitLeg = {
-      qty: decision.qty, reason: decision.reason, intendedPrice: decision.intendedPrice,
+      qty: sellQty, reason: decision.reason, intendedPrice: decision.intendedPrice,
       decisionPrice: price,
       orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
     }
 
     const order = await this.broker.submitLimit({
       symbol: trade.symbol,
-      qty: decision.qty,
+      qty: sellQty,
       side: 'sell',
       limitPrice: limit,
       extendedHours: session === 'premarket' || session === 'afterhours',
@@ -526,6 +684,9 @@ export class PaperExecutor {
       this.touch(trade, `exit ${decision.reason} rejected: ${order.rejectReason ?? 'unknown'}`)
       this.log(`EXIT REJECT ${trade.symbol} (${decision.reason}): ${order.rejectReason}`)
       appendEvent({ event: 'exit_rejected', symbol: trade.symbol, tradeId: trade.id, reason: decision.reason, detail: order.rejectReason })
+      // A qty/short rejection means our local state is ahead of the broker — the
+      // position is smaller or already flat. Reconcile rather than retrying blind.
+      if (isQtyOrShortRejection(order.rejectReason)) await this.reconcile(trade, now)
       return
     }
 
@@ -580,6 +741,11 @@ export class PaperExecutor {
     })
     if (order.status === 'rejected') {
       this.touch(trade, `protective stop rejected: ${order.rejectReason ?? 'unknown'}`)
+      // Two causes, both handled by asking the broker rather than re-submitting an
+      // impossible stop: price already crossed the stop, or the position is flat/
+      // smaller than we think. If still long, decideExit will fire a marketable
+      // exit on the next tick (the WOK path); if flat, reconcile closes the trade.
+      if (isQtyOrShortRejection(order.rejectReason)) await this.reconcile(trade, now)
       return
     }
     trade.protectiveStopOrderId = order.id
@@ -597,20 +763,28 @@ export class PaperExecutor {
       try {
         await this.broker.cancelOpenOrders(trade.symbol)
         trade.protectiveStopOrderId = null
+        // Broker truth before flattening — don't sell a position already closed.
+        const brokerQty = await this.reconcile(trade, Date.now())
+        if (trade.state !== 'open' || brokerQty <= 0) continue
         const prices = await this.getPrices([trade.symbol])
         const price = prices.get(trade.symbol)
         if (price == null) { this.touch(trade, 'flatten: no price'); continue }
+        const flatQty = Math.min(trade.openQty, brokerQty)
         const leg: ExitLeg = {
-          qty: trade.openQty, reason, intendedPrice: price, decisionPrice: price,
+          qty: flatQty, reason, intendedPrice: price, decisionPrice: price,
           orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
         }
         const order = await this.broker.submitLimit({
-          symbol: trade.symbol, qty: trade.openQty, side: 'sell',
+          symbol: trade.symbol, qty: flatQty, side: 'sell',
           limitPrice: exitLimitPrice(price, this.config.exitSlipTolerancePct),
           extendedHours: getSessionType() !== 'regular',
           clientOrderId: `${trade.id}:flat:${Math.floor(Date.now() / 1000)}`,
         })
-        if (order.status === 'rejected') { this.touch(trade, `flatten rejected: ${order.rejectReason}`); continue }
+        if (order.status === 'rejected') {
+          this.touch(trade, `flatten rejected: ${order.rejectReason}`)
+          if (isQtyOrShortRejection(order.rejectReason)) await this.reconcile(trade, Date.now())
+          continue
+        }
         leg.orderId = order.id
         trade.exits.push(leg)
         await this.reconcileExits(trade)
@@ -623,23 +797,39 @@ export class PaperExecutor {
 
   /** One-line end-of-session summary — the numbers paper trading exists to produce. */
   summary(): string {
+    // Scope every count to the current ET session — `this.trades` can hold prior
+    // days (midnight rollover / restart rehydration); see todaysTrades.
+    const today = this.todaysTrades()
     const closed = this.closedToday()
-    const filled = this.trades.filter(t => t.entryFillPrice != null)
-    const aborted = this.trades.filter(t => t.state === 'aborted')
-    const pnl = closed.reduce((s, t) => s + (t.realizedPnl ?? 0), 0)
-    const wins = closed.filter(t => (t.realizedPnl ?? 0) > 0).length
+    // A closed trade with no reconstructable realizedPnl (e.g. FIGR 2026-08-17:
+    // flattened by an EXTERNAL order the daemon never saw → manual_review, P&L
+    // null) is NOT a scoreable result. Counting it would tally a phantom loss and
+    // dilute the win rate. Score only trades whose P&L is known; report the rest
+    // as `unreconciled`, never as W/L.
+    const scored = closed.filter(t => t.realizedPnl != null)
+    const unreconciled = closed.length - scored.length
+    const filled = today.filter(t => t.entryFillPrice != null)
+    const aborted = today.filter(t => t.state === 'aborted')
+    const pnl = scored.reduce((s, t) => s + (t.realizedPnl ?? 0), 0)
+    const wins = scored.filter(t => (t.realizedPnl ?? 0) > 0).length
     const entrySlips = filled.map(t => t.entrySlippagePct).filter((n): n is number => n != null)
-    const exitSlips = this.trades.flatMap(t => t.exits.map(l => l.slippagePct)).filter((n): n is number => n != null)
+    const exitSlips = today.flatMap(t => t.exits.map(l => l.slippagePct)).filter((n): n is number => n != null)
     const mean = (xs: number[]) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null
     const fmt = (n: number | null) => n == null ? '—' : `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
     // Split exit slippage into what we can fix by polling faster (gap) vs what the
     // limit tolerance costs (concession). On 2026-08-10 that was −2.35% / −0.50%.
-    const legs = this.trades.flatMap(t => t.exits).filter(l => l.fillPrice != null && l.decisionPrice != null)
+    const legs = today.flatMap(t => t.exits).filter(l => l.fillPrice != null && l.decisionPrice != null)
     const gaps = legs.map(l => slippagePct(l.intendedPrice, l.decisionPrice!)).filter((n): n is number => n != null)
     const concessions = legs.map(l => slippagePct(l.decisionPrice!, l.fillPrice!)).filter((n): n is number => n != null)
+    // Reconciliation split — only `verified` closes are trustworthy evidence.
+    const byStatus = (s: PaperTrade['reconciliationStatus']) => closed.filter(t => t.reconciliationStatus === s).length
+    const flagged = today.filter(t => t.executionWarnings.length > 0)
     return [
-      `signals→trades: ${this.trades.length} considered, ${filled.length} filled, ${aborted.length} never filled`,
-      `closed ${closed.length} · ${wins}W/${closed.length - wins}L · P&L $${pnl.toFixed(2)}`,
+      `signals→trades: ${today.length} considered, ${filled.length} filled, ${aborted.length} never filled`,
+      `closed ${scored.length} · ${wins}W/${scored.length - wins}L · P&L $${pnl.toFixed(2)}` +
+        (unreconciled ? ` · ${unreconciled} unreconciled (P&L unrecoverable, excluded)` : ''),
+      `reconciliation — verified ${byStatus('verified')} · discrepancy ${byStatus('discrepancy')} · manual_review ${byStatus('manual_review')} · pending ${byStatus('pending')}`,
+      flagged.length ? `  ⚠ ${flagged.length} trade(s) with execution warnings: ${flagged.map(t => t.symbol).join(', ')}` : `  no execution warnings`,
       `mean entry slip ${fmt(mean(entrySlips))} · mean exit slip ${fmt(mean(exitSlips))}`,
       `  exit slip split — market gap ${fmt(mean(gaps))} (latency) · concession ${fmt(mean(concessions))} (limit tolerance)`,
     ].join('\n')

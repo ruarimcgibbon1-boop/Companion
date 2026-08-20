@@ -5,7 +5,7 @@ import { canOpenPosition, realizedPnlToday, openRisk } from '@/lib/execution/ris
 import { decideExit, slippagePct, PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { newPaperTrade, computeRealized } from '@/lib/execution/types'
 import type {
-  Broker, BrokerOrder, PaperTrade, LimitOrderRequest, StopOrderRequest,
+  Broker, BrokerOrder, BrokerFill, PaperTrade, LimitOrderRequest, StopOrderRequest,
 } from '@/lib/execution/types'
 import { mapStatus, roundToTick, AlpacaBroker } from '@/lib/execution/alpaca'
 import type { BuySignalRecord } from '@/types'
@@ -289,7 +289,12 @@ class FakeBroker implements Broker {
   holdOrder: (o: BrokerOrder) => boolean = () => false
   /** symbol → shares held, moved by fills. */
   held = new Map<string, number>()
+  /** Broker-side fill ledger — what getRecentFills reads, incl. external sells. */
+  fills: BrokerFill[] = []
   rejected: Array<{ qty: number; available: number }> = []
+  /** When set, the NEXT sell/stop rejects with this exact message (one-shot). Models
+   *  Alpaca's "cannot be sold short" / "stop price must be less than current price". */
+  rejectNextSellWith: string | null = null
   private seq = 0
 
   async getAccount() {
@@ -305,6 +310,11 @@ class FakeBroker implements Broker {
       symbol, qty, qtyAvailable: this.availableQty(symbol),
       avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0,
     }))
+  }
+  async getPosition(symbol: string) {
+    const qty = this.held.get(symbol) ?? 0
+    if (qty <= 0) return null
+    return { symbol, qty, qtyAvailable: this.availableQty(symbol), avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0 }
   }
 
   /**
@@ -335,9 +345,22 @@ class FakeBroker implements Broker {
     }
   }
 
+  /** One-shot custom rejection, e.g. "cannot be sold short". Consumed on use. */
+  private customReject(symbol: string, qty: number, clientOrderId: string, limitPrice: number | null): BrokerOrder | null {
+    if (this.rejectNextSellWith == null) return null
+    const rejectReason = this.rejectNextSellWith
+    this.rejectNextSellWith = null
+    return {
+      id: '', clientOrderId, symbol, side: 'sell', status: 'rejected',
+      qty, filledQty: 0, filledAvgPrice: limitPrice, limitPrice, submittedAt: Date.now(), rejectReason,
+    }
+  }
+
   async submitLimit(req: LimitOrderRequest): Promise<BrokerOrder> {
     this.submitted.push(req)
     if (req.side === 'sell') {
+      const custom = this.customReject(req.symbol, req.qty, req.clientOrderId, req.limitPrice)
+      if (custom) return custom
       const reject = this.rejectSell(req.symbol, req.qty, req.clientOrderId, req.limitPrice)
       if (reject) return reject
     }
@@ -353,6 +376,8 @@ class FakeBroker implements Broker {
 
   async submitStop(req: StopOrderRequest): Promise<BrokerOrder> {
     this.submitted.push(req)
+    const custom = this.customReject(req.symbol, req.qty, req.clientOrderId, null)
+    if (custom) return custom
     const reject = this.rejectSell(req.symbol, req.qty, req.clientOrderId, null)
     if (reject) return reject
     const id = `o${++this.seq}`
@@ -375,8 +400,20 @@ class FakeBroker implements Broker {
       o.filledAvgPrice = o.limitPrice
       const before = this.held.get(o.symbol) ?? 0
       this.held.set(o.symbol, before + (o.side === 'buy' ? o.filledQty : -o.filledQty))
+      this.fills.push({ symbol: o.symbol, side: o.side, qty: o.filledQty, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
     }
     return o
+  }
+
+  /** Model an order the daemon never placed (dashboard flatten / broker liquidation):
+   *  it moves broker shares and lands in the fill ledger with a foreign order id. */
+  injectExternalSell(symbol: string, qty: number, price: number) {
+    this.held.set(symbol, (this.held.get(symbol) ?? 0) - qty)
+    this.fills.push({ symbol, side: 'sell', qty, price, filledAt: Date.now(), orderId: 'external-1' })
+  }
+
+  async getRecentFills(symbol: string, sinceMs: number): Promise<BrokerFill[]> {
+    return this.fills.filter(f => f.symbol === symbol && f.filledAt >= sinceMs)
   }
 
   async cancelOrder(id: string) {
@@ -594,6 +631,132 @@ describe('PaperExecutor', () => {
     await ex.onSignal(signal())
     await ex.tick()
     expect(ex.summary()).toMatch(/mean entry slip \+0\.50%/)
+  })
+
+  // ── Monday 2026-08-17 regression fixture ─────────────────────────────────────
+  // Real broker sequences from the first profitable live session, each a failure
+  // mode the reconciliation ledger must now handle. Names match the live trades.
+
+  it('TEST A — STFS fast move: clean scale-out reaches VERIFIED', async () => {
+    // A winner that runs through both targets must close and reconcile to verified.
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal({ symbol: 'STFS' }))
+    await ex.tick()                       // entry fills
+    price = 11.2; await ex.tick()         // T1
+    price = 12.3; await ex.tick()         // T2 → closed
+    const t = ex.allTrades()[0]
+    expect(t.state).toBe('closed')
+    expect(t.reconciliationStatus).toBe('verified')
+    expect(t.brokerVerifiedQty).toBe(0)
+    expect(t.executionWarnings).toEqual([])
+  })
+
+  it('TEST B — CAPR normal stop: reconciles local position to zero, verified', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal({ symbol: 'CAPR' }))
+    await ex.tick()
+    price = 9.0; await ex.tick()          // stop breaks → marketable-limit exit
+    const t = ex.allTrades()[0]
+    expect(t.state).toBe('closed')
+    expect(t.openQty).toBe(0)
+    expect(t.reconciliationStatus).toBe('verified')
+  })
+
+  it('TEST C — FIGR stale stop: external close is detected, no new sell, verified flat', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal({ symbol: 'FIGR' }))
+    await ex.tick()                       // entry fills; broker.held FIGR = qty
+    const t = ex.allTrades()[0]
+    expect(t.state).toBe('open')
+    const qtyHeld = t.openQty
+
+    // An EXTERNAL order flattens the position — the broker is now flat, but the
+    // executor never saw a Companion fill (this is the exact FIGR bug).
+    broker.held.set('FIGR', 0)
+    const sellsBefore = broker.submitted.filter(o => 'side' in o && (o as LimitOrderRequest).side === 'sell').length
+
+    price = 34.4; await ex.tick()         // next management tick
+
+    expect(t.state).toBe('closed')
+    expect(t.openQty).toBe(0)
+    expect(qtyHeld).toBeGreaterThan(0)
+    // No NEW sell was submitted against the already-flat position (no stale short).
+    const sellsAfter = broker.submitted.filter(o => 'side' in o && (o as LimitOrderRequest).side === 'sell').length
+    expect(sellsAfter).toBe(sellsBefore)
+    // Closed on broker truth we can't price → quarantined from learning.
+    expect(t.reconciliationStatus).toBe('manual_review')
+    expect(t.executionWarnings.join(' ')).toMatch(/external order/)
+    expect(ex.verifiedClosedTrades()).not.toContain(t)
+  })
+
+  it('TEST C2 — external close is PRICED from broker fills (P&L reconciles, still manual_review)', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal({ symbol: 'EL' }))
+    await ex.tick()                       // entry fills at 10.05; broker.held EL = qty
+    const t = ex.allTrades()[0]
+    const qtyHeld = t.openQty
+    expect(t.state).toBe('open')
+    expect(t.entryFillPrice).toBeCloseTo(10.05)
+
+    // An external order (dashboard flatten) sells the whole position at 11.00 —
+    // ABOVE our entry, so this trade was actually a WINNER the naive path booked as $0.
+    broker.injectExternalSell('EL', qtyHeld, 11.00)
+
+    price = 11.0; await ex.tick()         // reconcile sees broker flat, prices the close
+
+    expect(t.state).toBe('closed')
+    expect(t.openQty).toBe(0)
+    // P&L is now reconstructed from the broker's own fill, not lost as null.
+    expect(t.realizedPnl).toBeCloseTo((11.00 - 10.05) * qtyHeld)
+    expect(t.realizedPnl!).toBeGreaterThan(0)
+    expect(t.exits.some(l => l.reason === 'external')).toBe(true)
+    // Still quarantined from learning — pricing it doesn't make it a trusted W/L.
+    expect(t.reconciliationStatus).toBe('manual_review')
+    expect(ex.verifiedClosedTrades()).not.toContain(t)
+  })
+
+  it('TEST D — rejected protective stop reconciles instead of looping the impossible order', async () => {
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal({ symbol: 'WOK' }))
+    // The FIRST protective-stop placement (same tick as the entry fill) is rejected:
+    // price already through the stop. The buy is unaffected; only the sell rejects.
+    broker.rejectNextSellWith = 'stop price must be less than current price'
+    await ex.tick()                       // entry fills → stop attempt → rejected → reconcile
+
+    const t = ex.allTrades()[0]
+    // Still long (reconcile confirmed the broker still holds it), no protective stop set,
+    // and it did not keep the impossible order.
+    expect(t.state).toBe('open')
+    expect(t.protectiveStopOrderId).toBeNull()
+    expect(t.brokerVerifiedQty).toBe(t.openQty)
+    // A real stop break on the next tick exits via a marketable limit (the WOK path).
+    price = 9.0; await ex.tick()
+    expect(t.state).toBe('closed')
+    expect(t.reconciliationStatus).toBe('verified')
+  })
+
+  it('TEST E — partial fill: broker qty overrides the assumed remainder', async () => {
+    // CAPR case — a stop fills partially, local believes the remainder is open, but
+    // the broker is already flat. reconcile must adopt broker truth, not local.
+    const ex = build()
+    await ex.init()
+    await ex.onSignal(signal({ symbol: 'CAPR' }))
+    await ex.tick()
+    const t = ex.allTrades()[0]
+
+    // Simulate: our record still shows shares open, but the broker filled the rest
+    // externally/behind our polling and is now flat.
+    broker.held.set('CAPR', 0)
+    price = 11.0; await ex.tick()         // T1 territory, but reconcile runs first
+
+    expect(t.openQty).toBe(0)
+    expect(t.brokerVerifiedQty).toBe(0)
+    expect(t.state).toBe('closed')
   })
 })
 
