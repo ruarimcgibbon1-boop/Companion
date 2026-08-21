@@ -200,24 +200,35 @@ export class PaperExecutor {
       return
     }
 
-    // A position with a non-finite/negative-nonsense qty is unknown exposure → fail closed.
+    // A position with a non-finite qty is unknown exposure → fail closed.
     const malformed = positions.some(p => !p || typeof p.qty !== 'number' || !Number.isFinite(p.qty))
-    const positive = positions.filter(p => p && typeof p.qty === 'number' && Number.isFinite(p.qty) && p.qty > 0)
+    // ANY non-zero finite quantity is exposure — long (qty>0) OR short (qty<0). Only a
+    // true zero (0 / -0) is flat. A negative/manual short is exposure too and must
+    // never be silently ignored.
+    const exposed = positions.filter(p => p && typeof p.qty === 'number' && Number.isFinite(p.qty) && p.qty !== 0)
 
     let represented = 0
     let ambiguous = 0
-    for (const pos of positive) {
+    for (const pos of exposed) {
       const actives = this.openTrades().filter(t => t.symbol === pos.symbol) // pending_entry | open
-      if (actives.length === 1) { represented++; continue } // tick reconcile() owns this symbol
+      // REPRESENTED only when the local executor can already ACCOUNT for this exact
+      // exposure: exactly one active local trade, carrying positive local exposure,
+      // whose accounted open quantity EQUALS the broker quantity (same sign & size).
+      // This is NOT an ownership claim; it only says the tick reconcile() already owns
+      // this symbol's lifecycle at this quantity. Any surplus/deficit/short/pending
+      // (openQty 0) is unaccounted identity → AMBIGUOUS. avgEntryPrice is NOT used.
+      const only = actives.length === 1 ? actives[0] : null
+      if (only && only.openQty > 0 && only.openQty === pos.qty) { represented++; continue }
       ambiguous++
       appendEvent({
         event: 'startup_orphan_detected',
         symbol: pos.symbol, qty: pos.qty, avgEntryPrice: pos.avgEntryPrice,
         activeLocalTradeIds: actives.map(t => t.id),
         activeLocalSetupIds: actives.map(t => t.setupId),
+        activeLocalOpenQty: actives.map(t => t.openQty),
         classification: 'AMBIGUOUS_BROKER_POSITION',
       })
-      this.log(`AMBIGUOUS broker position ${pos.symbol} ${pos.qty} sh — ${actives.length} active local trades; blocking new entries`)
+      this.log(`AMBIGUOUS broker position ${pos.symbol} ${pos.qty} sh — ${actives.length} active local trade(s), openQty [${actives.map(t => t.openQty).join(',')}]; blocking new entries`)
     }
 
     this.reconciliationUnresolved = ambiguous > 0 || malformed
@@ -226,7 +237,7 @@ export class PaperExecutor {
     }
     appendEvent({
       event: 'startup_reconciliation',
-      brokerPositionCount: positive.length,
+      brokerPositionCount: exposed.length,
       representedCount: represented,
       ambiguousCount: ambiguous,
       reconciliationUnresolved: this.reconciliationUnresolved,

@@ -323,7 +323,8 @@ class FakeBroker implements Broker {
   async getPositions() {
     if (this.throwGetPositions) throw new Error('positions unavailable')
     if (this.positionsOverride !== undefined) return this.positionsOverride as never
-    return [...this.held.entries()].filter(([, q]) => q > 0).map(([symbol, qty]) => ({
+    // Report any non-zero holding (shorts included), like a real broker.
+    return [...this.held.entries()].filter(([, q]) => q !== 0).map(([symbol, qty]) => ({
       symbol, qty, qtyAvailable: this.availableQty(symbol),
       avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0,
     }))
@@ -841,16 +842,77 @@ describe('PaperExecutor', () => {
       expect((await ex.onSignal(signal(), { sessionVolume: 10_000_000 })).taken).toBe(false)
     })
 
-    it('I: represented active local trade → existing tick reconcile qty-mismatch behaviour unchanged', async () => {
+    it('I: represented active local trade → existing tick reconcile behaviour unchanged (exact match)', async () => {
       mockStore.loaded = [activeTrade({ openQty: 1000 })]
-      broker.held.set('TEST', 800)                                 // broker holds fewer than local
+      broker.held.set('TEST', 1000)                                // EXACT match → represented
       const ex = build(); await ex.init()
-      expect(ex.isReconciliationUnresolved()).toBe(false)          // represented, not ambiguous
-      price = 10
-      await ex.tick()                                              // normal reconcile adopts broker truth
-      const t = ex.allTrades()[0]
-      expect(t.openQty).toBe(800)
-      expect(t.reconciliationStatus).toBe('discrepancy')
+      expect(ex.isReconciliationUnresolved()).toBe(false)
+      price = 10.05
+      await ex.tick()                                              // normal management, undisturbed
+      expect(ex.allTrades()[0].state).toBe('open')
+    })
+
+    // ── tightened classification (hostile-review findings) ──────────────────
+    it('J: broker qty > local openQty (surplus) → AMBIGUOUS, blocked, no ownership claim', async () => {
+      mockStore.loaded = [activeTrade({ openQty: 100 })]
+      broker.held.set('TEST', 150)                                 // 50 unaccounted
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(true)
+      expect((await ex.onSignal(signal({ setupId: 'x', symbol: 'X' }), { sessionVolume: 10_000_000 })).taken).toBe(false)
+      expect(ex.allTrades()[0].openQty).toBe(100)                  // startup did NOT adopt the 150
+    })
+
+    it('K: broker qty < local openQty (deficit) → AMBIGUOUS, blocked', async () => {
+      mockStore.loaded = [activeTrade({ openQty: 100 })]
+      broker.held.set('TEST', 80)
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(true)
+      expect((await ex.onSignal(signal({ setupId: 'x', symbol: 'X' }), { sessionVolume: 10_000_000 })).taken).toBe(false)
+    })
+
+    it('L: negative broker position + no local trade → exposure, AMBIGUOUS, blocked (not treated as flat)', async () => {
+      broker.held.set('SHORTY', -100)
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(true)
+      expect((await ex.onSignal(signal(), { sessionVolume: 10_000_000 })).taken).toBe(false)
+      expect(broker.held.get('SHORTY')).toBe(-100)                 // NOT liquidated
+    })
+
+    it('M: local long + broker NEGATIVE same symbol → sign mismatch, AMBIGUOUS, blocked', async () => {
+      mockStore.loaded = [activeTrade({ openQty: 100 })]
+      broker.held.set('TEST', -100)                                // opposite sign — never represented by abs-equality
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(true)
+      expect((await ex.onSignal(signal({ setupId: 'x', symbol: 'X' }), { sessionVolume: 10_000_000 })).taken).toBe(false)
+    })
+
+    it('N: pending_entry (openQty 0) + broker positive → AMBIGUOUS, blocked (not represented)', async () => {
+      mockStore.loaded = [activeTrade({ state: 'pending_entry', openQty: 0 })]
+      broker.held.set('TEST', 100)
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(true)
+      expect((await ex.onSignal(signal({ setupId: 'x', symbol: 'X' }), { sessionVolume: 10_000_000 })).taken).toBe(false)
+    })
+
+    it('O: qty = 0 position → treated as flat, ignored, clean startup', async () => {
+      broker.positionsOverride = [{ symbol: 'ZED', qty: 0, qtyAvailable: 0, avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0 }]
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(false)
+      expect((await ex.onSignal(signal(), { sessionVolume: 10_000_000 })).taken).toBe(true)
+    })
+
+    it('P: fractional EXACT match → represented, resolved', async () => {
+      mockStore.loaded = [activeTrade({ openQty: 12.5 })]
+      broker.held.set('TEST', 12.5)
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(false)
+    })
+
+    it('Q: NaN qty → malformed, fail closed', async () => {
+      broker.positionsOverride = [{ symbol: 'BAD', qty: NaN, qtyAvailable: 0, avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0 }]
+      const ex = build(); await ex.init()
+      expect(ex.isReconciliationUnresolved()).toBe(true)
+      expect((await ex.onSignal(signal(), { sessionVolume: 10_000_000 })).taken).toBe(false)
     })
   })
 
