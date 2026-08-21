@@ -156,6 +156,97 @@ describe('ExecutionObserver — passive, read-only, bid/trade evidence separate'
   })
 })
 
+describe('ExecutionObserver — stale-feed freshness guard (fail closed)', () => {
+  const NOW = 1_700_000_000_000
+  const FRESH = NOW - 1_000            // 1 s old
+  const STALE = NOW - 15 * 3600_000    // ~15 h old (prior session), like the 2026-08-21 soak
+  // Prices below are deliberately ≤ the 4.84 stop, so only staleness can suppress a breach.
+
+  it('fresh quote + fresh trade → normal semantics, ages recorded, breach asserted', async () => {
+    const feed = new FakeFeed()
+    feed.quote = { symbol: 'UUU', bidPrice: 4.80, askPrice: 4.85, sourceTs: FRESH }
+    feed.trade = { symbol: 'UUU', price: 4.82, sourceTs: FRESH }
+    const rows: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => rows.push(r), () => NOW).observe(ctx())
+    const o = rows[0]
+    expect(o.quoteFresh).toBe(true); expect(o.tradeFresh).toBe(true)
+    expect(o.quoteAgeMs).toBe(1_000); expect(o.tradeAgeMs).toBe(1_000)
+    expect(o.observedBidAtOrBelowStop).toBe(true)
+    expect(o.observedTradeAtOrBelowStop).toBe(true)
+    expect(o.observedBreach).toBe(true)
+  })
+
+  it('stale quote + fresh trade → quote asserts nothing (null), trade still evaluated', async () => {
+    const feed = new FakeFeed()
+    feed.quote = { symbol: 'UUU', bidPrice: 4.80, askPrice: 4.85, sourceTs: STALE }
+    feed.trade = { symbol: 'UUU', price: 4.82, sourceTs: FRESH }
+    const rows: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => rows.push(r), () => NOW).observe(ctx())
+    const o = rows[0]
+    expect(o.quoteFresh).toBe(false)
+    expect(o.observedBidAtOrBelowStop).toBeNull()   // stale → not true/false
+    expect(o.tradeFresh).toBe(true)
+    expect(o.observedTradeAtOrBelowStop).toBe(true)
+    expect(o.observedBreach).toBe(true)             // from the FRESH trade only
+    expect(o.observedBid).toBe(4.80)                // raw provenance retained
+  })
+
+  it('fresh quote + stale trade → trade asserts nothing (null), quote still evaluated', async () => {
+    const feed = new FakeFeed()
+    feed.quote = { symbol: 'UUU', bidPrice: 4.80, askPrice: 4.85, sourceTs: FRESH }
+    feed.trade = { symbol: 'UUU', price: 4.82, sourceTs: STALE }
+    const rows: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => rows.push(r), () => NOW).observe(ctx())
+    const o = rows[0]
+    expect(o.tradeFresh).toBe(false)
+    expect(o.observedTradeAtOrBelowStop).toBeNull()
+    expect(o.observedTradePrice).toBe(4.82)         // raw provenance retained
+    expect(o.observedBidAtOrBelowStop).toBe(true)
+  })
+
+  it('both stale + below stop → NO breach asserted (both null), and no breach latency', async () => {
+    const feed = new FakeFeed()
+    feed.quote = { symbol: 'UUU', bidPrice: 4.80, askPrice: 4.85, sourceTs: STALE }
+    feed.trade = { symbol: 'UUU', price: 4.82, sourceTs: STALE }
+    const rows: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => rows.push(r), () => NOW).observe(ctx())
+    const o = rows[0]
+    expect(o.quoteFresh).toBe(false); expect(o.tradeFresh).toBe(false)
+    expect(o.observedBidAtOrBelowStop).toBeNull()
+    expect(o.observedTradeAtOrBelowStop).toBeNull()
+    expect(o.observedBreach).toBe(false)            // stale-below-stop cannot assert a breach
+    expect(o.observationDropped).toBe(false)        // NOT dropped — it was a successful read
+  })
+
+  it('previous-day timestamps (the exact soak shape) are rejected as stale', async () => {
+    const now = Date.parse('2026-08-21T10:59:05Z')
+    const feed = new FakeFeed()
+    feed.quote = { symbol: 'BITO', bidPrice: 9.8, askPrice: 9.86, sourceTs: Date.parse('2026-08-20T20:59:59Z') }
+    feed.trade = { symbol: 'BITO', price: 9.82, sourceTs: Date.parse('2026-08-20T20:51:50Z') }
+    const rows: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => rows.push(r), () => now).observe(ctx({ symbol: 'BITO', stopPrice: 10.155415 }))
+    const o = rows[0]
+    expect(o.quoteFresh).toBe(false); expect(o.tradeFresh).toBe(false)
+    expect(o.quoteAgeMs).toBeGreaterThan(3600_000)  // ~14 h
+    expect(o.observedBidAtOrBelowStop).toBeNull()
+    expect(o.observedTradeAtOrBelowStop).toBeNull()
+    expect(o.observedBreach).toBe(false)
+  })
+
+  it('threshold is configurable: a tighter maxAgeMs flips a borderline sample to stale', async () => {
+    const feed = new FakeFeed()
+    feed.trade = { symbol: 'UUU', price: 4.80, sourceTs: NOW - 5_000 } // 5 s old
+    const fresh: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => fresh.push(r), () => NOW).observe(ctx()) // default 120 s
+    expect(fresh[0].tradeFresh).toBe(true)
+    expect(fresh[0].observedTradeAtOrBelowStop).toBe(true)
+    const strict: ExecutionQualityObservation[] = []
+    await new ExecutionObserver(feed, r => strict.push(r), () => NOW, 2_000).observe(ctx()) // 2 s window
+    expect(strict[0].tradeFresh).toBe(false)
+    expect(strict[0].observedTradeAtOrBelowStop).toBeNull()
+  })
+})
+
 function timerHarness() {
   const timers: Array<{ cb: () => void }> = []
   const setTimer = (cb: () => void) => { const t = { cb }; timers.push(t); return () => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1) } }
@@ -231,6 +322,7 @@ describe('deriveLatencies — bid vs trade kept separate, unknown ≠ zero', () 
     stopPrice: 4.84, executionPath: 'polled', observedFeed: 'fake-iex', feedConsolidated: false,
     quoteStatus: 'ok', tradeStatus: 'ok',
     observedTradePrice: null, observedTradeTs: null, observedBid: null, observedAsk: null, observedQuoteTs: null,
+    quoteAgeMs: null, tradeAgeMs: null, quoteFresh: null, tradeFresh: null,
     observedBidAtOrBelowStop: null, observedTradeAtOrBelowStop: null, observedBreach: false, observationDropped: false,
     monitorPrice: 4.86, monitorRequestStartTs: 900, monitorResponseTs: 1000, monitorQuoteTs: null,
     effectivePollIntervalMs: 3000, ...over,

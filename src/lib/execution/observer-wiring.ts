@@ -61,7 +61,9 @@ export function makeObserverLoop(
   opts: ObserverWiringOpts = {},
 ): ObserverLoop {
   const record = opts.record ?? ((row: ExecutionQualityObservation) => appendExecutionQuality({ kind: 'observation', ...row }))
-  const observer = new ExecutionObserver(source, record)
+  // Freshness threshold: default 120 s (see ExecutionObserver), overridable for a soak via EQ_MAX_STALE_MS.
+  const maxStaleMs = Number(process.env.EQ_MAX_STALE_MS) || undefined
+  const observer = new ExecutionObserver(source, record, undefined, maxStaleMs)
   return new ObserverLoop(
     observer,
     () => heldObserveContexts(src, opts.session),

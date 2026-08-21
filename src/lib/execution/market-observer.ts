@@ -92,9 +92,19 @@ export interface ExecutionQualityObservation {
   observedBid: number | null
   observedAsk: number | null
   observedQuoteTs: number | null
-  /** Executable-price evidence: bid ≤ stop (a long exits at the bid). Null when no quote → unknown. */
+  // ── Freshness (the stale-feed guard) ─────────────────────────────────────
+  /** Age of the quote at observation (wall − sourceTs), ms. Null when no quote/timestamp. Raw provenance is kept even when stale. */
+  quoteAgeMs: number | null
+  /** Age of the trade at observation, ms. Null when no trade/timestamp. */
+  tradeAgeMs: number | null
+  /** True = quote is recent enough to reason about (age ≤ maxAgeMs). False = STALE. Null = no quote to judge. */
+  quoteFresh: boolean | null
+  /** True = trade is recent enough. False = STALE. Null = no trade to judge. */
+  tradeFresh: boolean | null
+
+  /** Executable-price evidence: bid ≤ stop (a long exits at the bid). Null when no quote OR the quote is STALE → unknown, never a breach. */
   observedBidAtOrBelowStop: boolean | null
-  /** Last-trade evidence: trade ≤ stop. Null when no trade → unknown. Kept SEPARATE from bid evidence. */
+  /** Last-trade evidence: trade ≤ stop. Null when no trade OR the trade is STALE. Kept SEPARATE from bid evidence. */
   observedTradeAtOrBelowStop: boolean | null
   /** Convenience OR of the two above — for readers that want "any breach on this feed", never for causal claims. */
   observedBreach: boolean
@@ -119,6 +129,14 @@ export class ExecutionObserver {
     private readonly source: MarketDataSource,
     private readonly record: ObservationRecorder,
     private readonly now: () => number = () => Date.now(),
+    // FRESHNESS THRESHOLD. A breach can only be asserted from data recent relative to
+    // the observation. The loop samples every ~2–3 s, so a genuinely current print —
+    // even in a thin premarket book — is seconds old; a prior-session IEX `latest`
+    // print is HOURS old (observed 2026-08-21 soak: ~14 h). 120 s sits far above the
+    // sampling cadence and any realistic thin-book print gap, yet far below any
+    // session-boundary staleness, so it separates the two without false positives on
+    // real-but-sparse data. Configurable + injectable for tests.
+    private readonly maxAgeMs: number = 120_000,
   ) {}
 
   forget(tradeId: string): void { this.lastObservedAt.delete(tradeId) }
@@ -153,8 +171,23 @@ export class ExecutionObserver {
 
     const bid = quote?.bidPrice ?? null
     const tradePrice = trade?.price ?? null
-    const bidAtOrBelow = bid == null ? null : bid <= ctx.stopPrice
-    const tradeAtOrBelow = tradePrice == null ? null : tradePrice <= ctx.stopPrice
+    const quoteTs = dropped ? null : quote?.sourceTs ?? null
+    const tradeTs = dropped ? null : trade?.sourceTs ?? null
+
+    // FRESHNESS GUARD (fail-closed). IEX single-venue `latest` returns prior-session
+    // prints (premarket especially) that sit below today's stop and would fake a
+    // breach. Age is wall − sourceTs; a leg is fresh only if we can PROVE recency
+    // (timestamp present AND age ≤ maxAgeMs). Unknown age ⇒ NOT fresh. A stale or
+    // unknown-age leg asserts NOTHING: its ≤-stop field is null (never true/false),
+    // so it contributes no breach and no breach latency. The raw price/timestamp are
+    // still recorded as provenance.
+    const quoteAgeMs = quoteTs == null ? null : wall - quoteTs
+    const tradeAgeMs = tradeTs == null ? null : wall - tradeTs
+    const quoteFresh = bid == null ? null : (quoteAgeMs != null && quoteAgeMs <= this.maxAgeMs)
+    const tradeFresh = tradePrice == null ? null : (tradeAgeMs != null && tradeAgeMs <= this.maxAgeMs)
+
+    const bidAtOrBelow = bid == null ? null : (quoteFresh === true ? bid <= ctx.stopPrice : null)
+    const tradeAtOrBelow = tradePrice == null ? null : (tradeFresh === true ? tradePrice <= ctx.stopPrice : null)
     const observedBreach = !dropped && (bidAtOrBelow === true || tradeAtOrBelow === true)
 
     const row: ExecutionQualityObservation = {
@@ -170,10 +203,14 @@ export class ExecutionObserver {
       quoteStatus,
       tradeStatus,
       observedTradePrice: tradePrice,
-      observedTradeTs: dropped ? null : trade?.sourceTs ?? null,
+      observedTradeTs: tradeTs,
       observedBid: bid,
       observedAsk: dropped ? null : quote?.askPrice ?? null,
-      observedQuoteTs: dropped ? null : quote?.sourceTs ?? null,
+      observedQuoteTs: quoteTs,
+      quoteAgeMs,
+      tradeAgeMs,
+      quoteFresh,
+      tradeFresh,
       observedBidAtOrBelowStop: bidAtOrBelow,
       observedTradeAtOrBelowStop: tradeAtOrBelow,
       observedBreach,
