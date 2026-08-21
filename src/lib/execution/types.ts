@@ -148,6 +148,7 @@ export type ExitReason =
   | 'stop'            // initial stop, or breakeven stop after T1
   | 'time'            // end-of-day flatten (the resolver's mark-to-close)
   | 'risk_halt'       // governor pulled the plug mid-trade
+  | 'invalid_geometry' // fail-closed unwind of a fill that printed at/below its own stop
   | 'external'        // closed by an order the daemon never placed (dashboard flatten,
                       //   broker liquidation) — priced from the broker's own fills so
                       //   P&L reconciles, but kept out of learning (manual_review)

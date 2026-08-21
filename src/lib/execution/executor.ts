@@ -398,7 +398,7 @@ export class PaperExecutor {
     const timedOut = trade.entrySubmittedAt != null && now - trade.entrySubmittedAt > this.config.entryTimeoutMs
 
     if (order.status === 'filled' || (order.filledQty > 0 && (timedOut || order.status === 'canceled'))) {
-      this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
+      await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
       if (order.status !== 'filled') await this.broker.cancelOrder(trade.entryOrderId)
       return
     }
@@ -415,7 +415,7 @@ export class PaperExecutor {
       // countable outcome — and a much better one than paying up to chase.
       await this.broker.cancelOrder(trade.entryOrderId)
       if (order.filledQty > 0) {
-        this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
+        await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
       } else {
         trade.state = 'aborted'
         this.touch(trade, `entry timed out unfilled after ${Math.round(this.config.entryTimeoutMs / 1000)}s`)
@@ -425,8 +425,8 @@ export class PaperExecutor {
     }
   }
 
-  private bookEntryFill(trade: PaperTrade, qty: number, price: number, now: number): void {
-    trade.state = 'open'
+  private async bookEntryFill(trade: PaperTrade, qty: number, price: number, now: number): Promise<void> {
+    // Provenance is recorded regardless of validity, so a malformed fill is fully auditable.
     // Which session we got filled in decides which risk budget this trade spends.
     trade.entrySession = getSessionType(now)
     trade.entryFillQty = qty
@@ -434,9 +434,24 @@ export class PaperExecutor {
     trade.entryFilledAt = now
     trade.openQty = qty
     trade.entrySlippagePct = slippagePct(trade.intendedEntry, price)
-    // Risk is re-derived from the real fill: a worse fill on the same stop is
-    // strictly more dollars at risk, and the governor should see the true number.
-    trade.plannedRisk = qty * Math.max(price - trade.initialStop, 0)
+
+    // FAIL CLOSED on post-fill stop inversion. This book is long-only (every exit is a
+    // sell), so a valid long fill MUST be strictly above its stop. A favorable fill that
+    // prints AT or BELOW the stop (ADXN 2026-08-21: 5.69 vs stop 5.7508) leaves the
+    // position already through its invalidation. The old `Math.max(price - stop, 0)`
+    // silently clamped planned risk to 0 and admitted it; instead we detect it, cancel
+    // any remainder, and flatten the filled shares — never a zero/negative-risk position.
+    const riskPerShare = price - trade.initialStop
+    if (!(riskPerShare > 0)) {
+      await this.handleInvalidPostFillGeometry(trade, qty, price, riskPerShare, now)
+      return
+    }
+
+    trade.state = 'open'
+    // Risk is re-derived from the real fill: a worse fill on the same stop is strictly
+    // more dollars at risk, and the governor should see the true number. No clamp — the
+    // non-positive (inverted) case is handled above.
+    trade.plannedRisk = qty * riskPerShare
     this.touch(trade)
     const slip = trade.entrySlippagePct
     this.log(
@@ -447,6 +462,64 @@ export class PaperExecutor {
       event: 'entry_filled', symbol: trade.symbol, tradeId: trade.id,
       qty, fillPrice: price, intendedEntry: trade.intendedEntry, slippagePct: slip,
     })
+  }
+
+  /**
+   * INVALID_POST_FILL_GEOMETRY: a filled long whose fill is at/below its stop is already
+   * through its invalidation. Fail closed — record deterministic evidence, cancel any
+   * unfilled remainder, and flatten the filled shares. Never carry it as a normal open
+   * position and never clamp planned risk to zero. Idempotent: repeated fill callbacks
+   * re-attempt the flatten but never duplicate the cancel/audit.
+   */
+  private async handleInvalidPostFillGeometry(trade: PaperTrade, qty: number, price: number, riskPerShare: number, now: number): Promise<void> {
+    const marker = 'INVALID_POST_FILL_GEOMETRY'
+    if (trade.executionWarnings.some(w => w.startsWith(marker))) { await this.flattenFilledQty(trade, now); return }
+    const originalPlannedRisk = trade.plannedRisk
+    // Record the REAL (non-positive) per-share risk × qty — never a silent zero.
+    trade.plannedRisk = qty * riskPerShare
+    trade.state = 'open' // transient: shares are held until the flatten settles
+    trade.executionWarnings.push(`${marker}: fill ${price} <= stop ${trade.initialStop} (filled ${qty}, intended ${trade.intendedEntry})`)
+    this.touch(trade, `${marker} — flattening ${qty} sh`)
+    this.log(`INVALID FILL ${trade.symbol} ${qty} sh @ ${price.toFixed(4)} <= stop ${trade.initialStop.toFixed(4)} — cancel remainder + flatten`)
+    appendEvent({
+      event: 'entry_invalid_geometry', reason: marker,
+      symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id,
+      fillPrice: price, initialStop: trade.initialStop, filledQty: qty,
+      intendedEntry: trade.intendedEntry, originalPlannedRisk,
+    })
+    // Cancel any unfilled remainder of the entry order (idempotent — cancels the symbol's working orders).
+    if (trade.entryOrderId) { try { await this.broker.cancelOpenOrders(trade.symbol) } catch { /* best-effort */ } }
+    await this.flattenFilledQty(trade, now)
+  }
+
+  /**
+   * Flatten this trade's held shares as an invalid-geometry unwind. Idempotent: if an
+   * invalid_geometry exit leg is already working, it only settles it (no duplicate sell);
+   * when nothing is left to sell it stamps the trade closed.
+   */
+  private async flattenFilledQty(trade: PaperTrade, now: number): Promise<void> {
+    if (trade.openQty <= 0) {
+      if (trade.state === 'open') { trade.state = 'closed'; this.touch(trade, 'invalid-geometry flatten complete') }
+      return
+    }
+    const working = trade.exits.find(l => l.reason === 'invalid_geometry' && l.orderId != null && l.fillPrice == null)
+    if (working) { await this.reconcileExits(trade); return }
+    const prices = await this.getPrices([trade.symbol]).catch(() => new Map<string, number>())
+    const price = prices.get(trade.symbol) ?? trade.entryFillPrice ?? trade.initialStop
+    const leg: ExitLeg = {
+      qty: trade.openQty, reason: 'invalid_geometry', intendedPrice: price, decisionPrice: price,
+      orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
+    }
+    const order = await this.broker.submitLimit({
+      symbol: trade.symbol, qty: trade.openQty, side: 'sell',
+      limitPrice: exitLimitPrice(price, this.config.exitSlipTolerancePct),
+      extendedHours: getSessionType(now) !== 'regular',
+      clientOrderId: `${trade.id}:invalidflat:${Math.floor(now / 1000)}`,
+    })
+    if (order.status === 'rejected') { this.touch(trade, `invalid-geometry flatten rejected: ${order.rejectReason}`); return }
+    leg.orderId = order.id
+    trade.exits.push(leg)
+    await this.reconcileExits(trade)
   }
 
   /** Settle working exit legs and the protective stop against the broker. */
@@ -639,6 +712,11 @@ export class PaperExecutor {
   }
 
   private async manageOpen(trade: PaperTrade, price: number, etMinute: number, now: number): Promise<void> {
+    // FAIL CLOSED: an open trade with non-positive planned risk is an invariant
+    // violation (post-fill stop inversion). Do NOT run normal exit management on it —
+    // unwind it via the invalid-geometry flatten instead. A valid fill always has
+    // plannedRisk > 0, so this never touches a legitimate position.
+    if (!(trade.plannedRisk > 0)) { await this.flattenFilledQty(trade, now); return }
     // BROKER TRUTH FIRST. Never manage a position the broker no longer shows, and
     // never size an exit off a local qty the broker disagrees with. reconcile may
     // close the trade outright (e.g. FIGR closed externally on 2026-08-17).

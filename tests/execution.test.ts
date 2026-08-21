@@ -287,6 +287,9 @@ class FakeBroker implements Broker {
   neverFill = new Set<string>()
   /** Same, by predicate — for orders the executor submits without telling the test their id. */
   holdOrder: (o: BrokerOrder) => boolean = () => false
+  /** Override how the NEXT buy order fills (favorable/partial price+qty) — models a fill
+   *  that lands better than the limit, e.g. below the stop. Applied to buy orders only. */
+  buyFill: { price?: number; qty?: number; status?: BrokerOrder['status'] } | null = null
   /** symbol → shares held, moved by fills. */
   held = new Map<string, number>()
   /** Broker-side fill ledger — what getRecentFills reads, incl. external sells. */
@@ -395,6 +398,15 @@ class FakeBroker implements Broker {
     const o = this.orders.get(id)
     if (!o) return null
     if (o.status === 'open' && !this.neverFill.has(id) && !this.holdOrder(o)) {
+      if (o.side === 'buy' && this.buyFill) {
+        const fq = this.buyFill.qty ?? o.qty
+        o.filledQty = fq
+        o.filledAvgPrice = this.buyFill.price ?? o.limitPrice
+        o.status = this.buyFill.status ?? (fq >= o.qty ? 'filled' : 'canceled')
+        this.held.set(o.symbol, (this.held.get(o.symbol) ?? 0) + fq)
+        this.fills.push({ symbol: o.symbol, side: 'buy', qty: fq, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
+        return o
+      }
       o.status = 'filled'
       o.filledQty = o.qty
       o.filledAvgPrice = o.limitPrice
@@ -483,6 +495,103 @@ describe('PaperExecutor', () => {
     expect(t().exits.map(l => l.reason)).toEqual(['t1', 't2'])
     expect(t().realizedPnl).toBeGreaterThan(0)
     expect(t().fullyClosed).toBe(true)
+  })
+
+  // ── Post-fill stop inversion — fail closed (ADXN 2026-08-21) ────────────────
+  describe('post-fill stop inversion', () => {
+    it('long fill BELOW stop: detected, flattened, never a zero-risk open position', async () => {
+      broker.buyFill = { price: 9.4 }   // fills below the 9.5 stop
+      price = 9.4
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('closed')                                   // not a normal open position
+      expect(t.executionWarnings.some(w => w.startsWith('INVALID_POST_FILL_GEOMETRY'))).toBe(true)
+      expect(t.plannedRisk).toBeLessThan(0)                            // REAL negative risk, never clamped to 0
+      expect(t.plannedRisk).not.toBe(0)
+      expect(t.exits.some(l => l.reason === 'invalid_geometry')).toBe(true)  // filled qty flattened
+      expect(broker.submitted.some(o => 'stopPrice' in o)).toBe(false)       // no protective stop placed
+      expect(broker.held.get('TEST') ?? 0).toBe(0)                    // shares unwound
+    })
+
+    it('long fill EXACTLY at stop: same fail-closed behaviour', async () => {
+      broker.buyFill = { price: 9.5 }   // exactly the stop → riskPerShare 0, not > 0
+      price = 9.5
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('closed')
+      expect(t.executionWarnings.some(w => w.startsWith('INVALID_POST_FILL_GEOMETRY'))).toBe(true)
+      expect(t.exits.some(l => l.reason === 'invalid_geometry')).toBe(true)
+      expect(t.plannedRisk).toBeLessThanOrEqual(0)
+    })
+
+    it('PARTIAL fill through stop: only filled qty flattened, remainder cancelled, idempotent', async () => {
+      broker.buyFill = { price: 9.4, qty: 700, status: 'canceled' }   // 700/1000 filled below stop, remainder unfilled
+      price = 9.4
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.entryFillQty).toBe(700)                                 // only the 700 that filled
+      expect(broker.canceled.length).toBeGreaterThan(0)               // remainder cancelled
+      const invalidLegs = t.exits.filter(l => l.reason === 'invalid_geometry')
+      expect(invalidLegs).toHaveLength(1)                             // exactly one flatten, for the 700
+      expect(invalidLegs[0].qty).toBe(700)
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+      // Idempotent: a repeat tick must not submit a second flatten or reopen anything.
+      const sellsBefore = broker.submitted.filter(o => (o as LimitOrderRequest).side === 'sell').length
+      await ex.tick()
+      const sellsAfter = broker.submitted.filter(o => (o as LimitOrderRequest).side === 'sell').length
+      expect(sellsAfter).toBe(sellsBefore)
+      expect(t.exits.filter(l => l.reason === 'invalid_geometry')).toHaveLength(1)
+    })
+
+    it('WORSE-but-valid fill above stop: recomputes larger positive risk, normal lifecycle', async () => {
+      broker.buyFill = { price: 10.2 }   // worse than intended 10, still above 9.5 stop
+      price = 10.2
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('open')
+      expect(t.executionWarnings.some(w => w.startsWith('INVALID_POST_FILL_GEOMETRY'))).toBe(false)
+      expect(t.plannedRisk).toBeCloseTo(1000 * (10.2 - 9.5), 5)       // more dollars at risk — existing behaviour
+      expect(t.exits.some(l => l.reason === 'invalid_geometry')).toBe(false)
+    })
+
+    it('FAVORABLE-but-valid fill above stop: smaller positive risk, normal lifecycle', async () => {
+      broker.buyFill = { price: 9.7 }    // better than intended 10, still above 9.5 stop
+      price = 9.7
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('open')
+      expect(t.plannedRisk).toBeCloseTo(1000 * (9.7 - 9.5), 5)        // smaller but positive
+      expect(t.plannedRisk).toBeGreaterThan(0)
+      expect(t.exits.some(l => l.reason === 'invalid_geometry')).toBe(false)
+    })
+
+    it('backstop: an open trade with non-positive planned risk fails canOpenPosition closed', () => {
+      const bad = trade({ symbol: 'TEST', state: 'open', plannedRisk: -50 })
+      const s = {
+        equity: 100_000, startingEquity: 100_000, brokerBlocked: false,
+        openTrades: [bad] as PaperTrade[], closedToday: [] as PaperTrade[], halted: false,
+        session: 'regular' as const,
+      }
+      const d = canOpenPosition('OTHER', 500, s)
+      expect(d.allowed).toBe(false)
+      if (!d.allowed) expect(d.reason).toMatch(/invalid open-position risk/i)
+    })
   })
 
   it('places a protective stop while a position is open in regular hours', async () => {

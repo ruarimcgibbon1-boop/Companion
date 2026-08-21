@@ -111,6 +111,19 @@ export function canOpenPosition(
     return { allowed: false, reason: 'broker reports the account blocked', terminal: true }
   }
 
+  // DEFENCE IN DEPTH: an open position with non-positive planned risk is an invariant
+  // violation (a post-fill stop inversion that escaped the fill-boundary guard). Its risk
+  // must NEVER read as zero — that would understate openRisk and permit additional risk.
+  // Fail closed: refuse new entries until it is unwound.
+  const invalidRisk = state.openTrades.find(t => !(t.plannedRisk > 0))
+  if (invalidRisk) {
+    return {
+      allowed: false,
+      terminal: true,
+      reason: `invalid open-position risk (${invalidRisk.symbol} plannedRisk ${invalidRisk.plannedRisk}) — fail closed`,
+    }
+  }
+
   const realized = realizedPnlToday(state.closedToday)
   const lossLimit = -Math.abs(state.startingEquity * config.dailyLossLimitFraction)
   if (realized <= lossLimit) {
