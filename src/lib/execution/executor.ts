@@ -18,7 +18,7 @@
 import type { BuySignalRecord } from '@/types'
 import { getSessionType, etMinutesOfDay } from '@/lib/market-hours'
 
-import type { Broker, PaperTrade, ExitReason, ExitLeg } from './types'
+import type { Broker, PaperTrade, ExitReason, ExitLeg, BrokerPosition } from './types'
 import { newPaperTrade, computeRealized } from './types'
 import { sizePosition, entryLimitPrice, exitLimitPrice, DEFAULT_SIZING, type SizingConfig } from './sizing'
 import { canOpenPosition, DEFAULT_RISK, type RiskConfig } from './risk'
@@ -134,6 +134,8 @@ export class PaperExecutor {
   private startingEquity = 0
   private equity = 0
   private brokerBlocked = false
+  /** Phase-1 startup exposure guard: true blocks all new entries (see reconcileStartupPositions). */
+  private reconciliationUnresolved = false
   /** Set when the governor returns a terminal verdict — no more entries today. */
   private haltedForDay: string | null = null
 
@@ -155,12 +157,80 @@ export class PaperExecutor {
     this.startingEquity = this.trades.length > 0 && this.trades[0].notes.length > 0
       ? this.startingEquityFromNotes() ?? account.equity
       : account.equity
+    // Phase-1 startup exposure reconciliation: make broker positions visible and fail
+    // closed on anything a loaded active local trade cannot represent (must run before
+    // any new entry is admitted).
+    await this.reconcileStartupPositions()
     this.log(
       `executor ready · ${this.broker.name} · equity ${account.equity.toFixed(2)} · ` +
       `${this.openTrades().length} open / ${this.trades.length} today` +
+      (this.reconciliationUnresolved ? ' · RECONCILIATION_UNRESOLVED (new entries blocked)' : '') +
       (this.config.dryRun ? ' · DRY_RUN' : ''),
     )
-    appendEvent({ event: 'init', broker: this.broker.name, equity: account.equity, restored: this.trades.length })
+    appendEvent({ event: 'init', broker: this.broker.name, equity: account.equity, restored: this.trades.length, reconciliationUnresolved: this.reconciliationUnresolved })
+  }
+
+  /** True while startup exposure is unresolved (positive broker position with no unique
+   *  active local owner, or a failed position query) — all new entries are blocked. */
+  isReconciliationUnresolved(): boolean {
+    return this.reconciliationUnresolved
+  }
+
+  /**
+   * PHASE 1 startup exposure reconciliation. Enumerate broker positions and fail closed
+   * on any positive exposure the executor cannot confidently represent. A position is
+   * REPRESENTED only when EXACTLY ONE loaded active local trade (pending_entry|open)
+   * exists for its symbol — meaning the normal tick reconcile() already owns that
+   * symbol's lifecycle. This is NOT an ownership claim and rewrites no setupId/tradeId;
+   * it does not adopt, mutate, or liquidate any broker position. Zero, or more than one,
+   * active local trade — or only closed history — is AMBIGUOUS: audit it and block new
+   * risk. A failed/malformed position query is treated as unknown exposure, never flat.
+   */
+  private async reconcileStartupPositions(): Promise<void> {
+    let positions: BrokerPosition[]
+    try {
+      const raw = await this.broker.getPositions()
+      if (!Array.isArray(raw)) throw new Error('getPositions did not return an array')
+      positions = raw
+    } catch (e) {
+      // "Could not fetch positions" is NEVER "broker is flat" — fail closed.
+      this.reconciliationUnresolved = true
+      this.log(`startup reconciliation ERROR — new entries blocked: ${(e as Error).message}`)
+      appendEvent({ event: 'startup_reconciliation_error', broker: this.broker.name, message: (e as Error).message })
+      return
+    }
+
+    // A position with a non-finite/negative-nonsense qty is unknown exposure → fail closed.
+    const malformed = positions.some(p => !p || typeof p.qty !== 'number' || !Number.isFinite(p.qty))
+    const positive = positions.filter(p => p && typeof p.qty === 'number' && Number.isFinite(p.qty) && p.qty > 0)
+
+    let represented = 0
+    let ambiguous = 0
+    for (const pos of positive) {
+      const actives = this.openTrades().filter(t => t.symbol === pos.symbol) // pending_entry | open
+      if (actives.length === 1) { represented++; continue } // tick reconcile() owns this symbol
+      ambiguous++
+      appendEvent({
+        event: 'startup_orphan_detected',
+        symbol: pos.symbol, qty: pos.qty, avgEntryPrice: pos.avgEntryPrice,
+        activeLocalTradeIds: actives.map(t => t.id),
+        activeLocalSetupIds: actives.map(t => t.setupId),
+        classification: 'AMBIGUOUS_BROKER_POSITION',
+      })
+      this.log(`AMBIGUOUS broker position ${pos.symbol} ${pos.qty} sh — ${actives.length} active local trades; blocking new entries`)
+    }
+
+    this.reconciliationUnresolved = ambiguous > 0 || malformed
+    if (malformed) {
+      appendEvent({ event: 'startup_reconciliation_error', broker: this.broker.name, message: 'malformed position entry (non-finite qty)' })
+    }
+    appendEvent({
+      event: 'startup_reconciliation',
+      brokerPositionCount: positive.length,
+      representedCount: represented,
+      ambiguousCount: ambiguous,
+      reconciliationUnresolved: this.reconciliationUnresolved,
+    })
   }
 
   private startingEquityFromNotes(): number | null {
@@ -261,6 +331,7 @@ export class PaperExecutor {
       closedToday: this.closedToday(),
       halted: isHalted(),
       session: getSessionType(Date.now()),
+      reconciliationUnresolved: this.reconciliationUnresolved,
     }, this.config.risk)
 
     if (!verdict.allowed) {

@@ -70,6 +70,14 @@ export interface RiskState {
    * clock so this module stays pure and the same limits can be replayed.
    */
   session: SessionType
+  /**
+   * Startup exposure reconciliation flag (Phase 1). True when the broker reported
+   * positive exposure the executor could not confidently represent with a loaded
+   * active local trade, OR the position query itself failed. Unknown broker exposure
+   * must NEVER count as flat, so while this is true all new entries fail closed.
+   * Optional so existing callers/tests default to false (resolved).
+   */
+  reconciliationUnresolved?: boolean
 }
 
 /** Trades whose ENTRY filled in premarket — the ones that spend the premarket budget. */
@@ -109,6 +117,14 @@ export function canOpenPosition(
   }
   if (state.brokerBlocked) {
     return { allowed: false, reason: 'broker reports the account blocked', terminal: true }
+  }
+
+  // STARTUP EXPOSURE FAIL-CLOSED (Phase 1). Positive broker exposure that no loaded
+  // active local trade represents (or a failed startup position query) is unresolved
+  // risk. It must never read as flat, so block ALL new entries until it is resolved.
+  // Existing positions keep being managed; only NEW exposure is refused.
+  if (state.reconciliationUnresolved) {
+    return { allowed: false, reason: 'startup_reconciliation_unresolved', terminal: true }
   }
 
   // DEFENCE IN DEPTH: an open position with non-positive planned risk is an invariant
