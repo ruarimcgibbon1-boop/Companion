@@ -334,7 +334,12 @@ export class PaperExecutor {
   /** Reconcile working orders, then run exits. Safe to call every sweep. */
   async tick(now: number = Date.now()): Promise<void> {
     const live = this.openTrades()
-    if (live.length === 0) return
+    // A CLOSED invalid-geometry trade (non-positive planned risk) — or any closed
+    // trade still pending verification — needs post-close reconciliation even on an
+    // otherwise-flat book, because a cancelled entry can fill late at the broker (the
+    // 2971c26 residual race). So don't short-circuit the tick when only such trades remain.
+    const needsPostClose = this.trades.some(t => t.state === 'closed' && (t.reconciliationStatus === 'pending' || !(t.plannedRisk > 0)))
+    if (live.length === 0 && !needsPostClose) return
 
     for (const trade of live) {
       try {
@@ -355,7 +360,8 @@ export class PaperExecutor {
     }
 
     const holding = this.trades.filter(t => t.state === 'open' && t.openQty > 0)
-    if (holding.length === 0) { this.persist(); return }
+    // Same guard as the tick head: keep going for post-close reconciliation work.
+    if (holding.length === 0 && !needsPostClose) { this.persist(); return }
 
     let prices: Map<string, number>
     try {
@@ -383,7 +389,15 @@ export class PaperExecutor {
     // `pending` until the broker confirms it flat. reconcile stamps it `verified`
     // (or flags a discrepancy) — the gate the learning dataset reads.
     for (const trade of this.trades) {
-      if (trade.state === 'closed' && trade.reconciliationStatus === 'pending') {
+      // Reconcile a freshly-closed trade (pending → verified/discrepancy). AND keep an
+      // INVALID-GEOMETRY closed trade (non-positive planned risk) eligible EVERY tick —
+      // even after it verified flat with openQty 0 — because its cancelled entry order
+      // can still fill late at the broker (the 2971c26 race). The `plannedRisk <= 0`
+      // marker persists, so this re-polls broker truth until the trade rolls over; a
+      // late fill promotes it back to open (reconcile), and a broker that stays flat is
+      // a harmless no-op. Narrow: only invalid trades poll, and they are rare.
+      const invalidResidualWatch = !(trade.plannedRisk > 0)
+      if (trade.state === 'closed' && (trade.reconciliationStatus === 'pending' || invalidResidualWatch)) {
         try { await this.reconcile(trade, now) } catch { /* leave pending; retried next tick */ }
       }
     }
@@ -663,6 +677,32 @@ export class PaperExecutor {
     trade.brokerVerifiedQty = brokerQty
     trade.lastReconciledAt = now
     const localQty = trade.openQty
+
+    // FAIL-CLOSED RESIDUAL RECOVERY. A locally-CLOSED execution trade whose broker
+    // truth still shows exposure AND whose planned risk is non-positive (invalid
+    // post-fill geometry) must NEVER stay closed/invisible — that is the late-fill-
+    // after-close stranding from the 2971c26 review. Promote it back to an explicitly
+    // invalid OPEN state so openTrades() sees it (the risk backstop then fails closed)
+    // and the next tick's manageOpen invalid-geometry guard flattens it via the
+    // existing unwind. Placed BEFORE the equality check on purpose: a restart that
+    // rehydrates {closed, discrepancy, openQty=100, plannedRisk<=0} against a broker
+    // that also holds 100 has brokerQty === localQty, which a mismatch-only fix misses.
+    if (brokerQty > 0 && trade.state === 'closed' && !(trade.plannedRisk > 0)) {
+      const priorState = trade.state
+      const priorStatus = trade.reconciliationStatus
+      trade.openQty = brokerQty
+      trade.state = 'open'
+      trade.reconciliationStatus = 'discrepancy'
+      const warn = `invalid-geometry residual: broker holds ${brokerQty} on a closed trade (plannedRisk ${trade.plannedRisk}) — reopening to flatten`
+      trade.executionWarnings.push(warn)
+      this.touch(trade, warn)
+      appendEvent({
+        event: 'invalid_geometry_residual_recovered',
+        symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id,
+        brokerQty, priorState, plannedRisk: trade.plannedRisk, reconciliationStatus: priorStatus,
+      })
+      return brokerQty
+    }
 
     if (brokerQty === localQty) {
       // Broker agrees. Promote a finished trade to verified — the only path into

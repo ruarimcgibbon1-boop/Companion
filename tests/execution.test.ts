@@ -290,6 +290,12 @@ class FakeBroker implements Broker {
   /** Override how the NEXT buy order fills (favorable/partial price+qty) — models a fill
    *  that lands better than the limit, e.g. below the stop. Applied to buy orders only. */
   buyFill: { price?: number; qty?: number; status?: BrokerOrder['status'] } | null = null
+  /** One-shot: the NEXT sell fills only this many shares (models a partial emergency flatten). */
+  sellFillQty: number | null = null
+  /** Persistent: every sell/stop is rejected (models a broker refusing the flatten). */
+  rejectAllSells = false
+  /** cancelOpenOrders throws (models a failed remainder cancellation). */
+  throwCancelOpenOrders = false
   /** symbol → shares held, moved by fills. */
   held = new Map<string, number>()
   /** Broker-side fill ledger — what getRecentFills reads, incl. external sells. */
@@ -362,6 +368,10 @@ class FakeBroker implements Broker {
   async submitLimit(req: LimitOrderRequest): Promise<BrokerOrder> {
     this.submitted.push(req)
     if (req.side === 'sell') {
+      if (this.rejectAllSells) {
+        return { id: '', clientOrderId: req.clientOrderId, symbol: req.symbol, side: 'sell', status: 'rejected',
+          qty: req.qty, filledQty: 0, filledAvgPrice: req.limitPrice, limitPrice: req.limitPrice, submittedAt: Date.now(), rejectReason: 'rejectAllSells' }
+      }
       const custom = this.customReject(req.symbol, req.qty, req.clientOrderId, req.limitPrice)
       if (custom) return custom
       const reject = this.rejectSell(req.symbol, req.qty, req.clientOrderId, req.limitPrice)
@@ -407,6 +417,16 @@ class FakeBroker implements Broker {
         this.fills.push({ symbol: o.symbol, side: 'buy', qty: fq, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
         return o
       }
+      if (o.side === 'sell' && this.sellFillQty != null && this.sellFillQty < o.qty) {
+        const fq = this.sellFillQty
+        this.sellFillQty = null            // one-shot: the retry fills the remainder
+        o.filledQty = fq
+        o.filledAvgPrice = o.limitPrice
+        o.status = 'partially_filled'
+        this.held.set(o.symbol, (this.held.get(o.symbol) ?? 0) - fq)
+        this.fills.push({ symbol: o.symbol, side: 'sell', qty: fq, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
+        return o
+      }
       o.status = 'filled'
       o.filledQty = o.qty
       o.filledAvgPrice = o.limitPrice
@@ -435,6 +455,7 @@ class FakeBroker implements Broker {
   }
 
   async cancelOpenOrders(symbol: string) {
+    if (this.throwCancelOpenOrders) throw new Error('cancelOpenOrders failed')
     let n = 0
     for (const o of this.orders.values()) {
       if (o.symbol === symbol && o.status === 'open') { await this.cancelOrder(o.id); n++ }
@@ -591,6 +612,150 @@ describe('PaperExecutor', () => {
       const d = canOpenPosition('OTHER', 500, s)
       expect(d.allowed).toBe(false)
       if (!d.allowed) expect(d.reason).toMatch(/invalid open-position risk/i)
+    })
+  })
+
+  // ── Late-fill-after-close residual recovery (2971c26 review defect) ─────────
+  describe('invalid-geometry residual recovery', () => {
+    const invalidEntry = { price: 9.4, qty: 700, status: 'canceled' as const } // 700 fill below the 9.5 stop, remainder unfilled
+
+    it('LATE FILL after close: residual detected, reopened, flattened, fully flat', async () => {
+      broker.buyFill = invalidEntry
+      price = 9.4
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()                                   // 700 invalid → flatten 700 → closed
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+
+      broker.held.set('TEST', 100)                      // 100 more of the entry fill at broker AFTER close
+      await ex.tick()                                   // post-close reconcile → promote to open-invalid
+      expect(t.state).toBe('open')                      // visible to openTrades()/backstop again
+      expect(t.openQty).toBe(100)
+      expect(t.executionWarnings.some(w => w.includes('invalid-geometry residual'))).toBe(true)
+
+      await ex.tick()                                   // manageOpen invalid guard → flatten 100
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)      // no stranded exposure
+      const flattened = t.exits.filter(l => l.reason === 'invalid_geometry').reduce((s, l) => s + l.qty, 0)
+      expect(flattened).toBe(800)                       // 700 + 100
+    })
+
+    it('CANCEL FAILURE: remainder cancel throws, a later fill is still recovered to flat', async () => {
+      broker.buyFill = invalidEntry
+      broker.throwCancelOpenOrders = true
+      price = 9.4
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()                                   // cancel throws (caught); 700 flattened → closed
+      const t = ex.allTrades()[0]
+      broker.held.set('TEST', 100)                      // remainder filled later
+      await ex.tick(); await ex.tick()
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+    })
+
+    it('REPEATED cumulative fill / broker flat: no duplicate flatten or reopen', async () => {
+      broker.buyFill = invalidEntry
+      price = 9.4
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()                                   // clean invalid close, broker flat
+      const t = ex.allTrades()[0]
+      await ex.tick(); await ex.tick()                  // extra ticks must do nothing
+      expect(t.exits.filter(l => l.reason === 'invalid_geometry')).toHaveLength(1)
+      expect(t.state).toBe('closed')
+    })
+
+    it('PARTIAL emergency flatten: remainder is re-flattened, never left stranded', async () => {
+      broker.buyFill = { price: 9.4 }                   // full 1000 fills below stop
+      broker.sellFillQty = 600                          // first flatten only sells 600
+      price = 9.4
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()                                   // flatten 600, then re-flatten the 400 same tick
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('closed')                    // fully unwound (no premature close with shares left)
+      expect(t.openQty).toBe(0)
+      expect(broker.held.get('TEST') ?? 0).toBe(0)      // nothing stranded
+      const flattened = t.exits.filter(l => l.reason === 'invalid_geometry').reduce((s, l) => s + l.qty, 0)
+      expect(flattened).toBe(1000)                      // 600 + 400, both legs
+    })
+
+    it('FLATTEN REJECTED: stays open-invalid, blocks new risk, retried to flat', async () => {
+      broker.buyFill = { price: 9.4 }
+      broker.rejectAllSells = true
+      price = 9.4
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()                                   // flatten rejected → stays open-invalid
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('open')
+      expect(t.plannedRisk).toBeLessThan(0)
+      const blocked = await ex.onSignal(signal({ setupId: 'other', symbol: 'OTHER' }), { sessionVolume: 10_000_000 })
+      expect(blocked.taken).toBe(false)                 // backstop fails closed on the invalid open position
+      broker.rejectAllSells = false
+      await ex.tick()                                   // retry succeeds
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+    })
+
+    it('RESTART-persisted residual (brokerQty == localQty) is still recovered', async () => {
+      const ex = build(); await ex.init()
+      const stray = trade({
+        symbol: 'TEST', state: 'closed', reconciliationStatus: 'discrepancy',
+        openQty: 100, plannedRisk: -50, initialStop: 9.5, entryFillPrice: 9.4, entryFillQty: 100,
+      })
+      ex.allTrades().push(stray)
+      broker.held.set('TEST', 100)                      // broker ALSO holds 100 → equals local
+      price = 9.4
+      await ex.tick()                                   // residual branch → reconcile → promote (equal qty!)
+      expect(stray.state).toBe('open')
+      expect(stray.openQty).toBe(100)
+      await ex.tick()                                   // flatten
+      expect(stray.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+    })
+
+    it('normal closed trade with broker flat is unchanged (verified, not reopened)', async () => {
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      price = 11.2; await ex.tick()
+      price = 12.3; await ex.tick()                     // T1/T2 → closed, broker flat
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('closed')
+      expect(t.plannedRisk).toBeGreaterThan(0)
+      await ex.tick()
+      expect(t.state).toBe('closed')                    // not reopened
+      expect(t.reconciliationStatus).toBe('verified')
+    })
+
+    it('valid open trade (plannedRisk>0) is untouched by residual recovery', async () => {
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('open')
+      expect(t.plannedRisk).toBeGreaterThan(0)
+      await ex.tick()                                   // normal management, not flattened
+      expect(t.state).toBe('open')
+    })
+
+    it('EXTENDED-HOURS invalid unwind uses a limit + extendedHours order and still flattens', async () => {
+      vi.setSystemTime(new Date('2026-08-07T12:00:00Z').getTime()) // 08:00 ET premarket
+      broker.buyFill = { price: 9.4 }
+      price = 9.4
+      const ex = build(); await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      const flat = broker.submitted.find(o => (o as LimitOrderRequest).side === 'sell')
+      expect(flat).toBeTruthy()
+      expect((flat as LimitOrderRequest).extendedHours).toBe(true)
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
     })
   })
 
