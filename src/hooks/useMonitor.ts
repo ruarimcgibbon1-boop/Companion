@@ -3,66 +3,24 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { transition } from '@/lib/setup-state-machine'
-import { etMinutesOfDay } from '@/lib/market-hours'
 import { patternLogId, shouldLogPattern } from '@/lib/pattern-log-gate'
-// Imported, not re-declared: this file already keeps local copies of the gate
-// helpers, and a third copy of the cap is exactly how the client and the daemon
-// drift apart. buy-log.ts is browser-safe.
-import { MAX_LOGS_PER_SYMBOL, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
-import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, SetupType, MonitorFunnel, PatternLogRecord } from '@/types'
+// The buy-log GATE STACK is imported, never re-declared here. A local copy of the
+// gates is exactly how the client and the daemon/backtest drift apart, so this file
+// calls the shared classifyBuy / passesTrackingFloor directly (buy-log.ts is
+// browser-safe). Every gate's rationale lives there.
+import { classifyBuy, passesTrackingFloor, type BuyVerdict } from '@/lib/buy-log'
+import type { MonitorResult, DetectedSetup, MonitorAlert, SetupLog, SetupStateRecord, BuySignalRecord, MonitorFunnel, PatternLogRecord } from '@/types'
 
 // Pattern-log admission (dedup on price, close cutoff, falling-knife guard) lives
 // in pattern-log-gate.ts. The old ~10-min time bucket re-logged a persisting hit
 // every bucket, which against a stale quote never terminated.
 
-// A buy signal needs real liquidity behind it — at least this many shares traded on
-// the day. Screens out the thin illiquid names a fill can't get (SHPH-type).
-const MIN_BUY_VOLUME = 100_000
-// The premarket equivalent. A whole premarket session trades a small fraction of a
-// regular one, so the day floor would block everything before 09:30 — and until now
-// premarket was simply exempt, because the candle feed reports premarket volume as 0.
-// It is measured now (extended-hours feed, see premarket-volume.ts), so premarket
-// gets a floor of its own. Note the scale: that feed covers a subset of venues, so
-// this is lower than the consolidated number it corresponds to. 2026-08-03 premarket
-// reads — UPC 625k / DFNS 678k pass; HYFM 5k, WLDS 10k, CNCK 1k (all dead premarket,
-// all "signals on names that don't move") do not.
-const MIN_PREMARKET_BUY_VOLUME = 50_000
-// …but an ABSOLUTE share floor punishes ultra-thin float rockets: YXT (2026-08-05,
-// +208% premarket) surged to 46× its own premarket norm on 46,263 shares — hugely
-// active for a name that trades ~6k shares/day — yet missed the 50k floor by 7.5%
-// and its clean grade-C premarket_breakout was silently dropped. Relative volume is
-// the real "is this in play" signal, so a strong RVOL surge clears the floor even
-// when the absolute count is short. Dead names don't qualify: they surge little
-// relative to their own norm (HYFM read 0.1× on 2026-08-03), so this stays well
-// clear of them. Only affects the 10k–50k measured band (below 10k is already
-// exempt as unmeasured; above 50k already passes).
-const PREMARKET_SURGE_RVOL = 10
-// Anti-spray pivot (2026-08-04 CSV: 70 signals, 27% win, avg win +4.9% / loss
-// −2.3%). Two of the four levers live here (the anti-fade gate is in the detector):
-//   Lever 2 — grade floor: 57% of that day's signals were grade 'below' at 25%
-//   win, so stop logging below-grade signals. opening_drive is exempt — it carries
-//   the book (20-day replay: 47% / +2.03%/trade) and occasionally grades below.
-//   premarket_breakout was ALSO exempt on an 8/4 "2/2" read, but the 20-day FMP
-//   replay (2026-08-05) showed it is the single biggest drag — 31 signals, 29%
-//   win, −2.02%/trade, losing across every grade — and its below-grade fires were
-//   the bulk of the bleed. So it no longer skips the floor: only grade-C+ premarket
-//   breakouts (the quality gappers we still want) log now.
-//   NB: momentum_pullback was briefly exempted too (2026-08-05) on the theory that
-//   the best setup shouldn't be floored — but the replay showed the opposite:
-//   exempting it flooded the book with below-grade momentum_pullbacks that LOSE
-//   (17→89 signals, 60%→50% win, +2.23→−0.70%/trade). The grade floor was
-//   correctly filtering them, so it stays floored. Its edge lives in grade-C+ only.
-//   Lever 3 — per-symbol log cap: REMOVED 2026-08-07 at the user's direction (it was
-//   2 distinct ideas per name; TNMG had logged 8×, ENSC 6×). It kept consuming its
-//   budget on signals from earlier daemon runs, which starved the paper executor.
-//   Prior A/B on file: raising it 2→3 diluted the book (106→137 signals, 46%→42%
-//   win, +1.25→+0.81%/trade). Full rationale in src/lib/buy-log.ts.
-const GRADE_FLOOR_EXEMPT = new Set<DetectedSetup['type']>(['opening_drive'])
-// Late-session cutoff (20-day FMP replay, 2026-08-05): regular-hours entries after
-// 14:00 ET lost (−0.69%/trade over 17 signals) while the 10:00–14:00 window carried
-// the book (+1.72%/trade). Stop logging new regular-session BUYs past this time;
-// premarket is unaffected (it's judged on its own gates). ET minutes-of-day.
-const LATE_LOG_CUTOFF_ET_MIN = 14 * 60
+// Map a dropped-BUY verdict from classifyBuy to its signal-funnel counter, so a
+// 0-signal day stays legible (which gate ate the triggers).
+const FUNNEL_BUCKET: Record<Exclude<BuyVerdict, 'logged'>, keyof MonitorFunnel> = {
+  session: 'droppedSession', volume: 'droppedVolume', veto: 'droppedVeto',
+  standDown: 'droppedStandDown', capped: 'droppedCapped', dup: 'droppedDup',
+}
 
 // Scanner-wide sweep cadence. Aligned to the 15s QUOTE cache TTL: each sweep
 // lands on a freshly-expired quote so price-driven triggers react as fast as the
@@ -229,83 +187,10 @@ export function updateLog(log: SetupLog, setup: DetectedSetup, rec: SetupStateRe
   }
 }
 
-// ── Buy-signal de-duplication ────────────────────────────────────────────────
-// The scanner re-fires the same idea on every poll and across sibling detectors
-// (e.g. JLHL logged 12 near-identical BUYs on 2026-07-07 as ema9/ema21/pullback
-// all triggered into the same rollover). Keep the FIRST fire per symbol + entry
-// cluster within a cooldown window; suppress the rest so the log reflects one
-// tradeable idea, not the poll cadence.
-const ENTRY_SIMILARITY_PCT = 0.03            // entries within 3% ⇒ the same idea
-const BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000 // 45 minutes
-
-function isDuplicateBuy(sym: string, entryHigh: number, now: number, prior: BuySignalRecord[]): boolean {
-  for (const b of prior) {
-    if (b.symbol !== sym) continue
-    if (now - b.timestamp > BUY_DEDUP_COOLDOWN_MS) continue
-    if (b.entryHigh > 0 && Math.abs(entryHigh - b.entryHigh) / b.entryHigh < ENTRY_SIMILARITY_PCT) return true
-  }
-  return false
-}
-
-// After a long bounce on a symbol hits its invalidation, the *next* bounce on
-// that name is disproportionately another failure (2026-07-09: SKYQ/DCX/IOTR
-// each bounced again after failing and lost again — ~38% of the day's losses
-// were chop names re-bounced). Stand the symbol's bounce setups down for a
-// cooldown; momentum breakouts are unaffected (a name can break out after a
-// failed bounce).
-// 2h covers the observed same-session re-fire gaps (today's chop re-bounces were
-// 47–97 min after the first failure); the overnight gap keeps a prior-day failure
-// from carrying into a new session.
-const STANDDOWN_MS = 120 * 60 * 1000
-const BOUNCE_TYPES = new Set<SetupType>(['pullback', 'vwap_bounce', 'vwap_reclaim', 'ema9_bounce', 'ema21_bounce'])
-
-function recentlyFailedBounce(sym: string, now: number, states: SetupStateRecord[]): boolean {
-  return states.some(r =>
-    r.symbol === sym && r.state === 'failed' && BOUNCE_TYPES.has(r.type) &&
-    now - r.updatedAt < STANDDOWN_MS)
-}
-
-// ── Per-symbol trade cap ─────────────────────────────────────────────────────
-// The failed-bounce stand-down above only arms on *bounce* failures and only
-// blocks *bounce* re-fires. 2026-07-13 BRAI slipped straight through it: BRAI
-// isn't a bounce name, it fired 6× as momentum, blew off to $11.33, and after
-// its 11:07 entry was flagged-then-failed the scanner still re-fired at 11:16
-// and 11:17 for −5.7% / −4.5%. So cap re-firing on the *symbol*, any setup type:
-//   • one losing entry — INCLUDING an entry we only flagged (qualityVetoed) —
-//     stands the whole name down (gap A: a flag that then hits its stop is still
-//     a loss and must arm the stand-down),
-//   • or SYMBOL_WIN_CAP banked wins stand it down (stop pressing a name that's
-//     already paid out — the late re-fire tends to give it back).
-// The loss/win memory is read from the LATCHED setup LOG (outcome freezes once
-// it goes 'invalidated'/'target_hit'), not the live setup STATE. 2026-07-14 LEDS
-// showed why: it failed at 10:20/10:24, then ran back up so its setup re-armed
-// OUT of 'failed' — a live-state check lost the loss memory and the 11:24 chase
-// (−2.1%) slipped the cap 59 min later. The log outcome survives the re-arm, so
-// the cap now holds for the whole cooldown regardless of what the name does next.
-const SYMBOL_CAP_MS = 120 * 60 * 1000 // same session window as the bounce stand-down
-const SYMBOL_WIN_CAP = 2
-
-function symbolCapReached(
-  sym: string,
-  now: number,
-  logs: SetupLog[],
-  buys: BuySignalRecord[],
-): boolean {
-  // A loss: an entry we actually logged (present in `buys`) whose setup log has
-  // since latched to 'invalidated' within the cooldown.
-  const lostSetupIds = new Set(
-    logs
-      .filter(l => l.outcome === 'invalidated' && l.resolvedAt != null && now - l.resolvedAt < SYMBOL_CAP_MS)
-      .map(l => l.id),
-  )
-  const hasLoss = buys.some(b => b.symbol === sym && lostSetupIds.has(b.setupId))
-  if (hasLoss) return true
-
-  const wins = logs.filter(
-    l => l.symbol === sym && l.outcome === 'target_hit' && l.resolvedAt != null && now - l.resolvedAt < SYMBOL_CAP_MS,
-  ).length
-  return wins >= SYMBOL_WIN_CAP
-}
+// The buy-signal dedup, failed-bounce stand-down, and per-symbol trade cap that
+// used to be re-declared here now live (with their full evidence trail) in
+// buy-log.ts and run inside classifyBuy. Removing the local copies is the point of
+// this refactor: one decision engine, no drift.
 
 // ── Hook ────────────────────────────────────────────────────────────────────
 
@@ -394,9 +279,8 @@ export function useMonitor() {
         for (const setup of r.setups) {
           allSetups.push(setup)
 
-          // Only track/alert setups that clear the display floor.
-          const meetsLevel = (setup.breakdown.levelQuality / 20) * 100 >= settings.minLevelStrength * 0.2 || setup.confidence >= settings.minLevelStrength
-          if (setup.score < 55 && !meetsLevel) { funnel.belowFloor++; continue }
+          // Only track/alert setups that clear the display floor (shared with the replay).
+          if (!passesTrackingFloor(setup, settings.minLevelStrength)) { funnel.belowFloor++; continue }
           funnel.tracked++
           funnel.byState[setup.state] = (funnel.byState[setup.state] ?? 0) + 1
 
@@ -419,101 +303,25 @@ export function useMonitor() {
           logMap.set(setup.id, log)
           changedLogs.push(log)
 
-          // Buy Log: record long geometric triggers for end-of-day review.
-          // Quality-vetoed (flagged) triggers are NO LONGER logged: across the
-          // 7/13–7/14 review every flagged entry that filled was a loss (7/14:
-          // 5/5 flagged = losers, −15.4% combined), so the veto graduates from
-          // "flag for review" to "drop". The per-symbol entry-cluster dedup still
-          // collapses the poll/detector spam so one idea logs once.
-          // Stand down a symbol's bounce setups after a bounce on it just failed.
-          const allStates = [...Object.values(s.setupStates), ...Object.values(setupStates)]
-          const allBuys = [...s.buySignals, ...newBuySignals]
-          const standDown = BOUNCE_TYPES.has(setup.type) &&
-            recentlyFailedBounce(setup.symbol, now, allStates)
-          // NOTE: a "strong continuation" override (near-high + high-RVOL clears the
-          // grade floor and the per-symbol cap) was shipped 2026-08-06 for the
-          // RITR/PAVS misses and REVERTED 2026-08-07 — a clean A/B on the same pool
-          // showed it added 38 signals but cut expectancy +0.76% → +0.41%/trade.
-          // Lever 3: cap logged ideas per name this session (restored 2026-08-11 —
-          // VATE filled 3× for −$1,306 on 08-10 without it). Shared constant now.
-          const symbolLogsThisSession = allBuys.filter(
-            b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS
-          ).length
-          const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
-          const capped = overLogged || symbolCapReached(setup.symbol, now, [...logMap.values()], allBuys)
-          // Lever 2: quality floor — drop below-grade signals (exempt the early-momentum winners).
-          const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
-          // The fill you'd actually get entering on the trigger — not the (often
-          // unreachable) zone bottom. Computed BEFORE the dedup because the dedup
-          // must compare like for like: it previously passed `zoneUpper` while the
-          // record stored `entryFill`, so once price ran above the zone the two
-          // differed by more than the 3% similarity window and nothing deduped.
-          // 2026-07-20 GMM logged 7 signals — ema9 three times in 28 seconds, plus
-          // ORB + ema21 + pullback all on the same 12:44:35 fill.
-          const fill = setup.entryFill ?? setup.zoneUpper
-          // Classify every triggered long: logged, or which gate dropped it — so
-          // the funnel shows whether triggers are firing but getting eaten. The
-          // BUY is logged only in the clean (else) branch — same gate as before.
+          // Buy Log: classify every triggered long through the SHARED gate stack
+          // (classifyBuy in buy-log.ts) — the exact same module the alert daemon,
+          // backtest, diagnose, and recall call, so the client's BUY/drop decision
+          // cannot drift from the replay's. The full rationale for each gate (the
+          // dropped-veto policy, the reverted strong-continuation override, the
+          // restored per-symbol cap, the late-session cutoff) lives in buy-log.ts.
           if (setup.direction === 'long' && setup.triggeredRaw) {
             funnel.triggered++
-            const dup = isDuplicateBuy(setup.symbol, fill, now, allBuys)
-            // After-close gate: a trigger printed once the market's shut (or
-            // overnight) is untradeable — you can't act on it, and it fired off the
-            // closing print (2026-07-29 logged 3 at 16:01). Premarket stays; regular
-            // hours stay only before the late-session cutoff (see LATE_LOG_CUTOFF).
-            const tradeable = r.integrity.session === 'premarket' ||
-              (r.integrity.session === 'regular' && etMinutesOfDay(now) < LATE_LOG_CUTOFF_ET_MIN)
-            // Buy signals need real liquidity behind them. Premarket is measured on
-            // its own scale; only a genuinely unmeasurable reading (null — the
-            // extended-feed fetch failed) is exempt, so a data gap can't silently
-            // shut premarket down.
-            // Premarket: pass on absolute volume, an unmeasured (null) reading, OR a
-            // strong RVOL surge — the last one is what rescues thin-float rockets like
-            // YXT (46× on 46k shares) that the absolute floor wrongly rejects.
-            const premarketSurge = r.relativeVolume != null && r.relativeVolume >= PREMARKET_SURGE_RVOL
-            const volumeOk = r.integrity.session === 'premarket'
-              ? r.premarketVolume == null || r.premarketVolume >= MIN_PREMARKET_BUY_VOLUME || premarketSurge
-              : r.volume === 0 || r.volume >= MIN_BUY_VOLUME
-            if (!tradeable) funnel.droppedSession++
-            else if (!volumeOk) funnel.droppedVolume++
-            // Grade floor folds into the veto bucket — both are "dropped for quality".
-            else if (setup.qualityVetoed || gradeFloorFail) funnel.droppedVeto++
-            else if (standDown) funnel.droppedStandDown++
-            else if (capped) funnel.droppedCapped++
-            else if (dup) funnel.droppedDup++
-            else {
+            const allBuys = [...s.buySignals, ...newBuySignals]
+            const allStates = [...Object.values(s.setupStates), ...Object.values(setupStates)]
+            const { verdict, buy } = classifyBuy(setup, r, {
+              now, priorBuys: allBuys, priorLogs: [...logMap.values()], priorStates: allStates,
+            })
+            if (verdict === 'logged' && buy) {
               funnel.logged++
-              const t1 = setup.targets[0]?.price ?? null
-              const rr = t1 != null && fill > setup.stopReference
-                ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
-                : setup.rewardRisk
-              const buy: BuySignalRecord = {
-                id: `${setup.id}:triggered:${Math.floor(now / 1000)}`,
-                setupId: setup.id,
-                symbol: setup.symbol,
-                timestamp: now,
-                setupType: setup.type,
-                triggerPrice: setup.signal.triggerPrice ?? setup.zoneUpper,
-                entryLow: setup.zoneLower,
-                entryHigh: fill,
-                invalidation: setup.invalidation,
-                stop: setup.stopReference,
-                targets: setup.targets.map(t => t.price),
-                score: setup.score,
-                grade: setup.grade,
-                rewardRisk: rr,
-                priceAtSignal: r.price,
-                flagged: false, // vetoed triggers are dropped above, so a logged entry is never flagged
-
-                ctxTrend15m: r.technicals?.trend15m,
-                ctxDistVwapPct: r.technicals?.distanceFromVwapPct ?? null,
-                ctxDistDayHighPct: r.technicals?.distanceFromDayHighPct ?? null,
-                ctxRelVol: r.relativeVolume,
-                ctxHigherHighsLows: r.technicals?.higherHighsLows ?? null,
-                ctxAtrPct: r.technicals?.atrPct ?? null,
-              }
               newBuySignals.push(buy)
               sendTelegramAlert(buy)
+            } else if (verdict !== 'logged') {
+              funnel[FUNNEL_BUCKET[verdict]]++
             }
           }
 

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { classifyBuy, passesTrackingFloor } from '../src/lib/buy-log'
-import type { DetectedSetup, MonitorResult, BuySignalRecord } from '../src/types'
+import type { DetectedSetup, MonitorResult, BuySignalRecord, SetupLog, SetupStateRecord } from '../src/types'
 
 // Minimal fixtures — only the fields classifyBuy / passesTrackingFloor read.
 function mkSetup(o: Partial<DetectedSetup> = {}): DetectedSetup {
@@ -85,6 +85,56 @@ describe('classifyBuy', () => {
 
   it('dedups a near-identical re-fire on the same name', () => {
     expect(classifyBuy(mkSetup(), mkResult(), ctx([buyRec('AAA', 9.0, PM - 1000)])).verdict).toBe('dup')
+  })
+})
+
+// ── One decision engine: the win/loss cap and failed-bounce stand-down ─────────
+// These two gates read priorLogs / priorStates. The alert daemon and the recall
+// harness pass [] for both (they don't run the full state machine), so those gates
+// no-op there — but the LIVE client (useMonitor) and the REPLAY (backtest) BOTH now
+// feed real logs/states into this same classifyBuy. These tests pin that shared
+// behaviour so live and replay can't diverge on the cap or the stand-down.
+function mkLog(o: Partial<SetupLog>): SetupLog {
+  return { id: 'AAA:s1', symbol: 'AAA', direction: 'long', outcome: 'invalidated', resolvedAt: PM - 1000, ...o } as unknown as SetupLog
+}
+function mkState(o: Partial<SetupStateRecord>): SetupStateRecord {
+  return { symbol: 'AAA', type: 'vwap_bounce', state: 'failed', updatedAt: PM - 1000, ...o } as unknown as SetupStateRecord
+}
+
+describe('classifyBuy — win/loss cap and stand-down (live + replay paths)', () => {
+  // A prior LOGGED entry on the name whose setup log has since latched to a loss
+  // stands the whole name down for the cooldown (BRAI 2026-07-13). The loss is only
+  // seen when priorLogs+priorBuys are supplied — the daemon, passing [], would log.
+  it('caps a name after a prior logged entry became a loss', () => {
+    const priorBuys = [buyRec('AAA', 6.0, PM - 3000)]
+    priorBuys[0].setupId = 'AAA:s1'   // ties the buy to the losing log below
+    const ctxWithLoss = { now: PM, priorBuys, priorLogs: [mkLog({ id: 'AAA:s1', outcome: 'invalidated' })], priorStates: [] }
+    // Entry far from the prior (6.0) so this is the CAP firing, not the dedup.
+    const s = mkSetup({ entryFill: 9.0, zoneUpper: 9.0 })
+    expect(classifyBuy(s, mkResult(), ctxWithLoss).verdict).toBe('capped')
+    // Same inputs but the loss unknown (daemon/recall style) → it logs. This IS the
+    // live-vs-daemon difference, and why live + replay must pass the logs.
+    expect(classifyBuy(s, mkResult(), { now: PM, priorBuys, priorLogs: [], priorStates: [] }).verdict).toBe('logged')
+  })
+
+  it('caps a name after 2 banked wins', () => {
+    const priorLogs = [mkLog({ id: 'AAA:w1', outcome: 'target_hit' }), mkLog({ id: 'AAA:w2', outcome: 'target_hit' })]
+    const s = mkSetup({ entryFill: 9.0, zoneUpper: 9.0 })
+    expect(classifyBuy(s, mkResult(), { now: PM, priorBuys: [], priorLogs, priorStates: [] }).verdict).toBe('capped')
+  })
+
+  it('stands a bounce setup down after a recent failed bounce on the name', () => {
+    const s = mkSetup({ type: 'vwap_bounce', id: 'AAA:vwap_bounce:9.00' })
+    const stood = { now: PM, priorBuys: [], priorLogs: [], priorStates: [mkState({ type: 'vwap_bounce' })] }
+    expect(classifyBuy(s, mkResult(), stood).verdict).toBe('standDown')
+    // No failed-bounce state → the same setup logs. The gate is the state, nothing else.
+    expect(classifyBuy(s, mkResult(), { now: PM, priorBuys: [], priorLogs: [], priorStates: [] }).verdict).toBe('logged')
+  })
+
+  it('does NOT stand a momentum breakout down for a failed bounce (only bounce types)', () => {
+    const s = mkSetup({ type: 'break_of_structure', grade: 'C', id: 'AAA:break_of_structure:9.00' })
+    const r = mkResult({ technicals: { distanceFromDayHighPct: -0.5 } as MonitorResult['technicals'] })
+    expect(classifyBuy(s, r, { now: PM, priorBuys: [], priorLogs: [], priorStates: [mkState({ type: 'vwap_bounce' })] }).verdict).toBe('logged')
   })
 })
 
