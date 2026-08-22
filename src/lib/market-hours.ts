@@ -27,26 +27,47 @@ export const DEFAULT_SESSION_CONFIG: SessionConfig = {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+//
+// PERFORMANCE: `etHHMM` and `isWeekendET` map a UTC instant to an ET wall-clock
+// field. Both are pure functions of `ts`. Constructing an Intl.DateTimeFormat and
+// calling `.format()` is expensive (~microseconds each), and the replay classifies
+// the SAME candle timestamps on every bar it re-scans — so this ran millions of
+// times and dominated replay runtime. We (1) reuse ONE formatter each instead of
+// constructing per call, and (2) memoise the result per `ts`. This is a pure
+// caching change: identical inputs give identical outputs, so no session boundary,
+// no detector, and no gate verdict moves — only the cost does. The cache is bounded
+// and cleared wholesale when full, so a long-lived live session can't leak.
+
+const ET_HHMM_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
+})
+const ET_WEEKDAY_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', weekday: 'long',
+})
+
+const MAX_TS_CACHE = 200_000
+const hhmmCache = new Map<number, number>()
+const weekendCache = new Map<number, boolean>()
 
 function etHHMM(ts: number): number {
-  const d = new Date(ts)
-  const et = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(d)
+  const hit = hhmmCache.get(ts)
+  if (hit !== undefined) return hit
+  const et = ET_HHMM_FMT.format(ts)
   const [h, m] = et.split(':').map(Number)
-  return h * 100 + m
+  const v = h * 100 + m
+  if (hhmmCache.size >= MAX_TS_CACHE) hhmmCache.clear()
+  hhmmCache.set(ts, v)
+  return v
 }
 
 function isWeekendET(ts: number): boolean {
-  const d = new Date(ts)
-  const dayName = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
-    weekday: 'long',
-  }).format(d)
-  return dayName === 'Saturday' || dayName === 'Sunday'
+  const hit = weekendCache.get(ts)
+  if (hit !== undefined) return hit
+  const dayName = ET_WEEKDAY_FMT.format(ts)
+  const v = dayName === 'Saturday' || dayName === 'Sunday'
+  if (weekendCache.size >= MAX_TS_CACHE) weekendCache.clear()
+  weekendCache.set(ts, v)
+  return v
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────

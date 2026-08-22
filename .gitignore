@@ -43,3 +43,8 @@ next-env.d.ts
 # Daily trade-log exports (data inputs, not source — resolved via scripts/research.ts)
 data/buy-signals-*.csv
 data/pattern-log-*.csv
+
+# Local historical research cache (LARGE provider tape). Never commit the whole
+# provider cache — only the small curated fixtures under tests/fixtures/replay-tape/
+# are checked in. Point FMP_CACHE_DIR here (or anywhere local) for a repo-local cache.
+/data/research-cache/

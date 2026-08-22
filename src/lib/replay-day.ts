@@ -22,17 +22,38 @@ export interface RawRow { date: string; open: number; high: number; low: number;
 export function etStrToUnixSec(s: string): number {
   return Math.floor(Date.parse((s.length <= 10 ? `${s}T00:00:00` : s.replace(' ', 'T')) + '-04:00') / 1000)
 }
+// PERFORMANCE: both map an instant to an ET wall-clock field and are pure in their
+// argument, but the per-bar `todayVol` filter calls etDayKey once PER CANDLE on
+// every bar it re-scans — O(bars²) Intl formats, a dominant replay cost. Reuse one
+// formatter each and memoise per key. Pure caching: identical inputs → identical
+// outputs, so no decision changes. Bounded + cleared-when-full so live can't leak.
+const ET_DAYKEY_FMT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+})
+const ET_HHMM_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
+})
+const MAX_CACHE = 200_000
+const dayKeyCache = new Map<number, string>()
+const hhmmCache = new Map<number, number>()
+
 export function etDayKey(unixSec: number): string {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date(unixSec * 1000))
+  const hit = dayKeyCache.get(unixSec)
+  if (hit !== undefined) return hit
+  const v = ET_DAYKEY_FMT.format(unixSec * 1000)
+  if (dayKeyCache.size >= MAX_CACHE) dayKeyCache.clear()
+  dayKeyCache.set(unixSec, v)
+  return v
 }
 export function etHHMM(ms: number): number {
-  const s = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
-  }).format(new Date(ms))
+  const hit = hhmmCache.get(ms)
+  if (hit !== undefined) return hit
+  const s = ET_HHMM_FMT.format(ms)
   const [h, m] = s.split(':').map(Number)
-  return h * 100 + m
+  const v = h * 100 + m
+  if (hhmmCache.size >= MAX_CACHE) hhmmCache.clear()
+  hhmmCache.set(ms, v)
+  return v
 }
 export function toCandles(rows: RawRow[]): Candle[] {
   return rows.map(x => ({
@@ -46,6 +67,10 @@ export interface ReplayBar {
   etHHMM: number
   session: string
   price: number
+  /** This bar's high/low — callers latching stop/target touches need the range,
+   *  not just the close. */
+  high: number
+  low: number
   setups: DetectedSetup[]
   /** Shaped like the MonitorResult the live gates consume. */
   result: MonitorResult
@@ -53,10 +78,19 @@ export interface ReplayBar {
 
 /**
  * Walk `day`'s bars for `symbol`, yielding the pipeline state at each bar close.
- * `m5` should span ~14 days back (warm-up + premarket-volume baseline); `daily`
+ * `rows` should span ~14 days back (warm-up + premarket-volume baseline); `daily`
  * is the EOD series up to and including `day`.
+ *
+ * `barSeconds` is the intraday bar width (300 = 5-min, 60 = 1-min). It ONLY sets
+ * the simulated clock (nowTs = bar close = bar.time + barSeconds); the technicals,
+ * levels, detectors, and gates are the real production code either way, so 1m and
+ * 5m differ only by the data they see, never by a parallel strategy path.
  */
-export function* replayDay(symbol: string, day: string, m5: RawRow[], daily: RawRow[], float: number | null = null): Generator<ReplayBar> {
+export function* replayDay(
+  symbol: string, day: string, rows: RawRow[], daily: RawRow[],
+  float: number | null = null, barSeconds = 300,
+): Generator<ReplayBar> {
+  const m5 = rows
   const dailyUpTo = daily.filter(r => r.date.slice(0, 10) <= day)
   if (dailyUpTo.length < 2) return
   const dailyC = toCandles(dailyUpTo)
@@ -73,7 +107,7 @@ export function* replayDay(symbol: string, day: string, m5: RawRow[], daily: Raw
   for (let i = 0; i < walk.length; i++) {
     const bar = walk[i]
     if (etDayKey(bar.time) !== day) continue
-    const nowTs = (bar.time + 300) * 1000   // "now" = this 5-min bar's close
+    const nowTs = (bar.time + barSeconds) * 1000   // "now" = this bar's close
     const session = getSessionType(nowTs)
     if (session !== 'premarket' && session !== 'regular') continue
 
@@ -111,6 +145,6 @@ export function* replayDay(symbol: string, day: string, m5: RawRow[], daily: Raw
       },
     } as unknown as MonitorResult
 
-    yield { nowTs, etHHMM: etHHMM(nowTs), session, price, setups, result }
+    yield { nowTs, etHHMM: etHHMM(nowTs), session, price, high: bar.high, low: bar.low, setups, result }
   }
 }
