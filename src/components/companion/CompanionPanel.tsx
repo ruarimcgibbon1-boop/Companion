@@ -23,32 +23,32 @@ const TABS: Array<{ key: Tab; label: string }> = [
 ]
 
 const STATUS_BG: Record<string, string> = {
-  'Constructive': 'bg-green-900/30 text-green-400 border border-green-700/30',
-  'Developing': 'bg-yellow-900/30 text-yellow-400 border border-yellow-700/30',
-  'Extended': 'bg-orange-900/30 text-orange-400 border border-orange-700/30',
-  'Chasing Risk': 'bg-red-900/30 text-red-400 border border-red-700/30',
-  'Weakening': 'bg-orange-900/30 text-orange-400 border border-orange-700/30',
-  'Breakdown Risk': 'bg-red-900/40 text-red-300 border border-red-700/40',
-  'No Clean Setup': 'bg-gray-900/30 text-gray-400 border border-gray-700/30',
+  'Constructive': 'bg-bull/10 text-bull ring-1 ring-inset ring-bull/30',
+  'Developing': 'bg-warn/10 text-warn ring-1 ring-inset ring-warn/30',
+  'Extended': 'bg-warn/10 text-warn ring-1 ring-inset ring-warn/30',
+  'Chasing Risk': 'bg-bear/10 text-bear ring-1 ring-inset ring-bear/30',
+  'Weakening': 'bg-warn/10 text-warn ring-1 ring-inset ring-warn/30',
+  'Breakdown Risk': 'bg-bear/15 text-bear ring-1 ring-inset ring-bear/40',
+  'No Clean Setup': 'bg-white/5 text-ink-mute ring-1 ring-inset ring-white/10',
 }
 
 const QUALITY_COLORS: Record<string, string> = {
-  'Strong Confirmed Catalyst': 'text-green-400',
-  'Moderate Catalyst': 'text-yellow-400',
-  'Weak or Recycled Catalyst': 'text-orange-400',
-  'Unclear Catalyst': 'text-gray-400',
-  'Negative or Dilutive Catalyst': 'text-red-400',
-  'No Recent Catalyst Found': 'text-gray-600',
+  'Strong Confirmed Catalyst': 'text-bull',
+  'Moderate Catalyst': 'text-warn',
+  'Weak or Recycled Catalyst': 'text-warn',
+  'Unclear Catalyst': 'text-ink-mute',
+  'Negative or Dilutive Catalyst': 'text-bear',
+  'No Recent Catalyst Found': 'text-ink-faint',
 }
 
 const BREAKOUT_COLORS: Record<string, string> = {
-  approaching: 'text-blue-400',
-  testing: 'text-yellow-400',
-  triggered: 'text-orange-400',
-  confirmed: 'text-green-400',
-  failed: 'text-red-400',
-  extended: 'text-orange-500',
-  none: 'text-gray-500',
+  approaching: 'text-info',
+  testing: 'text-warn',
+  triggered: 'text-warn',
+  confirmed: 'text-bull',
+  failed: 'text-bear',
+  extended: 'text-warn',
+  none: 'text-ink-mute',
 }
 
 function fmt(v: number | null | undefined): string {
@@ -85,41 +85,39 @@ export function CompanionPanel() {
 
   if (!selectedSymbol) {
     return (
-      <div className="flex flex-col h-full bg-[#0e1117] border-l border-gray-800 items-center justify-center p-4">
-        <p className="text-gray-600 text-sm text-center">Select a ticker to begin analysis</p>
+      <div className="flex flex-col h-full bg-panel border-l border-line items-center justify-center p-4">
+        <p className="text-ink-mute text-sm text-center">Select a ticker to begin analysis</p>
       </div>
     )
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#0e1117] border-l border-gray-800">
+    <div className="flex flex-col h-full bg-panel border-l border-line">
       {/* Ticker header */}
-      <div className="px-4 py-3 border-b border-gray-800 flex-shrink-0">
-        <div className="flex items-center justify-between mb-1">
-          <div>
-            <span className="text-lg font-bold text-white">{selectedSymbol}</span>
+      <div className="px-4 pt-3 pb-3 border-b border-line flex-shrink-0 bg-gradient-to-b from-white/[0.02] to-transparent">
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-baseline gap-2 min-w-0">
+            <span className="text-xl font-bold text-ink tracking-wide">{selectedSymbol}</span>
             {snapshot?.quote?.name && (
-              <span className="ml-2 text-xs text-gray-500">{snapshot.quote.name}</span>
+              <span className="text-xs text-ink-mute truncate">{snapshot.quote.name}</span>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => isWatching ? removeFromWatchlist(selectedSymbol) : addToWatchlist(selectedSymbol)}
-              className={`text-xs px-2 py-0.5 rounded border ${isWatching ? 'border-blue-500 text-blue-400' : 'border-gray-600 text-gray-500 hover:text-gray-300'}`}
-            >
-              {isWatching ? '★ Watching' : '☆ Watch'}
-            </button>
-          </div>
+          <button
+            onClick={() => isWatching ? removeFromWatchlist(selectedSymbol) : addToWatchlist(selectedSymbol)}
+            className={`ring-focus flex-shrink-0 text-xs px-2 py-1 rounded-md border font-medium transition-colors ${isWatching ? 'border-accent/50 bg-accent/10 text-accent-hi' : 'border-line-strong text-ink-mute hover:text-ink hover:border-ink-mute'}`}
+          >
+            {isWatching ? '★ Watching' : '☆ Watch'}
+          </button>
         </div>
 
         {snapshot?.quote && (
           <div className="flex items-center gap-3">
-            <span className="text-2xl font-mono text-white">${snapshot.quote.price.toFixed(2)}</span>
-            <span className={`text-sm font-medium ${snapshot.quote.changesPercentage >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+            <span className="text-[26px] leading-none font-semibold text-ink tnum">${snapshot.quote.price.toFixed(2)}</span>
+            <span className={`text-sm font-semibold tnum ${snapshot.quote.changesPercentage >= 0 ? 'text-bull' : 'text-bear'}`}>
               {fmtPct(snapshot.quote.changesPercentage)}
             </span>
             {snapshot.setupScore && (
-              <span className={`ml-auto text-xs px-2 py-1 rounded ${STATUS_BG[snapshot.setupScore.status] ?? 'bg-gray-800 text-gray-400'}`}>
+              <span className={`ml-auto text-[11px] px-2 py-1 rounded-md font-semibold ${STATUS_BG[snapshot.setupScore.status] ?? 'bg-white/5 text-ink-mute'}`}>
                 {snapshot.setupScore.status}
               </span>
             )}
@@ -128,33 +126,33 @@ export function CompanionPanel() {
 
         {/* Breakout status */}
         {snapshot?.breakoutStatus && snapshot.breakoutStatus.state !== 'none' && (
-          <div className={`mt-1 text-xs ${BREAKOUT_COLORS[snapshot.breakoutStatus.state] ?? 'text-gray-500'}`}>
+          <div className={`mt-1.5 text-xs ${BREAKOUT_COLORS[snapshot.breakoutStatus.state] ?? 'text-ink-mute'}`}>
             {snapshot.breakoutStatus.description}
           </div>
         )}
 
         {snapshot && (
-          <div className="flex items-center gap-2 mt-1">
-            <span className={`text-xs ${snapshot.dataQuality === 'High' ? 'text-green-600' : snapshot.dataQuality === 'Stale' ? 'text-red-600' : 'text-yellow-600'}`}>
-              {snapshot.dataQuality}
+          <div className="flex items-center gap-2 mt-2 tnum">
+            <span className={`inline-flex items-center gap-1 text-[10px] ${snapshot.dataQuality === 'High' ? 'text-bull' : snapshot.dataQuality === 'Stale' ? 'text-bear' : 'text-warn'}`}>
+              <span className="w-1.5 h-1.5 rounded-full bg-current" />{snapshot.dataQuality}
             </span>
-            <span className="text-xs text-gray-700">•</span>
-            <span className={`text-xs ${isStale(snapshot.timestamp, 60000) ? 'text-red-600' : 'text-gray-600'}`}>
+            <span className="text-[10px] text-line-strong">•</span>
+            <span className={`text-[10px] ${isStale(snapshot.timestamp, 60000) ? 'text-bear' : 'text-ink-mute'}`}>
               {dataAge(snapshot.timestamp)}
             </span>
-            <span className="text-xs text-gray-700">•</span>
-            <span className="text-xs text-gray-600">{snapshot.sessionType}</span>
+            <span className="text-[10px] text-line-strong">•</span>
+            <span className="text-[10px] text-ink-mute">{snapshot.sessionType}</span>
           </div>
         )}
       </div>
 
       {/* Tabs — scrollable */}
-      <div className="flex border-b border-gray-800 flex-shrink-0 overflow-x-auto">
+      <div className="flex border-b border-line flex-shrink-0 overflow-x-auto bg-app/30">
         {TABS.map(t => (
           <button
             key={t.key}
             onClick={() => setActiveTab(t.key)}
-            className={`flex-shrink-0 text-xs px-3 py-2 border-b-2 transition-colors ${activeTab === t.key ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-600 hover:text-gray-400'}`}
+            className={`flex-shrink-0 text-xs px-3 py-2.5 border-b-2 font-medium transition-colors ${activeTab === t.key ? 'border-accent text-ink' : 'border-transparent text-ink-mute hover:text-ink-soft'}`}
           >
             {t.label}
           </button>
@@ -163,11 +161,11 @@ export function CompanionPanel() {
 
       {snapshotLoading && !snapshot && (
         <div className="flex-1 flex items-center justify-center">
-          <span className="text-gray-500 text-sm animate-pulse">Loading analysis...</span>
+          <span className="text-ink-mute text-sm animate-pulse">Loading analysis…</span>
         </div>
       )}
       {snapshotError && (
-        <div className="px-4 py-2 text-xs text-red-400 bg-red-900/10">{snapshotError}</div>
+        <div className="px-4 py-2 text-xs text-bear bg-bear/5">{snapshotError}</div>
       )}
 
       {/* Chat tab renders regardless of snapshot so it can prompt user to select a ticker */}
@@ -179,7 +177,7 @@ export function CompanionPanel() {
 
       {!snapshot && !snapshotLoading && activeTab !== 'chat' && (
         <div className="flex-1 flex items-center justify-center">
-          <span className="text-gray-600 text-xs">Select a ticker to load analysis</span>
+          <span className="text-ink-mute text-xs">Select a ticker to load analysis</span>
         </div>
       )}
 
@@ -202,7 +200,7 @@ export function CompanionPanel() {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="mb-4">
-      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">{title}</h3>
+      <h3 className="eyebrow mb-2">{title}</h3>
       {children}
     </div>
   )
@@ -210,9 +208,9 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function Row({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
   return (
-    <div className="flex justify-between items-center py-0.5">
-      <span className="text-xs text-gray-600">{label}</span>
-      <span className={`text-xs font-mono ${valueClass ?? 'text-gray-300'}`}>{value}</span>
+    <div className="flex justify-between items-center py-1 border-b border-line/40 last:border-0">
+      <span className="text-xs text-ink-mute">{label}</span>
+      <span className={`text-xs tnum ${valueClass ?? 'text-ink-soft'}`}>{value}</span>
     </div>
   )
 }
@@ -226,16 +224,18 @@ function OverviewTab({ snap }: { snap: TickerSnapshot }) {
   return (
     <div className="px-4 py-3 space-y-4">
       <Section title="Setup Score">
-        <div className="flex items-center gap-3 mb-3">
-          <div className="text-3xl font-bold text-white">{sc.total}<span className="text-sm text-gray-500">/100</span></div>
-          <div>
-            <div className={`text-sm font-medium px-2 py-0.5 rounded inline-block ${STATUS_BG[sc.status] ?? 'bg-gray-800 text-gray-300'}`}>
-              {sc.status}
+        <div className="card card-hi p-3 mb-3">
+          <div className="flex items-center gap-3">
+            <div className="text-[34px] leading-none font-bold text-ink tnum">{sc.total}<span className="text-sm text-ink-faint font-medium">/100</span></div>
+            <div className="min-w-0">
+              <div className={`text-xs font-semibold px-2 py-0.5 rounded-md inline-block ${STATUS_BG[sc.status] ?? 'bg-white/5 text-ink-soft'}`}>
+                {sc.status}
+              </div>
+              <div className="text-xs text-ink-mute mt-1">{sc.classification}</div>
             </div>
-            <div className="text-xs text-gray-500 mt-0.5">{sc.classification}</div>
           </div>
         </div>
-        <div className="space-y-1">
+        <div className="space-y-1.5">
           <ScoreBar label="Trend/Structure" value={bd.trendStructure} max={20} />
           <ScoreBar label="Volume/Liquidity" value={bd.volumeLiquidity} max={15} />
           <ScoreBar label="Catalyst" value={bd.catalystQuality} max={15} />
@@ -249,24 +249,24 @@ function OverviewTab({ snap }: { snap: TickerSnapshot }) {
       {/* Breakout status */}
       {snap.breakoutStatus.state !== 'none' && (
         <Section title="Breakout Status">
-          <div className={`text-xs px-2 py-1.5 rounded bg-gray-900 border border-gray-800 ${BREAKOUT_COLORS[snap.breakoutStatus.state]}`}>
-            <span className="font-semibold uppercase">{snap.breakoutStatus.state}</span>
+          <div className={`card text-xs px-2.5 py-2 ${BREAKOUT_COLORS[snap.breakoutStatus.state]}`}>
+            <span className="font-semibold uppercase tracking-wide">{snap.breakoutStatus.state}</span>
             {snap.breakoutStatus.level && (
-              <span className="ml-2 text-gray-400">@ ${snap.breakoutStatus.level.toFixed(2)}</span>
+              <span className="ml-2 text-ink-soft tnum">@ ${snap.breakoutStatus.level.toFixed(2)}</span>
             )}
-            <div className="mt-0.5 text-gray-400 font-normal">{snap.breakoutStatus.description}</div>
+            <div className="mt-0.5 text-ink-soft font-normal">{snap.breakoutStatus.description}</div>
           </div>
           {snap.breakoutStatus.volumeConfirms && (
-            <div className="text-xs text-green-500 mt-1">✓ Volume confirms</div>
+            <div className="text-xs text-bull mt-1.5">✓ Volume confirms</div>
           )}
         </Section>
       )}
 
       <Section title="Catalyst">
-        <div className={`text-xs font-medium mb-1 ${QUALITY_COLORS[snap.catalystQuality] ?? 'text-gray-400'}`}>
+        <div className={`text-xs font-semibold mb-1 ${QUALITY_COLORS[snap.catalystQuality] ?? 'text-ink-mute'}`}>
           {snap.catalystQuality} — {snap.catalystCategory}
         </div>
-        <p className="text-xs text-gray-400">{snap.catalystSummary}</p>
+        <p className="text-xs text-ink-soft leading-relaxed">{snap.catalystSummary}</p>
       </Section>
 
       <Section title="Market Context">
@@ -291,8 +291,8 @@ function OverviewTab({ snap }: { snap: TickerSnapshot }) {
 
       {snap.pullbacks.length > 0 && (
         <Section title="Best Setup">
-          <div className="bg-gray-900 rounded p-3">
-            <div className="text-xs font-semibold text-blue-400 mb-1">{snap.pullbacks[0].name}</div>
+          <div className="card p-3">
+            <div className="text-xs font-semibold text-accent-hi mb-1.5">{snap.pullbacks[0].name}</div>
             <Row label="Entry zone" value={`$${snap.pullbacks[0].entryZoneLow.toFixed(2)} – $${snap.pullbacks[0].entryZoneHigh.toFixed(2)}`} />
             <Row label="Invalidation" value={fmt(snap.pullbacks[0].invalidation)} valueClass="text-red-400" />
             <Row label="Confidence" value={`${snap.pullbacks[0].confidenceScore}%`} />
@@ -305,14 +305,14 @@ function OverviewTab({ snap }: { snap: TickerSnapshot }) {
 
 function ScoreBar({ label, value, max }: { label: string; value: number; max: number }) {
   const pct = (value / max) * 100
-  const color = pct >= 75 ? 'bg-green-500' : pct >= 50 ? 'bg-yellow-500' : 'bg-red-500'
+  const color = pct >= 75 ? 'bg-bull' : pct >= 50 ? 'bg-warn' : 'bg-bear'
   return (
-    <div className="flex items-center gap-2">
-      <span className="text-xs text-gray-600 w-28 flex-shrink-0">{label}</span>
-      <div className="flex-1 bg-gray-800 rounded-full h-1.5">
-        <div className={`h-1.5 rounded-full ${color}`} style={{ width: `${pct}%` }} />
+    <div className="flex items-center gap-2.5">
+      <span className="text-[11px] text-ink-mute w-28 flex-shrink-0">{label}</span>
+      <div className="flex-1 bg-app rounded-full h-1.5 ring-1 ring-inset ring-line/60 overflow-hidden">
+        <div className={`h-full rounded-full ${color} transition-all`} style={{ width: `${pct}%` }} />
       </div>
-      <span className="text-xs text-gray-500 w-8 text-right">{value}/{max}</span>
+      <span className="text-[11px] text-ink-soft w-9 text-right tnum">{value}/{max}</span>
     </div>
   )
 }
@@ -329,8 +329,8 @@ function PlansTab({ snap, liveTradePlans, livePrice }: { snap: TickerSnapshot; l
     <div className="px-4 py-3">
       {/* Live price indicator */}
       {isLive && livePrice != null && (
-        <div className="flex items-center gap-1.5 mb-2 text-[10px] text-green-500">
-          <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse inline-block" />
+        <div className="flex items-center gap-1.5 mb-2.5 text-[10px] text-bull">
+          <span className="w-1.5 h-1.5 rounded-full bg-bull animate-pulse inline-block" />
           Plans updated to live price ${livePrice.toFixed(2)}
         </div>
       )}
@@ -343,16 +343,16 @@ function PlansTab({ snap, liveTradePlans, livePrice }: { snap: TickerSnapshot; l
             <button
               key={l}
               onClick={() => setSelected(l)}
-              className={`flex-1 py-1.5 rounded text-xs font-semibold transition-colors border ${
+              className={`ring-focus flex-1 py-1.5 rounded-md text-xs font-semibold transition-colors ${
                 selected === l
-                  ? 'bg-blue-700 border-blue-500 text-white'
+                  ? 'bg-accent text-white shadow-[0_0_0_1px_var(--color-accent)]'
                   : isValid
-                  ? 'bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-500'
-                  : 'bg-gray-900 border-gray-800 text-gray-600'
+                  ? 'bg-raised text-ink-soft ring-1 ring-inset ring-line hover:ring-ink-mute'
+                  : 'bg-surface/50 text-ink-faint ring-1 ring-inset ring-line/60'
               }`}
             >
               Plan {l}
-              <div className={`text-[9px] font-normal ${selected === l ? 'text-blue-200' : 'text-gray-600'}`}>
+              <div className={`text-[9px] font-normal ${selected === l ? 'text-white/70' : 'text-ink-faint'}`}>
                 {p?.type}
               </div>
             </button>
@@ -366,18 +366,18 @@ function PlansTab({ snap, liveTradePlans, livePrice }: { snap: TickerSnapshot; l
 }
 
 function PlanCard({ plan }: { plan: TradePlan; price: number }) {
-  const planTypeColor = plan.type === 'No-Trade' ? 'text-gray-500' : plan.valid ? 'text-blue-400' : 'text-gray-600'
+  const planTypeColor = plan.type === 'No-Trade' ? 'text-ink-mute' : plan.valid ? 'text-accent-hi' : 'text-ink-mute'
   return (
-    <div className={`rounded-lg border p-3 ${plan.type === 'No-Trade' ? 'bg-gray-900/40 border-gray-800' : plan.valid ? 'bg-gray-900 border-gray-700' : 'bg-gray-900/40 border-gray-800'}`}>
-      <div className="flex items-center justify-between mb-2">
+    <div className={`card p-3 ${plan.type === 'No-Trade' || !plan.valid ? 'opacity-90' : 'card-hi'}`}>
+      <div className="flex items-center justify-between mb-2.5">
         <span className={`text-sm font-bold ${planTypeColor}`}>Plan {plan.label}: {plan.name}</span>
         {!plan.valid && plan.invalidReason && (
-          <span className="text-xs text-red-500 bg-red-900/20 px-1.5 py-0.5 rounded">Invalid</span>
+          <span className="text-[10px] font-semibold text-bear bg-bear/10 ring-1 ring-inset ring-bear/25 px-1.5 py-0.5 rounded">Invalid</span>
         )}
       </div>
 
       {!plan.valid && plan.invalidReason && (
-        <div className="text-xs text-orange-400 mb-2 bg-orange-900/10 px-2 py-1.5 rounded">
+        <div className="text-xs text-warn mb-2.5 bg-warn/8 ring-1 ring-inset ring-warn/20 px-2 py-1.5 rounded-md">
           ⚠ {plan.invalidReason}
         </div>
       )}
@@ -385,37 +385,37 @@ function PlanCard({ plan }: { plan: TradePlan; price: number }) {
       {plan.type !== 'No-Trade' && (
         <>
           {/* Entry */}
-          <div className="bg-gray-800/50 rounded p-2 mb-2">
-            <div className="text-xs font-semibold text-gray-400 mb-1">Entry</div>
+          <div className="bg-app/60 ring-1 ring-inset ring-line rounded-md p-2 mb-2">
+            <div className="eyebrow mb-1">Entry</div>
             {plan.entryLow && plan.entryHigh && (
-              <div className="text-sm font-mono text-white">${plan.entryLow.toFixed(2)} – ${plan.entryHigh.toFixed(2)}</div>
+              <div className="text-sm tnum text-ink">${plan.entryLow.toFixed(2)} – ${plan.entryHigh.toFixed(2)}</div>
             )}
-            <div className="text-xs text-gray-400 mt-0.5">{plan.entryTrigger}</div>
+            <div className="text-xs text-ink-soft mt-0.5">{plan.entryTrigger}</div>
           </div>
 
           {/* Risk */}
           <div className="grid grid-cols-2 gap-2 mb-2">
-            <div className="bg-gray-800/50 rounded p-2">
-              <div className="text-xs text-gray-500 mb-0.5">Stop</div>
-              <div className="text-sm font-mono text-red-400">{fmt(plan.stopLoss)}</div>
+            <div className="bg-app/60 ring-1 ring-inset ring-line rounded-md p-2">
+              <div className="eyebrow mb-0.5">Stop</div>
+              <div className="text-sm tnum text-bear">{fmt(plan.stopLoss)}</div>
             </div>
-            <div className="bg-gray-800/50 rounded p-2">
-              <div className="text-xs text-gray-500 mb-0.5">Invalidation</div>
-              <div className="text-sm font-mono text-red-500">{fmt(plan.invalidation)}</div>
+            <div className="bg-app/60 ring-1 ring-inset ring-line rounded-md p-2">
+              <div className="eyebrow mb-0.5">Invalidation</div>
+              <div className="text-sm tnum text-bear">{fmt(plan.invalidation)}</div>
             </div>
           </div>
 
           {/* Targets */}
           {plan.targets.length > 0 && (
             <div className="mb-2">
-              <div className="text-xs font-semibold text-gray-400 mb-1">Targets</div>
+              <div className="eyebrow mb-1.5">Targets</div>
               <div className="space-y-1">
                 {plan.targets.map((t, i) => (
-                  <div key={i} className="flex items-center justify-between bg-gray-800/50 rounded px-2 py-1">
-                    <span className="text-xs text-gray-400">{t.label}</span>
-                    <span className="text-xs font-mono text-green-400">{fmt(t.price)}</span>
+                  <div key={i} className="flex items-center justify-between bg-app/60 ring-1 ring-inset ring-line rounded-md px-2 py-1">
+                    <span className="text-xs text-ink-mute">{t.label}</span>
+                    <span className="text-xs tnum text-bull">{fmt(t.price)}</span>
                     {t.rewardRisk && (
-                      <span className="text-xs text-gray-500">{t.rewardRisk.toFixed(1)}:1</span>
+                      <span className="text-xs text-ink-mute tnum">{t.rewardRisk.toFixed(1)}:1</span>
                     )}
                   </div>
                 ))}
@@ -426,10 +426,10 @@ function PlanCard({ plan }: { plan: TradePlan; price: number }) {
           {/* Confirmation */}
           {plan.confirmation.length > 0 && (
             <div className="mb-2">
-              <div className="text-xs font-semibold text-gray-400 mb-1">Confirmation needed</div>
+              <div className="eyebrow mb-1.5">Confirmation needed</div>
               {plan.confirmation.map((c, i) => (
-                <div key={i} className="text-xs text-gray-500 flex items-start gap-1">
-                  <span className="text-green-600 flex-shrink-0">✓</span><span>{c}</span>
+                <div key={i} className="text-xs text-ink-soft flex items-start gap-1.5 py-0.5">
+                  <span className="text-bull flex-shrink-0">✓</span><span>{c}</span>
                 </div>
               ))}
             </div>
@@ -440,20 +440,20 @@ function PlanCard({ plan }: { plan: TradePlan; price: number }) {
       {/* Ideal / avoid */}
       {plan.idealConditions.length > 0 && (
         <div className="mb-2">
-          <div className="text-xs font-semibold text-gray-400 mb-1">Ideal conditions</div>
+          <div className="eyebrow mb-1.5">Ideal conditions</div>
           {plan.idealConditions.map((c, i) => (
-            <div key={i} className="text-xs text-gray-500 flex items-start gap-1">
-              <span className="text-blue-600 flex-shrink-0">+</span><span>{c}</span>
+            <div key={i} className="text-xs text-ink-soft flex items-start gap-1.5 py-0.5">
+              <span className="text-accent flex-shrink-0">+</span><span>{c}</span>
             </div>
           ))}
         </div>
       )}
       {plan.avoidWhen.length > 0 && (
         <div className="mb-2">
-          <div className="text-xs font-semibold text-gray-400 mb-1">Avoid when</div>
+          <div className="eyebrow mb-1.5">Avoid when</div>
           {plan.avoidWhen.map((c, i) => (
-            <div key={i} className="text-xs text-gray-500 flex items-start gap-1">
-              <span className="text-red-600 flex-shrink-0">−</span><span>{c}</span>
+            <div key={i} className="text-xs text-ink-soft flex items-start gap-1.5 py-0.5">
+              <span className="text-bear flex-shrink-0">−</span><span>{c}</span>
             </div>
           ))}
         </div>
@@ -461,13 +461,13 @@ function PlanCard({ plan }: { plan: TradePlan; price: number }) {
 
       {/* Pullback label */}
       {plan.pullbackDepth && (
-        <div className="text-xs text-blue-400 mt-1">
+        <div className="text-xs text-accent-hi mt-1">
           Pullback depth: <span className="font-semibold">{plan.pullbackDepth}</span>
         </div>
       )}
 
       {plan.notes && (
-        <div className="text-xs text-gray-500 mt-2 italic border-t border-gray-800 pt-2">{plan.notes}</div>
+        <div className="text-xs text-ink-mute mt-2 italic border-t border-line pt-2">{plan.notes}</div>
       )}
     </div>
   )
@@ -522,27 +522,27 @@ function PullbackTab({ snap }: { snap: TickerSnapshot }) {
 function PullbackCard({ p, index }: { p: PullbackScenario; index: number }) {
   const confidenceColor = p.confidenceScore >= 70 ? 'text-green-400' : p.confidenceScore >= 50 ? 'text-yellow-400' : 'text-orange-400'
   return (
-    <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+    <div className="card p-3">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-semibold text-blue-400">{index + 1}. {p.name}</span>
-        <span className={`text-xs font-medium ${confidenceColor}`}>{p.confidenceScore}%</span>
+        <span className="text-sm font-semibold text-accent-hi">{index + 1}. {p.name}</span>
+        <span className={`text-xs font-semibold tnum ${confidenceColor}`}>{p.confidenceScore}%</span>
       </div>
-      <div className="space-y-0.5 mb-2">
+      <div className="mb-2">
         <Row label="Entry zone" value={`$${p.entryZoneLow.toFixed(2)} – $${p.entryZoneHigh.toFixed(2)}`} />
-        <Row label="Invalidation" value={fmt(p.invalidation)} valueClass="text-red-400" />
-        <Row label="Target 1" value={fmt(p.target1)} valueClass="text-green-400" />
-        <Row label="Target 2" value={fmt(p.target2)} valueClass="text-green-400" />
+        <Row label="Invalidation" value={fmt(p.invalidation)} valueClass="text-bear" />
+        <Row label="Target 1" value={fmt(p.target1)} valueClass="text-bull" />
+        <Row label="Target 2" value={fmt(p.target2)} valueClass="text-bull" />
         <Row label="R/R" value={p.rewardRisk ? `${p.rewardRisk.toFixed(1)}:1` : 'n/a'} />
         <Row label="Vol confirms" value={p.volumeConfirms ? 'Yes' : 'No'} />
         <Row label="Chasing" value={p.isChasing ? 'Yes ⚠️' : 'No'} />
       </div>
-      <div className="text-xs text-gray-500 mb-1"><span className="text-gray-600">Confirmation:</span> {p.confirmation}</div>
-      <div className="text-xs text-gray-500 mb-1"><span className="text-gray-600">Trigger:</span> {p.trigger}</div>
+      <div className="text-xs text-ink-soft mb-1"><span className="text-ink-mute">Confirmation:</span> {p.confirmation}</div>
+      <div className="text-xs text-ink-soft mb-1"><span className="text-ink-mute">Trigger:</span> {p.trigger}</div>
       {p.whatMakesStronger.length > 0 && (
-        <div className="text-xs text-gray-600">+ {p.whatMakesStronger.join(' · ')}</div>
+        <div className="text-xs text-ink-mute">+ {p.whatMakesStronger.join(' · ')}</div>
       )}
       {p.whatMakesWeaker.length > 0 && (
-        <div className="text-xs text-gray-600">− {p.whatMakesWeaker.join(' · ')}</div>
+        <div className="text-xs text-ink-mute">− {p.whatMakesWeaker.join(' · ')}</div>
       )}
     </div>
   )
@@ -579,7 +579,7 @@ function LevelsTab({ snap }: { snap: TickerSnapshot }) {
 }
 
 function ZoneCard({ zone }: { zone: SupportResistanceZone }) {
-  const typeColor = zone.type === 'support' ? 'text-green-400' : zone.type === 'resistance' ? 'text-red-400' : 'text-yellow-400'
+  const typeColor = zone.type === 'support' ? 'text-bull' : zone.type === 'resistance' ? 'text-bear' : 'text-warn'
   // 5-tier strength label
   const strengthLabel =
     zone.strengthScore >= 9 ? 'Very Strong' :
@@ -588,27 +588,27 @@ function ZoneCard({ zone }: { zone: SupportResistanceZone }) {
     zone.strengthScore >= 3 ? 'Weak' :
     'Very Weak'
   const strengthColor =
-    zone.strengthScore >= 9 ? 'text-green-400' :
-    zone.strengthScore >= 7 ? 'text-yellow-400' :
-    zone.strengthScore >= 5 ? 'text-gray-400' :
-    'text-gray-600'
+    zone.strengthScore >= 9 ? 'text-bull' :
+    zone.strengthScore >= 7 ? 'text-warn' :
+    zone.strengthScore >= 5 ? 'text-ink-soft' :
+    'text-ink-mute'
 
   return (
-    <div className="bg-gray-900 rounded p-2 mb-1 border border-gray-800">
+    <div className="card p-2 mb-1.5">
       <div className="flex items-center justify-between mb-1">
-        <span className={`text-xs font-semibold ${typeColor}`}>{zone.type.toUpperCase()}</span>
-        <div className="flex items-center gap-2">
+        <span className={`text-xs font-semibold tracking-wide ${typeColor}`}>{zone.type.toUpperCase()}</span>
+        <div className="flex items-center gap-2 tnum">
           <span className={`text-xs ${strengthColor}`}>{strengthLabel} ({zone.strengthScore}/10)</span>
-          <span className={`text-xs ${zone.status === 'testing' ? 'text-yellow-400' : zone.status === 'failed' ? 'text-red-400' : 'text-gray-500'}`}>
+          <span className={`text-xs ${zone.status === 'testing' ? 'text-warn' : zone.status === 'failed' ? 'text-bear' : 'text-ink-mute'}`}>
             {zone.status}
           </span>
         </div>
       </div>
-      <div className="text-xs text-gray-300 font-mono">
+      <div className="text-xs text-ink tnum">
         ${zone.lower.toFixed(2)} – ${zone.upper.toFixed(2)}
-        <span className="ml-2 text-gray-600">({zone.priorReactions} reactions)</span>
+        <span className="ml-2 text-ink-mute">({zone.priorReactions} reactions)</span>
       </div>
-      <div className="text-xs text-gray-600 mt-0.5">{zone.reasons.join(' · ')}</div>
+      <div className="text-xs text-ink-mute mt-0.5">{zone.reasons.join(' · ')}</div>
     </div>
   )
 }
@@ -628,26 +628,26 @@ function NewsTab({ snap }: { snap: TickerSnapshot }) {
 
 function NewsCard({ news: n }: { news: NewsItem }) {
   return (
-    <div className={`rounded-lg p-3 border ${n.isDilutive ? 'bg-red-900/20 border-red-800/30' : 'bg-gray-900 border-gray-800'}`}>
-      <div className="flex items-start justify-between gap-2 mb-1">
-        <span className={`text-xs font-medium leading-tight ${QUALITY_COLORS[n.quality] ?? 'text-gray-400'}`}>
+    <div className={`card p-3 ${n.isDilutive ? '!bg-bear/8 !ring-1 !ring-inset !ring-bear/25 !border-transparent' : ''}`}>
+      <div className="flex items-start justify-between gap-2 mb-1.5">
+        <span className={`text-xs font-semibold leading-tight ${QUALITY_COLORS[n.quality] ?? 'text-ink-mute'}`}>
           {n.quality}
         </span>
-        <span className="text-xs text-gray-600 flex-shrink-0">{n.age}</span>
+        <span className="text-[10px] text-ink-mute flex-shrink-0 tnum">{n.age}</span>
       </div>
-      <a href={n.url} target="_blank" rel="noopener noreferrer" className="text-xs text-gray-200 hover:text-white leading-tight block mb-1">
+      <a href={n.url} target="_blank" rel="noopener noreferrer" className="text-xs text-ink-soft hover:text-ink leading-snug block mb-1.5 transition-colors">
         {n.title}
       </a>
-      <div className="flex items-center gap-2 text-xs text-gray-600">
+      <div className="flex items-center gap-2 text-[11px] text-ink-mute">
         <span>{n.source}</span>
-        {n.isDilutive && <span className="text-red-400 font-medium">⚠️ DILUTION</span>}
+        {n.isDilutive && <span className="text-bear font-semibold">⚠️ DILUTION</span>}
         <span>{n.catalystCategory}</span>
       </div>
       {n.bullishElements.length > 0 && (
-        <div className="text-xs text-green-600 mt-1">+ {n.bullishElements.join(' · ')}</div>
+        <div className="text-xs text-bull/90 mt-1">+ {n.bullishElements.join(' · ')}</div>
       )}
       {n.bearishElements.length > 0 && (
-        <div className="text-xs text-red-600">− {n.bearishElements.join(' · ')}</div>
+        <div className="text-xs text-bear/90">− {n.bearishElements.join(' · ')}</div>
       )}
     </div>
   )
@@ -831,22 +831,22 @@ function CalcTab({ snap }: { snap: TickerSnapshot }) {
       <Section title="Position Size Calculator">
         <div className="space-y-2">
           <div>
-            <label className="text-xs text-gray-500 block mb-0.5">Account Size ($)</label>
+            <label className="eyebrow block mb-1">Account Size ($)</label>
             <input
               type="number"
               value={accountSize}
               onChange={e => setAccountSize(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white font-mono"
+              className="ring-focus w-full bg-raised border border-line rounded-md px-2 py-1.5 text-xs text-ink tnum focus:border-accent focus:outline-none"
               placeholder="25000"
             />
           </div>
           <div>
-            <label className="text-xs text-gray-500 block mb-0.5">Max Risk (%)</label>
+            <label className="eyebrow block mb-1">Max Risk (%)</label>
             <input
               type="number"
               value={maxRiskPct}
               onChange={e => setMaxRiskPct(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white font-mono"
+              className="ring-focus w-full bg-raised border border-line rounded-md px-2 py-1.5 text-xs text-ink tnum focus:border-accent focus:outline-none"
               placeholder="1"
               step="0.1"
               min="0.1"
@@ -854,22 +854,22 @@ function CalcTab({ snap }: { snap: TickerSnapshot }) {
             />
           </div>
           <div>
-            <label className="text-xs text-gray-500 block mb-0.5">Entry Price ($)</label>
+            <label className="eyebrow block mb-1">Entry Price ($)</label>
             <input
               type="number"
               value={entry}
               onChange={e => setEntry(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white font-mono"
+              className="ring-focus w-full bg-raised border border-line rounded-md px-2 py-1.5 text-xs text-ink tnum focus:border-accent focus:outline-none"
               step="0.01"
             />
           </div>
           <div>
-            <label className="text-xs text-gray-500 block mb-0.5">Stop Loss ($)</label>
+            <label className="eyebrow block mb-1">Stop Loss ($)</label>
             <input
               type="number"
               value={stop}
               onChange={e => setStop(e.target.value)}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white font-mono"
+              className="ring-focus w-full bg-raised border border-line rounded-md px-2 py-1.5 text-xs text-ink tnum focus:border-accent focus:outline-none"
               step="0.01"
             />
           </div>

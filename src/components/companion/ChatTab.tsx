@@ -278,6 +278,11 @@ function MarkdownText({ text }: { text: string }) {
   while (i < lines.length) {
     const line = lines[i]
 
+    // Key each block by the line index where it STARTS — the inner loops below
+    // advance `i` past the block, so keying on `i` after them collides with the
+    // next element (two children with the same key).
+    const start = i
+
     if (line.startsWith('- ') || line.startsWith('• ')) {
       // Bullet list — collect consecutive bullets
       const items: string[] = []
@@ -286,7 +291,7 @@ function MarkdownText({ text }: { text: string }) {
         i++
       }
       elements.push(
-        <ul key={i} className="list-disc list-inside space-y-0.5 my-1">
+        <ul key={start} className="list-disc list-inside space-y-0.5 my-1">
           {items.map((it, j) => (
             <li key={j}><InlineText text={it} /></li>
           ))}
@@ -299,17 +304,17 @@ function MarkdownText({ text }: { text: string }) {
         i++
       }
       elements.push(
-        <ol key={i} className="list-decimal list-inside space-y-0.5 my-1">
+        <ol key={start} className="list-decimal list-inside space-y-0.5 my-1">
           {items.map((it, j) => (
             <li key={j}><InlineText text={it} /></li>
           ))}
         </ol>
       )
     } else if (line === '') {
-      elements.push(<div key={i} className="h-1" />)
+      elements.push(<div key={start} className="h-1" />)
       i++
     } else {
-      elements.push(<p key={i} className="leading-relaxed"><InlineText text={line} /></p>)
+      elements.push(<p key={start} className="leading-relaxed"><InlineText text={line} /></p>)
       i++
     }
   }

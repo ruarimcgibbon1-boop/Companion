@@ -1,0 +1,136 @@
+{
+  "_comment": "Append-only decision log written by the promote-learning skill. Each entry: {candidateId, decision, date, evidenceSummary, sampleSize, confidence, dataset}. decision ∈ VALIDATED | KEEP TESTING | REJECT.",
+  "_provenance": "Entries dated before 2026-08-22 predate the committed shared-engine harness (6b6e0bc→99e0e8a→7a62166) and are HISTORICAL: any result referencing JULY_2026_1M_BASELINE (or 'current production code'/'signal parity verified' from that era) was produced by the pre-C2 research engine and is UNPROVEN against the committed engine until re-verified. Old records are never rewritten; this marker scopes them.",
+  "history": [
+    {
+      "candidateId": "C3",
+      "title": "MIN_GREEN_STREAK=2 entry-timing confirmation",
+      "decision": "REJECT",
+      "subdecision": "REJECTED ON 5-MINUTE REPLAY (parent entry-timing thesis UNRESOLVED)",
+      "date": "2026-08-16",
+      "dataset": "July 2026 (2026-07-06 → 2026-07-31), 20-day FMP replay, current production code, cap=2, 5-minute bars",
+      "sampleSize": {
+        "control": 84,
+        "experiment": 48
+      },
+      "metrics": {
+        "control": {
+          "signals": 84,
+          "winRate": 0.38,
+          "avgR": 0.726,
+          "medianR": -1.03,
+          "netR": 60.9,
+          "maxDrawdownR": -22.5,
+          "lossAvgMaePct": -4.75
+        },
+        "experiment": {
+          "signals": 48,
+          "winRate": 0.31,
+          "avgR": 0.429,
+          "medianR": -1.05,
+          "netR": 20.6,
+          "maxDrawdownR": -19.2,
+          "lossAvgMaePct": -4.83
+        }
+      },
+      "evidenceSummary": "Requiring 2 prior green closes removed winners (ORB +21.6R->-9.0R, hod_break +2.5R->-3.8R), cut net R -66%, dropped win rate 38%->31%, and did NOT reduce losers' MAE (-4.75%->-4.83%) so the claimed entry-timing mechanism never appeared. Left the book more ticker-concentrated (top-2 47%->96%). All pre-registered reject triggers fired.",
+      "confidence": "high (for the 5-min proxy rejection); the broader entry-timing thesis is unresolved because 5-min bars cannot observe intra-bar entry-bar death",
+      "reviewTrigger": "1-minute replay available -> retest entry-timing with a 1-min-native confirmation proxy"
+    },
+    {
+      "candidateId": "D1",
+      "title": "Early adverse excursion (MAE<=-0.5R within 2 min)",
+      "decision": "KEEP TESTING",
+      "subdecision": "PREDICTIVE ONLY — not actionable via a blanket -0.5R exit",
+      "date": "2026-08-16",
+      "dataset": "JULY_2026_1M_BASELINE, 167 clean-resolved trades",
+      "sampleSize": {
+        "dipped": 75,
+        "dippedWinners": 14,
+        "dippedLosers": 61
+      },
+      "evidenceSummary": "Dipped cohort (MAE@2m<=-0.5R): 75 trades, 19% win, -37.1R realised. Blanket -0.5R exit counterfactual = -37.5R (0.4R WORSE before slippage). 14 recovering winners contribute +33.0R (avg +2.36R) and are captured by current wide-stop/scale-out management; a blanket exit destroys them. Recovery discriminators weak/tautological on a 14-trade sample.",
+      "confidence": "prediction strong; policy value absent as posed",
+      "reviewTrigger": "only revisit as a CONDITIONAL exit that spares fast-reclaim recoveries, with a purpose-built recovery study (current recovery N=14)"
+    },
+    {
+      "candidateId": "D2",
+      "title": "Tight (<2%) stop-width edge",
+      "decision": "REJECT",
+      "subdecision": "Largely a proxy for volatility/setup structure, not independently robust",
+      "date": "2026-08-16",
+      "dataset": "JULY_2026_1M_BASELINE, 167 clean-resolved trades",
+      "sampleSize": {
+        "tight": 81,
+        "wide": 86
+      },
+      "evidenceSummary": "Stop set at ~1.3xATR so stop-width ~ volatility proxy (median RVOL 2->4->33 across buckets). Edge reverses for break_of_structure (tight -0.8R vs wide +11.4R), holds only for opening_drive/ORB, and collapses +45.9R->+14.9R without the top-3 tickers. Not a price or RR proxy.",
+      "confidence": "low that stop width is an independent edge",
+      "reviewTrigger": "n/a — treat as a symptom of clean low-ATR opening-session momentum, not a lever"
+    },
+    {
+      "candidateId": "M1",
+      "title": "Remove breakeven-after-T1 (runner keeps original stop until T2)",
+      "decision": "KEEP TESTING",
+      "subdecision": "Blanket rule REJECTED on robustness; targeted variant may warrant testing",
+      "date": "2026-08-17",
+      "dataset": "JULY_2026_1M_BASELINE, controlled A/B (BREAKEVEN_AFTER_T1 true vs false), pinned universe, signal parity verified",
+      "sampleSize": {
+        "affectedTrades": 16,
+        "helped": 5,
+        "hurt": 11
+      },
+      "metrics": {
+        "baselineA": {
+          "control": 73.2,
+          "experiment": 77.7,
+          "delta": 4.5
+        },
+        "baselineB": {
+          "control": 34.8,
+          "experiment": 39.3,
+          "delta": 4.5
+        },
+        "baselineC_strictRealised": {
+          "control": 24.7,
+          "experiment": 27.9,
+          "delta": 3.2
+        },
+        "maxDrawdownA": {
+          "control": -19.1,
+          "experiment": -21.1
+        }
+      },
+      "evidenceSummary": "Removing breakeven-after-T1 nets +4.5R (marked) / +3.2R (strict-realised): +8.6R gained via T2 + 1.4R via EOD-mark, -5.5R lost as 11 runners fell to the original stop (breakeven does protect these). Positive on all three baselines and gains>losses, but robustness fails: ex-top-2 tickers flips to -0.6R, one day (2026-07-21) contributes +5.1R (>the whole net), and max drawdown worsens -19.1->-21.1R. Corrected the descriptive study: the +32.1R MFE 'forfeit' was hindsight; the realisable edge is ~7x smaller.",
+      "confidence": "point estimate positive but fragile/outlier-dependent; not ship-worthy as a blanket rule",
+      "reviewTrigger": "test a TARGETED variant (structure/ATR runner trail, or setup-conditioned on BOS/ORB where gains sit) rather than full breakeven removal"
+    },
+    {
+      "candidateId": "OL-1",
+      "title": "Broker fills authoritative over local execution state",
+      "decision": "VALIDATED",
+      "date": "2026-08-18",
+      "dataset": "2026-08-17 live Alpaca broker evidence (CAPR partial fill) + regression TEST E",
+      "evidenceSummary": "CAPR stop filled 575+2007@7.28 as one Alpaca order; local recorded only the first partial and believed 2007 open while broker was flat. reconcile() now adopts broker qty. Correctness invariant, not a statistical edge.",
+      "confidence": "high (mechanism, broker-proven)"
+    },
+    {
+      "candidateId": "OL-2",
+      "title": "Stale sell management must terminate at broker qty zero",
+      "decision": "VALIDATED",
+      "date": "2026-08-18",
+      "dataset": "2026-08-17 live Alpaca broker evidence (FIGR external close, WOK stop rejection) + regression TESTS C,D",
+      "evidenceSummary": "FIGR flattened by external order 762fe788; daemon kept stale 553 open and re-submitted an expiring stop. Now: verify broker position before every sell; broker-flat => force close, no new sell, quarantine. Prevents accidental shorts on shortable names.",
+      "confidence": "high (mechanism, broker-proven)"
+    },
+    {
+      "candidateId": "OL-3",
+      "title": "Only broker-verified executions enter learning",
+      "decision": "VALIDATED",
+      "date": "2026-08-18",
+      "dataset": "2026-08-17 FIGR (external close, P&L unreconstructable) + regression TEST C",
+      "evidenceSummary": "verifiedClosedTrades() gate: reconciliationStatus in {discrepancy,manual_review} excluded from research until human-confirmed. FIGR resolves to manual_review and is excluded. Gate installed before any live->learning pipe exists.",
+      "confidence": "high (design gate)"
+    }
+  ]
+}

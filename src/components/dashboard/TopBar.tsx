@@ -7,6 +7,7 @@ import { TradeJournal } from '@/components/journal/TradeJournal'
 import { OpportunitiesDrawer } from '@/components/opportunities/OpportunitiesDrawer'
 import { ContinuationDrawer } from '@/components/continuation/ContinuationDrawer'
 import { useMonitor } from '@/hooks/useMonitor'
+import { useEodResolution } from '@/hooks/useEodResolution'
 import { useTradingStore } from '@/store/trading-store'
 
 export function TopBar() {
@@ -20,6 +21,9 @@ export function TopBar() {
 
   // Always-on monitoring engine — runs app-wide, independent of the selected ticker.
   useMonitor()
+  // Reconcile any open outcomes from sessions that have since closed (the app
+  // wasn't live through their close), so the Buy Log reflects the real tape.
+  useEodResolution({ auto: true })
   const setupCount = useTradingStore(s => s.monitoredSetups.filter(su => su.score >= 75).length)
   const unreadSignals = useTradingStore(s => s.monitorAlerts.filter(a => !a.read).length)
 
@@ -33,12 +37,12 @@ export function TopBar() {
       const sc = sessionColor(s)
       setSessionColorClass(
         sc === 'text-green-400'
-          ? 'text-green-400 bg-green-900/20'
+          ? 'text-bull bg-bull/10 ring-1 ring-bull/25'
           : sc === 'text-yellow-400'
-          ? 'text-yellow-400 bg-yellow-900/20'
+          ? 'text-warn bg-warn/10 ring-1 ring-warn/25'
           : sc === 'text-blue-400'
-          ? 'text-blue-400 bg-blue-900/20'
-          : 'text-gray-500 bg-gray-900/20'
+          ? 'text-info bg-info/10 ring-1 ring-info/25'
+          : 'text-ink-mute bg-white/5 ring-1 ring-white/10'
       )
     }
     update()
@@ -47,42 +51,45 @@ export function TopBar() {
   }, [])
 
   return (
-    <header className="relative flex items-center justify-between px-4 h-10 bg-[#080b10] border-b border-gray-800 flex-shrink-0">
+    <header className="relative z-30 flex items-center justify-between px-4 h-11 bg-bar border-b border-line flex-shrink-0 shadow-[0_1px_0_rgba(0,0,0,0.4)]">
       <div className="flex items-center gap-3">
-        <span className="text-sm font-bold text-white tracking-wide">INTRADAY COMPANION</span>
-        <span className={`text-xs px-2 py-0.5 rounded font-medium ${sessionColorClass}`}>
+        <div className="flex items-center gap-2">
+          <span className="h-4 w-1 rounded-full bg-accent shadow-[0_0_8px_var(--color-accent)]" />
+          <span className="text-[13px] font-semibold text-ink tracking-[0.14em]">INTRADAY COMPANION</span>
+        </div>
+        <span className={`text-[11px] px-2 py-0.5 rounded-md font-semibold tracking-wide ${sessionColorClass}`}>
           {session}
         </span>
       </div>
       <div className="flex items-center gap-3">
-        <div className="flex items-center gap-2 text-xs font-mono text-gray-500">
-          <span>ET {etTime}</span>
-          <span className="text-gray-700">·</span>
-          <span>LON {londonTime}</span>
+        <div className="flex items-center gap-2 tnum text-[11px] text-ink-mute mr-1">
+          <span><span className="text-ink-faint">ET</span> {etTime}</span>
+          <span className="text-line-strong">·</span>
+          <span><span className="text-ink-faint">LON</span> {londonTime}</span>
         </div>
         <button
           onClick={() => setOppsOpen(true)}
-          className="relative text-xs px-2.5 py-1 rounded border border-blue-800 bg-blue-950/40 text-blue-300 hover:text-white hover:border-blue-600 transition-colors font-medium"
+          className="ring-focus relative text-xs px-2.5 py-1.5 rounded-md border border-accent/40 bg-accent/10 text-accent-hi hover:bg-accent/20 hover:border-accent/60 transition-colors font-medium"
         >
           ⚡ Opportunities
           {setupCount > 0 && (
-            <span className="ml-1.5 text-[10px] px-1 rounded bg-blue-700 text-white">{setupCount}</span>
+            <span className="ml-1.5 text-[10px] px-1.5 py-px rounded-full bg-accent text-white font-semibold tnum">{setupCount}</span>
           )}
           {unreadSignals > 0 && (
-            <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 text-white text-[9px] flex items-center justify-center font-bold">
+            <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-bear text-white text-[9px] flex items-center justify-center font-bold ring-2 ring-bar">
               {unreadSignals > 9 ? '9+' : unreadSignals}
             </span>
           )}
         </button>
         <button
           onClick={() => setContOpen(true)}
-          className="text-xs px-2.5 py-1 rounded border border-emerald-800 bg-emerald-950/40 text-emerald-300 hover:text-white hover:border-emerald-600 transition-colors font-medium"
+          className="ring-focus text-xs px-2.5 py-1.5 rounded-md border border-bull/40 bg-bull/10 text-bull hover:bg-bull/20 hover:border-bull/60 transition-colors font-medium"
         >
           🎯 Continuation
         </button>
         <button
           onClick={() => setJournalOpen(true)}
-          className="text-xs px-2.5 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 transition-colors font-medium"
+          className="ring-focus text-xs px-2.5 py-1.5 rounded-md border border-line-strong text-ink-soft hover:text-ink hover:border-ink-mute hover:bg-white/5 transition-colors font-medium"
         >
           Journal
         </button>

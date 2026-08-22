@@ -212,6 +212,33 @@ export async function getIntradayCandles(
   return []
 }
 
+/**
+ * Extended-hours 5-min candles over the last `days` calendar days.
+ *
+ * The only feed that carries real premarket VOLUME — Yahoo returns premarket
+ * bars with `volume: 0` for every symbol (verified 2026-08-03), which is why
+ * premarket participation was unmeasurable. `extended=true` is required, not a
+ * preferred attempt: without it the response has no premarket bars at all, so
+ * there is no silent fallback here.
+ */
+export async function getExtendedIntradayCandles(
+  symbol: string,
+  days = 10
+): Promise<FmpCandle[]> {
+  const fromDate = new Date(Date.now() - days * 86_400_000)
+  const from = fromDate.toISOString().slice(0, 10)
+  try {
+    const data = await fmpGet(
+      '/historical-chart/5min',
+      { symbol, from, extended: true },
+      z.array(FmpCandleSchema)
+    )
+    return data.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+  } catch {
+    return []
+  }
+}
+
 export async function getDailyCandles(symbol: string): Promise<FmpCandle[]> {
   // Daily EOD history — try known endpoint paths
   const attempts: Array<[string, Record<string, string | number | boolean>]> = [
@@ -274,4 +301,13 @@ export async function getSharesFloat(symbol: string): Promise<FmpSharesFloat | n
   } catch {
     return null
   }
+}
+
+// Sanitized absolute float count, shared by the scanner and the signal path.
+// FMP occasionally returns an implausibly small value for a micro-cap (a units
+// glitch, e.g. INLF at 4,263 shares); anything under 10k isn't a real tradeable
+// float, so return null (unknown) rather than a fake ultra-low-float reading.
+export async function getFloatShares(symbol: string): Promise<number | null> {
+  const v = (await getSharesFloat(symbol))?.floatShares ?? null
+  return v != null && v >= 10_000 ? v : null
 }

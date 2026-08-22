@@ -1,0 +1,23 @@
+{
+  "_comment": "Labelled setups the user actually wanted — sourced from screenshots they sent. This is the RECALL test set: for each row, did any detector even SEE the setup near that time? Recall is measured independently of outcome, so (unlike gate policy) it is not biased by only-winners-are-screenshotted. Add a row every time a setup is sent. etTime is the approximate entry time in ET (HHMM); entry is approximate and read off a chart, so recall matching is primarily on TIME.",
+  "setups": [
+    { "symbol": "YXT",  "date": "2026-08-05", "etTime": "0820", "entry": 5.86,  "shape": "premarket base -> continuation", "movePct": 208, "note": "thin float, 46x RVOL on 46k shares" },
+    { "symbol": "YXT",  "date": "2026-08-05", "etTime": "1055", "entry": 12.10, "shape": "halt-resume continuation", "movePct": 100, "note": "ran to 25" },
+    { "symbol": "ZYBT", "date": "2026-08-05", "etTime": "1110", "entry": 2.02,  "shape": "RTH base -> vertical", "movePct": 108, "note": "base ~1.7 -> 4.2" },
+    { "symbol": "INLF", "date": "2026-08-05", "etTime": "0935", "entry": 7.46,  "shape": "opening drive", "movePct": 27, "note": "ran to 9.48" },
+    { "symbol": "RITR", "date": "2026-08-05", "etTime": "1220", "entry": 0.30,  "shape": "near-high ORB", "movePct": 16, "note": "45x RVOL at -0.3% off high" },
+    { "symbol": "JLHL", "date": "2026-08-05", "etTime": "0955", "entry": 8.82,  "shape": "opening range break", "movePct": 26, "note": "ran to 11.11" },
+    { "symbol": "GTE",  "date": "2026-08-05", "etTime": "0615", "entry": 9.30,  "shape": "premarket base -> continuation", "movePct": 16, "note": "user trade; based 9.2-9.3 then ran to 10.73" },
+    { "symbol": "CISS", "date": "2026-08-05", "etTime": "0515", "entry": 0.131, "shape": "premarket dip -> continuation", "movePct": 20, "note": "user scaled ~3 entries" },
+    { "symbol": "PAVS", "date": "2026-08-06", "etTime": "0605", "entry": 8.90,  "shape": "premarket base pocket -> continuation", "movePct": 20, "note": "USER'S ACTUAL WINNING TRADE; 178x RVOL" },
+    { "symbol": "PAVS", "date": "2026-08-06", "etTime": "0650", "entry": 10.29, "shape": "runner continuation leg", "movePct": 17, "note": "198x RVOL, ran to 12.10" },
+    { "symbol": "CLRO", "date": "2026-08-06", "etTime": "0730", "entry": 11.99, "shape": "premarket continuation", "movePct": 20, "note": "639x RVOL at the high" },
+    { "symbol": "WYHG", "date": "2026-08-06", "etTime": "1000", "entry": 13.64, "shape": "RTH continuation", "movePct": 60, "note": "grade B score 72; thin float (51k avg vol)" },
+    { "symbol": "WYHG", "date": "2026-08-06", "etTime": "0435", "entry": 5.71,  "shape": "premarket breakout", "movePct": 78, "note": "55x RVOL" },
+    { "symbol": "XHLD", "date": "2026-08-06", "etTime": "1440", "entry": 1.35,  "shape": "afternoon continuation", "movePct": 40, "note": "41x RVOL; biggest leg after 15:00" },
+    { "symbol": "GAUZ", "date": "2026-08-06", "etTime": "1030", "entry": 0.60,  "shape": "vertical breakout", "movePct": 75, "note": "ZERO triggers all day - pure recognition gap" },
+    { "symbol": "GAUZ", "date": "2026-08-06", "etTime": "1130", "entry": 0.62,  "shape": "second push", "movePct": 33, "note": "" },
+    { "symbol": "CELZ", "date": "2026-08-06", "etTime": "1100", "entry": 1.20,  "shape": "RTH base -> run", "movePct": 50, "note": "1.08 -> 1.75" },
+    { "symbol": "CELZ", "date": "2026-08-06", "etTime": "1200", "entry": 1.40,  "shape": "continuation", "movePct": 19, "note": "" }
+  ]
+}

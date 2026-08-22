@@ -26,7 +26,11 @@ function px(n: number): string {
 function triggerConditionFor(type: SetupType, direction: 'long' | 'short'): string {
   switch (type) {
     case 'breakout': return 'a candle CLOSE above'
+    case 'bull_flag': return 'a break + hold above the flag high'
+    case 'break_of_structure': return 'a break of the prior swing high'
+    case 'opening_drive': return 'a break of the premarket/prior-day high'
     case 'pullback': return 'a bounce + reclaim of'
+    case 'momentum_pullback': return 'a new high off the pullback above'
     case 'ema9_bounce': return 'a hold + reclaim above'
     case 'ema21_bounce': return 'a higher low + reclaim above'
     case 'vwap_bounce': return 'buyers defending / hold above'
@@ -43,6 +47,10 @@ export function deriveSignal(s: DetectedSetup): TradeSignal {
   // The level that flips the setup actionable: reclaim/break the top (long) or
   // lose the bottom (short) of the zone.
   const triggerPrice = long ? s.zoneUpper : s.zoneLower
+  // Where you actually fill entering on the trigger (buy the reclaim), never
+  // below current price for a long — so we don't tell the user to rest a limit
+  // in a zone that a strong mover never revisits.
+  const entryFill = s.entryFill ?? triggerPrice
   const cond = triggerConditionFor(s.type, s.direction)
   const stop = s.invalidation
   const targets = s.targets.map(t => t.price)
@@ -63,7 +71,7 @@ export function deriveSignal(s: DetectedSetup): TradeSignal {
         headline = `${s.symbol} ${label(s.type)} triggered but R/R only ${rr(s)} — target ${px(targets[0] ?? triggerPrice)} too close to stop ${px(stop)}. Skip unless the setup improves.`
       } else if (long) {
         action = 'buy'; verb = 'BUY'; urgency = 'now'
-        headline = `BUY ${s.symbol} — ${label(s.type)} triggered. Entry ~${px(triggerPrice)}, stop ${px(stop)}, sell into ${tgtText}. R/R ${rr(s)}.`
+        headline = `BUY ${s.symbol} — ${label(s.type)} triggered. Enter now ~${px(entryFill)} (on the reclaim), stop ${px(stop)}, sell into ${tgtText}. R/R ${rr(s)}.`
       } else {
         action = 'sell_short'; verb = 'SELL / SHORT'; urgency = 'now'
         headline = `SELL/SHORT ${s.symbol} — ${label(s.type)} triggered. Entry ~${px(triggerPrice)}, stop ${px(stop)}, cover into ${tgtText}. R/R ${rr(s)}.`

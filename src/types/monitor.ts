@@ -13,7 +13,14 @@
 
 export type SetupType =
   | 'pullback'
+  | 'momentum_pullback'
   | 'breakout'
+  | 'premarket_breakout'
+  | 'opening_range_break'
+  | 'opening_drive'
+  | 'hod_break'
+  | 'bull_flag'
+  | 'break_of_structure'
   | 'ema9_bounce'
   | 'ema21_bounce'
   | 'vwap_bounce'
@@ -128,6 +135,14 @@ export interface DetectedSetup {
   type: SetupType
   direction: SetupDirection
   state: SetupState
+  /** Raw geometric trigger, BEFORE any quality veto downgrades `state`. The Buy
+   *  Log records on this so it captures every signal for review; `state` still
+   *  drives what the user is told to act on. */
+  triggeredRaw?: boolean
+  /** A quality gate (e.g. rolled-over-off-high) fired — the signal is logged but flagged. */
+  qualityVetoed?: boolean
+  /** Price you'd actually fill entering on the trigger (buy the reclaim), never below current price for a long. */
+  entryFill?: number
   score: number
   grade: SetupGrade
   breakdown: ScoreBreakdown
@@ -245,6 +260,11 @@ export interface MonitorResult {
   symbol: string
   price: number
   changePct: number
+  volume: number            // day/session share volume (0 when the feed omits it, e.g. premarket)
+  /** Today's premarket share volume, measured off the extended-hours feed. Null outside premarket. */
+  premarketVolume: number | null
+  /** In premarket this is the premarket measure (vs this name's own typical premarket volume by
+   *  this time of day); in regular hours, the session-paced day RVOL. */
   relativeVolume: number | null
   spreadPct: number | null
   catalyst: string
@@ -253,8 +273,71 @@ export interface MonitorResult {
   roadmap: PriceRoadmap
   integrity: DataIntegrity
   technicals?: ContinuationTechnicals
+  /** Bullish candlestick patterns detected on this symbol now (top-gainer scan). */
+  patterns?: PatternHit[]
   error?: string
 }
+
+// ── Candlestick pattern scan (top-gainer universe) ──────────────────────────
+export type CandlePattern =
+  | 'hammer'
+  | 'bullish_engulfing'
+  | 'morning_star'
+  | 'three_white_soldiers'
+
+export interface PatternHit {
+  pattern: CandlePattern
+  atSupport: boolean       // formed at a pullback low / near support
+  volumeConfirmed: boolean // above-average volume on the signal candle
+  strength: number         // 0–100: base + location + volume + trend
+}
+
+export const PATTERN_LABELS: Record<CandlePattern, string> = {
+  hammer: 'Hammer',
+  bullish_engulfing: 'Bullish Engulfing',
+  morning_star: 'Morning Star',
+  three_white_soldiers: 'Three White Soldiers',
+}
+
+/** A logged pattern occurrence — accumulated in the background to build a dataset
+ *  of which candlestick patterns on which gainers actually pay off. */
+export interface PatternLogRecord {
+  /**
+   * symbol:pattern:priceBucket — deduped per occurrence AND per price.
+   *
+   * Was symbol:pattern:timeBucket, which re-logged the same pattern every 10-min
+   * bucket for as long as it persisted. With a stale feed that is unbounded:
+   * 2026-08-12's export had INLF's hammer 21x and PAVS's morning_star 20x at a
+   * price that never changed once (6.27 and 4.91 for 3+ hours), 40% of the file.
+   * Keying on price means a frozen quote logs once.
+   */
+  id: string
+  timestamp: number        // epoch ms when first logged
+  symbol: string
+  pattern: CandlePattern
+  strength: number
+  atSupport: boolean
+  volumeConfirmed: boolean
+  price: number            // price when the pattern logged (for later outcome resolution)
+  changePct: number        // day change at log time (to filter to the top gainers)
+  rvol: number | null
+  // ── Outcome, filled by the pattern resolver ────────────────────────────────
+  /** Which barrier the tape hit first inside the horizon. Null until resolved. */
+  outcome?: PatternOutcome
+  /** Best gain reached after the pattern, % — populated with the outcome. */
+  mfePct?: number | null
+  /** Worst drawdown reached after the pattern, % (negative). */
+  maePct?: number | null
+  resolvedAt?: number | null
+}
+
+/**
+ * Symmetric barriers, deliberately: ±2% within one hour. Because the up and down
+ * barriers are the same size, the WIN RATE is itself the edge measurement — above
+ * 50% means the pattern predicts direction, and no payoff-ratio assumptions are
+ * smuggled in. 'expired' = neither barrier touched inside the horizon.
+ */
+export type PatternOutcome = 'open' | 'win' | 'loss' | 'expired'
 
 // ── State machine record (persisted for restart restoration) ────────────────
 
@@ -351,7 +434,14 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   inApp: true,
   setupTypes: {
     pullback: true,
+    momentum_pullback: true,
     breakout: true,
+    premarket_breakout: true,
+    opening_range_break: true,
+    opening_drive: true,
+    hod_break: true,
+    bull_flag: true,
+    break_of_structure: true,
     ema9_bounce: true,
     ema21_bounce: true,
     vwap_bounce: true,
@@ -421,11 +511,56 @@ export interface BuySignalRecord {
   grade: SetupGrade
   rewardRisk: number | null
   priceAtSignal: number
+  /** A quality gate fired at trigger time (e.g. rolled over off the session high). Logged for review, not filtered out. */
+  flagged?: boolean
+  // ── Diagnostic context at signal time — captured so winners vs losers can be
+  //    separated empirically at review (which trend/RVOL/position actually pays),
+  //    rather than guessing at gates. All optional/additive.
+  ctxTrend15m?: 'up' | 'down' | 'flat'
+  ctxDistVwapPct?: number | null      // + above VWAP, - below
+  ctxDistDayHighPct?: number | null   // ~0 = at HOD (top-buy), very negative = well below
+  ctxRelVol?: number | null
+  ctxHigherHighsLows?: boolean | null // constructive structure vs chop
+  ctxAtrPct?: number | null           // volatility, for stop-vs-noise analysis
+  // ── Realized P/L (filled by the EOD resolver, scaled-out model) ──────────────
+  /** Realized return % for the trade under the scale-out rule (½ T1, ½ T2, breakeven stop after T1, remainder marked at the close). Null until the day closes and it's resolved. */
+  pnlPct?: number | null
+  /** False when a remainder was still held at the close (marked-to-close, not a clean exit). */
+  pnlFullyClosed?: boolean
+}
+
+// ── Signal funnel (per-sweep instrumentation) ───────────────────────────────
+// Counts where candidates die each monitor sweep, so a "0 signals" day is
+// legible: scanned → detected → cleared floor → triggered → logged, with the
+// drop reason at each stage. Ephemeral (latest sweep only), not persisted.
+export interface MonitorFunnel {
+  timestamp: number
+  scanned: number             // symbols in the monitor universe this sweep
+  symbolsWithSetups: number   // symbols that produced ≥1 raw setup
+  rawSetups: number           // total setups detected across the universe
+  belowFloor: number          // dropped by the score/level display floor
+  tracked: number             // setups that cleared the floor (entered the state machine)
+  byState: Partial<Record<SetupState, number>>  // geometry state among tracked
+  triggered: number           // long setups with triggeredRaw among tracked
+  droppedSession: number      // …dropped as untradeable (after-hours / overnight)
+  droppedVolume: number       // …dropped below the min buy-signal volume floor
+  droppedVeto: number         // triggered longs dropped by the quality veto (flagged)
+  droppedStandDown: number    // …by the failed-bounce stand-down
+  droppedCapped: number       // …by the per-symbol cap
+  droppedDup: number          // …by the entry-cluster dedup
+  logged: number              // buys actually logged this sweep
 }
 
 export const SETUP_TYPE_LABELS: Record<SetupType, string> = {
   pullback: 'Pullback',
+  momentum_pullback: 'Momentum Pullback',
   breakout: 'Breakout',
+  premarket_breakout: 'Premarket Breakout',
+  opening_range_break: 'Opening-Range Break',
+  opening_drive: 'Opening Drive',
+  hod_break: 'HOD Break',
+  bull_flag: 'Bull Flag',
+  break_of_structure: 'Break of Structure',
   ema9_bounce: '9 EMA Bounce',
   ema21_bounce: '21 EMA Bounce',
   vwap_bounce: 'VWAP Bounce',
