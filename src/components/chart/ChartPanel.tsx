@@ -2,9 +2,10 @@
 
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useTradingStore } from '@/store/trading-store'
-import { isTodayPremarket, isTodayAfterHours, isRegularHours } from '@/lib/market-hours'
+import { useBrokerPositions } from '@/hooks/useBrokerPositions'
+import { isTodayPremarket, isTodayAfterHours, isRegularHours, dataAge } from '@/lib/market-hours'
 import { emaAll } from '@/lib/technical'
-import type { Position } from '@/types'
+import { selectChartPosition, structuralOverlayKey, type ChartPositionOverlay } from './position-overlay'
 
 type ChartInterval = '1min' | '5min' | '15min' | 'daily'
 
@@ -20,6 +21,74 @@ interface Candle {
 // Determine if a candle timestamp (unix ms) is an extended-hours candle
 function isExtendedCandle(tsMs: number): boolean {
   return isTodayPremarket(tsMs) || isTodayAfterHours(tsMs)
+}
+
+// ── Live position badge ──────────────────────────────────────────────────────
+// Compact, always-current read of the on-chart position. Rendered as an ordinary
+// React element (not a chart primitive), so its P&L refreshes every broker poll
+// WITHOUT touching the lightweight-charts instance (Phase 11).
+
+const RECON_BADGE: Record<string, { label: string; cls: string }> = {
+  verified:      { label: 'VERIFIED',      cls: 'text-bull' },
+  pending:       { label: 'PENDING',       cls: 'text-ink-mute' },
+  discrepancy:   { label: 'DISCREPANCY',   cls: 'text-warn' },
+  manual_review: { label: 'MANUAL REVIEW', cls: 'text-warn' },
+}
+
+function overlayHeader(o: ChartPositionOverlay): { icon: string; label: string; cls: string } {
+  if (o.kind === 'manual') return { icon: '◆', label: 'TRACKER POSITION', cls: 'text-ink-soft' }
+  switch (o.source) {
+    case 'companion':    return { icon: '⚡', label: 'LIVE POSITION',   cls: 'text-accent-hi' }
+    case 'external':     return { icon: '○', label: 'EXTERNAL',        cls: 'text-ink-mute' }
+    default:             return { icon: '⚠', label: 'UNATTRIBUTED',    cls: 'text-warn' }
+  }
+}
+
+function LivePositionBadge({
+  overlay, stale, error, lastSuccessAt,
+}: {
+  overlay: ChartPositionOverlay
+  stale: boolean
+  error: string | null
+  lastSuccessAt: number | null
+}) {
+  const o = overlay
+  const head = overlayHeader(o)
+  const pnl = o.unrealizedPnl
+  const pnlPct = o.unrealizedPnlPct
+  const pnlCls = pnl == null ? 'text-ink-mute' : pnl >= 0 ? 'text-bull' : 'text-bear'
+  const recon = o.kind === 'broker' && o.reconciliationStatus ? RECON_BADGE[o.reconciliationStatus] : null
+  const isBroker = o.kind === 'broker'
+  const syncAge = lastSuccessAt != null ? dataAge(lastSuccessAt) : null
+
+  return (
+    <div className="absolute top-2 left-2 z-10 pointer-events-none select-none rounded-lg bg-app/85 backdrop-blur-sm ring-1 ring-inset ring-line-strong px-2.5 py-1.5 shadow-lg shadow-black/40 min-w-[132px]">
+      <div className="flex items-center gap-1.5">
+        <span className={`text-[11px] font-bold tracking-wide ${head.cls}`}>{head.icon} {head.label}</span>
+        {recon && <span className={`text-[9px] font-semibold ${recon.cls}`}>{recon.label}</span>}
+      </div>
+      <div className={`text-sm tnum font-semibold ${pnlCls} leading-tight mt-0.5`}>
+        {pnl == null ? '—' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}
+        {pnlPct != null && (
+          <span className={`text-[11px] ml-1.5 ${pnlCls}`}>{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</span>
+        )}
+      </div>
+      <div className="text-[10px] text-ink-mute tnum mt-0.5">
+        {o.qty.toLocaleString()} sh
+        {o.entryIsActualFill && <span className="text-ink-faint"> @ ${o.entry.toFixed(2)} avg</span>}
+      </div>
+      {isBroker && error && (
+        <div className="text-[10px] text-bear font-semibold mt-1">
+          ALPACA UNAVAILABLE{syncAge ? ` • last ${syncAge}` : ''}
+        </div>
+      )}
+      {isBroker && !error && stale && (
+        <div className="text-[10px] text-warn font-semibold mt-1">
+          ALPACA STALE{syncAge ? ` • ${syncAge}` : ''}
+        </div>
+      )}
+    </div>
+  )
 }
 
 export function ChartPanel() {
@@ -59,13 +128,26 @@ export function ChartPanel() {
     [symbolSetups]
   )
 
-  // Active (non-closed) position for the currently selected symbol
-  const activePosition: Position | null =
-    selectedSymbol
-      ? (positions.find(
-          p => p.symbol === selectedSymbol && p.status !== 'closed' && p.status !== 'stopped'
-        ) ?? null)
-      : null
+  // ── Broker (Alpaca) position feed ───────────────────────────────────────────
+  // Broker-authoritative exposure for the selected symbol, polled on the shared
+  // cadence. Overlay priority (Phase 2): broker position → manual/local → none.
+  const broker = useBrokerPositions()
+  const [showPosition, setShowPosition] = useState(true)
+
+  const overlay: ChartPositionOverlay | null = useMemo(
+    () => selectChartPosition({
+      symbol: selectedSymbol,
+      brokerPositions: broker.positions,
+      manualPositions: positions,
+    }),
+    [selectedSymbol, broker.positions, positions],
+  )
+
+  // STRUCTURAL signature only — excludes price/P&L, so the chart is NOT rebuilt on
+  // every 2.5s broker poll (Phase 11). Geometry changes (entry/qty/stop/targets)
+  // change this key and trigger exactly one rebuild.
+  const overlayStructuralKey = useMemo(() => structuralOverlayKey(overlay), [overlay])
+  const hasOverlay = showPosition && overlay != null
 
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const [candles, setCandles] = useState<Candle[]>([])
@@ -150,17 +232,17 @@ export function ChartPanel() {
 
       const chart = createChart(chartContainerRef.current, {
         layout: {
-          background: { color: '#0e1117' },
-          textColor: '#9ca3af',
+          background: { color: '#0e131a' },
+          textColor: '#8b96a5',
         },
         grid: {
-          vertLines: { color: '#1f2937' },
-          horzLines: { color: '#1f2937' },
+          vertLines: { color: 'rgba(33,42,54,0.55)' },
+          horzLines: { color: 'rgba(33,42,54,0.55)' },
         },
         crosshair: { mode: CrosshairMode.Normal },
-        rightPriceScale: { borderColor: '#374151' },
+        rightPriceScale: { borderColor: '#212a36' },
         timeScale: {
-          borderColor: '#374151',
+          borderColor: '#212a36',
           timeVisible: true,
           secondsVisible: false,
         },
@@ -186,10 +268,10 @@ export function ChartPanel() {
         const extended = isExtendedCandle(tsMs)
         const isGreen = c.close >= c.open
         // Extended hours: muted teal/slate colors
-        const upColor = extended ? '#2d6a6a' : '#22c55e'
-        const downColor = extended ? '#6a3535' : '#ef4444'
-        const borderUpColor = extended ? '#3a8585' : '#22c55e'
-        const borderDownColor = extended ? '#854444' : '#ef4444'
+        const upColor = extended ? '#2d6a6a' : '#2ebd85'
+        const downColor = extended ? '#6a3535' : '#f6465d'
+        const borderUpColor = extended ? '#3a8585' : '#2ebd85'
+        const borderDownColor = extended ? '#854444' : '#f6465d'
         return {
           time: Math.floor(tsMs / 1000) as LCTime,
           open: c.open,
@@ -205,12 +287,12 @@ export function ChartPanel() {
 
       // ── Candlestick series ───────────────────────────────────────────────
       const candleSeries = chart.addSeries(CandlestickSeries, {
-        upColor: '#22c55e',
-        downColor: '#ef4444',
-        borderUpColor: '#22c55e',
-        borderDownColor: '#ef4444',
-        wickUpColor: '#22c55e',
-        wickDownColor: '#ef4444',
+        upColor: '#2ebd85',
+        downColor: '#f6465d',
+        borderUpColor: '#2ebd85',
+        borderDownColor: '#f6465d',
+        wickUpColor: '#2ebd85',
+        wickDownColor: '#f6465d',
       })
       candleSeries.setData(chartData)
 
@@ -227,71 +309,69 @@ export function ChartPanel() {
         })
       }
 
-      // ── Position trade lines ─────────────────────────────────────────────
-      if (activePosition) {
-        const pos = activePosition
-        const isLong = pos.direction === 'long'
+      // ── Position overlay (broker-authoritative, else manual) ─────────────
+      // ONE overlay per symbol — broker truth wins over the manual tracker, so no
+      // duplicate entry/stop/target lines are drawn (Phase 2). EXTERNAL and
+      // UNATTRIBUTED positions expose exposure only: no invented stop/targets.
+      if (showPosition && overlay) {
+        const o = overlay
+        const isLong = o.direction === 'long'
 
-        // Entry line
+        // Entry / actual average fill. A real broker fill reads cyan + "AVG FILL"
+        // so it is visibly distinct from an intended/manual entry (blue).
+        const isExternal = o.source === 'external' || o.source === 'unattributed'
+        const entryColor = o.entryIsActualFill ? (isExternal ? '#7dd3fc' : '#22d3ee') : '#60a5fa'
+        const entryTitle = o.entryIsActualFill
+          ? `AVG FILL $${o.entry.toFixed(2)} · ${o.qty.toLocaleString()} SH`
+          : `Entry (${isLong ? 'L' : 'S'}) ${o.qty.toLocaleString()}sh`
         candleSeries.createPriceLine({
-          price: pos.entry,
-          color: '#60a5fa',
+          price: o.entry,
+          color: entryColor,
           lineWidth: 2,
           lineStyle: LineStyle.Solid,
           axisLabelVisible: true,
-          title: `Entry (${isLong ? 'L' : 'S'}) ${pos.shares}sh`,
+          title: entryTitle,
         })
 
-        // Stop loss line
-        candleSeries.createPriceLine({
-          price: pos.stop,
-          color: '#f87171',
-          lineWidth: 2,
-          lineStyle: LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: pos.stop === pos.entry ? 'Stop (BE)' : pos.stop === pos.initialStop ? 'Stop' : 'Stop ⟳',
-        })
-
-        // Initial stop (ghost) — only if stop has moved from original
-        if (pos.stop !== pos.initialStop) {
+        // Stop — drawn only for Companion/manual overlays (o.stop null otherwise).
+        // Solid = a resting broker protective stop is recorded; dashed = intended
+        // strategy stop only (e.g. premarket, where Alpaca accepts no stop order).
+        if (o.stop != null) {
+          const stopTitle = o.stopIsBreakeven ? `STOP · BE $${o.stop.toFixed(2)}` : `STOP $${o.stop.toFixed(2)}`
           candleSeries.createPriceLine({
-            price: pos.initialStop,
-            color: '#f8717140',
-            lineWidth: 1,
-            lineStyle: LineStyle.Dotted,
-            axisLabelVisible: false,
-            title: '',
+            price: o.stop,
+            color: '#f87171',
+            lineWidth: 2,
+            lineStyle: o.hasProtectiveStop ? LineStyle.Solid : LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: stopTitle,
           })
+          // Initial stop ghost — only once the stop has moved from its origin.
+          if (o.initialStop != null && o.initialStop !== o.stop) {
+            candleSeries.createPriceLine({
+              price: o.initialStop,
+              color: '#f8717140',
+              lineWidth: 1,
+              lineStyle: LineStyle.Dotted,
+              axisLabelVisible: false,
+              title: '',
+            })
+          }
         }
 
-        // Profit targets
+        // Targets — completed ones go quieter (dotted + ✓) rather than vanishing.
         const targetColors = ['#4ade80', '#34d399', '#10b981']
-        for (let i = 0; i < pos.targets.length; i++) {
-          const t = pos.targets[i]
+        o.targets.forEach((t, i) => {
+          const c = targetColors[i] ?? '#34d399'
           candleSeries.createPriceLine({
             price: t.price,
-            color: t.hit ? targetColors[i] + '80' : targetColors[i],
+            color: t.hit ? c + '80' : c,
             lineWidth: t.hit ? 1 : 2,
             lineStyle: t.hit ? LineStyle.Dotted : LineStyle.Dashed,
             axisLabelVisible: true,
             title: t.hit ? `${t.label} ✓` : t.label,
           })
-        }
-
-        // Risk/reward shading via very faint area series isn't supported,
-        // but we show a midpoint label so the zone is clear
-        if (pos.targets.length > 0) {
-          const rr = Math.abs(pos.targets[0].price - pos.entry) / Math.abs(pos.entry - pos.stop)
-          const entryLine = pos.entry
-          candleSeries.createPriceLine({
-            price: entryLine,
-            color: '#00000000', // transparent — used only for the axis label
-            lineWidth: 1,
-            lineStyle: LineStyle.Solid,
-            axisLabelVisible: false,
-            title: `R/R ${rr.toFixed(1)}:1`,
-          })
-        }
+        })
       }
 
       // ── Volume bars ──────────────────────────────────────────────────────
@@ -310,7 +390,7 @@ export function ChartPanel() {
             value: c.volume,
             color: extended
               ? (c.close >= c.open ? '#2d6a6a50' : '#6a353550')
-              : (c.close >= c.open ? '#22c55e30' : '#ef444430'),
+              : (c.close >= c.open ? '#2ebd8530' : '#f6465d30'),
           }
         })
       )
@@ -447,21 +527,26 @@ export function ChartPanel() {
       }
 
       // ── Monitored setup overlays ──────────────────────────────────────────
+      // When a live position is on the chart the theoretical setup is muted so the
+      // ACTUAL position dominates (Phase 9) — context kept, prominence lowered.
+      const setupMuted = showPosition && overlay != null
       for (const su of symbolSetups) {
         const dir = su.direction === 'long'
         if (showSetupZones) {
           // Zone bounds as a shaded pair of lines + a labelled midline
           candleSeries.createPriceLine({
-            price: su.zoneUpper, color: dir ? '#22c55e60' : '#ef444460',
+            price: su.zoneUpper, color: dir ? '#2ebd8560' : '#f6465d60',
             lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '',
           })
           candleSeries.createPriceLine({
-            price: su.zoneLower, color: dir ? '#22c55e60' : '#ef444460',
+            price: su.zoneLower, color: dir ? '#2ebd8560' : '#f6465d60',
             lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '',
           })
           candleSeries.createPriceLine({
-            price: su.zoneMidpoint, color: dir ? '#22c55e' : '#ef4444',
-            lineWidth: 2, lineStyle: LineStyle.Solid, axisLabelVisible: true,
+            price: su.zoneMidpoint,
+            color: setupMuted ? (dir ? '#2ebd8570' : '#f6465d70') : (dir ? '#2ebd85' : '#f6465d'),
+            lineWidth: setupMuted ? 1 : 2, lineStyle: setupMuted ? LineStyle.Dotted : LineStyle.Solid,
+            axisLabelVisible: true,
             title: `${su.grade === 'below' ? '' : su.grade + ' '}${su.type.replace(/_/g, ' ')} ${su.score}`,
           })
         }
@@ -518,48 +603,51 @@ export function ChartPanel() {
     // overlayKey is a stable signature of symbolSetups — avoids rebuilding the
     // chart on every monitor sweep when the selected symbol's overlays are unchanged.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, showVwap, showEma9, showEma20, showLevels, showSetupZones, showTargets, showInvalidation, overlayKey, snapshot?.sessionLevels, snapshot?.technical, activePosition?.entry, activePosition?.stop, activePosition?.status, activePosition?.targets])
+    // overlayStructuralKey is a signature of ONLY structural position geometry —
+    // it excludes price/P&L, so the 2.5s broker poll never rebuilds the chart; the
+    // live badge below consumes P&L directly and updates on its own (Phase 11).
+  }, [candles, showVwap, showEma9, showEma20, showLevels, showSetupZones, showTargets, showInvalidation, overlayKey, snapshot?.sessionLevels, snapshot?.technical, overlayStructuralKey, showPosition])
 
   useEffect(() => () => cleanupRef.current(), [])
 
   return (
-    <div className="flex flex-col h-full bg-[#0e1117]">
+    <div className="flex flex-col h-full bg-panel">
 
       {/* ── Toolbar ── */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-800 flex-shrink-0 min-h-[40px]">
+      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-line flex-shrink-0 min-h-[44px]">
         {selectedSymbol ? (
           <>
-            <span className="text-sm font-bold text-white">{selectedSymbol}</span>
+            <span className="text-sm font-bold text-ink tracking-wide">{selectedSymbol}</span>
             {snapshot?.quote && (
               <>
-                <span className="text-sm font-mono text-gray-200">
+                <span className="text-sm tnum text-ink">
                   ${snapshot.quote.price.toFixed(2)}
                 </span>
-                <span className={`text-xs font-medium ${snapshot.quote.changesPercentage >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                <span className={`text-xs font-semibold tnum ${snapshot.quote.changesPercentage >= 0 ? 'text-bull' : 'text-bear'}`}>
                   {snapshot.quote.changesPercentage >= 0 ? '+' : ''}{snapshot.quote.changesPercentage.toFixed(2)}%
                 </span>
                 {snapshot.setupScore && (
-                  <span className="text-xs text-gray-600 ml-1">
+                  <span className="text-[11px] text-ink-mute ml-0.5 tnum">
                     Score {snapshot.setupScore.total}/100
                   </span>
                 )}
-                {activePosition && (
-                  <span className="text-xs ml-1 px-1.5 py-0.5 rounded font-medium border border-blue-700 text-blue-300 bg-blue-900/30">
-                    {activePosition.direction === 'long' ? '▲' : '▼'} {activePosition.shares.toLocaleString()}sh
-                    {activePosition.unrealizedPnl != null && (
-                      <span className={activePosition.unrealizedPnl >= 0 ? ' text-green-400' : ' text-red-400'}>
-                        {' '}{activePosition.unrealizedPnl >= 0 ? '+' : ''}${activePosition.unrealizedPnl.toFixed(2)}
+                {overlay && (
+                  <span className="text-xs ml-0.5 px-1.5 py-0.5 rounded-md font-medium ring-1 ring-inset ring-accent/40 text-accent-hi bg-accent/10 tnum">
+                    {overlay.direction === 'long' ? '▲' : '▼'} {overlay.qty.toLocaleString()}sh
+                    {overlay.unrealizedPnl != null && (
+                      <span className={overlay.unrealizedPnl >= 0 ? ' text-bull' : ' text-bear'}>
+                        {' '}{overlay.unrealizedPnl >= 0 ? '+' : ''}${overlay.unrealizedPnl.toFixed(2)}
                       </span>
                     )}
                   </span>
                 )}
                 {snapshot.breakoutStatus && snapshot.breakoutStatus.state !== 'none' && (
-                  <span className={`text-xs ml-1 px-1.5 py-0.5 rounded font-medium ${
-                    snapshot.breakoutStatus.state === 'confirmed' ? 'text-green-400 bg-green-900/20' :
-                    snapshot.breakoutStatus.state === 'triggered' ? 'text-yellow-400 bg-yellow-900/20' :
-                    snapshot.breakoutStatus.state === 'failed' ? 'text-red-400 bg-red-900/20' :
-                    snapshot.breakoutStatus.state === 'extended' ? 'text-orange-400 bg-orange-900/20' :
-                    'text-blue-400 bg-blue-900/20'
+                  <span className={`text-[10px] ml-0.5 px-1.5 py-0.5 rounded font-semibold tracking-wide ${
+                    snapshot.breakoutStatus.state === 'confirmed' ? 'text-bull bg-bull/10 ring-1 ring-inset ring-bull/25' :
+                    snapshot.breakoutStatus.state === 'triggered' ? 'text-warn bg-warn/10 ring-1 ring-inset ring-warn/25' :
+                    snapshot.breakoutStatus.state === 'failed' ? 'text-bear bg-bear/10 ring-1 ring-inset ring-bear/25' :
+                    snapshot.breakoutStatus.state === 'extended' ? 'text-warn bg-warn/10 ring-1 ring-inset ring-warn/25' :
+                    'text-info bg-info/10 ring-1 ring-inset ring-info/25'
                   }`}>
                     {snapshot.breakoutStatus.state.toUpperCase()}
                   </span>
@@ -568,57 +656,60 @@ export function ChartPanel() {
             )}
           </>
         ) : (
-          <span className="text-xs text-gray-600">No ticker selected</span>
+          <span className="text-xs text-ink-mute">No ticker selected</span>
         )}
 
         <div className="ml-auto flex items-center gap-1 flex-wrap">
-          {/* Interval buttons */}
-          {(['1min', '5min', '15min', 'daily'] as ChartInterval[]).map(iv => (
-            <button
-              key={iv}
-              onClick={() => setChartInterval(iv)}
-              className={`text-xs px-2 py-0.5 rounded ${
-                chartInterval === iv
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-800 text-gray-400 hover:text-gray-200'
-              }`}
-            >
-              {iv}
-            </button>
-          ))}
-          <div className="w-px h-4 bg-gray-700 mx-1" />
+          {/* Interval buttons — segmented control */}
+          <div className="flex items-center gap-0.5 p-0.5 rounded-md bg-app/60 ring-1 ring-inset ring-line">
+            {(['1min', '5min', '15min', 'daily'] as ChartInterval[]).map(iv => (
+              <button
+                key={iv}
+                onClick={() => setChartInterval(iv)}
+                className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
+                  chartInterval === iv
+                    ? 'bg-accent text-white font-semibold'
+                    : 'text-ink-mute hover:text-ink'
+                }`}
+              >
+                {iv}
+              </button>
+            ))}
+          </div>
+          <div className="w-px h-4 bg-line-strong mx-1" />
           {/* Indicator toggles */}
           {[
-            { key: 'vwap', label: 'VWAP', active: showVwap, toggle: toggleVwap, color: 'text-purple-400' },
-            { key: 'ema9', label: 'E9', active: showEma9, toggle: toggleEma9, color: 'text-yellow-400' },
-            { key: 'ema20', label: 'E20', active: showEma20, toggle: toggleEma20, color: 'text-blue-400' },
-            { key: 'lvl', label: 'Levels', active: showLevels, toggle: toggleLevels, color: 'text-gray-400' },
-            { key: 'zones', label: 'Setups', active: showSetupZones, toggle: toggleSetupZones, color: 'text-emerald-400' },
-            { key: 'tgt', label: 'Targets', active: showTargets, toggle: toggleTargets, color: 'text-green-400' },
-            { key: 'inv', label: 'Inval', active: showInvalidation, toggle: toggleInvalidation, color: 'text-red-400' },
+            { key: 'vwap', label: 'VWAP', active: showVwap, toggle: toggleVwap, color: 'text-struct' },
+            { key: 'ema9', label: 'E9', active: showEma9, toggle: toggleEma9, color: 'text-warn' },
+            { key: 'ema20', label: 'E20', active: showEma20, toggle: toggleEma20, color: 'text-info' },
+            { key: 'lvl', label: 'Levels', active: showLevels, toggle: toggleLevels, color: 'text-ink-soft' },
+            { key: 'zones', label: 'Setups', active: showSetupZones, toggle: toggleSetupZones, color: 'text-bull' },
+            { key: 'tgt', label: 'Targets', active: showTargets, toggle: toggleTargets, color: 'text-bull' },
+            { key: 'inv', label: 'Inval', active: showInvalidation, toggle: toggleInvalidation, color: 'text-bear' },
+            { key: 'pos', label: 'Position', active: showPosition, toggle: () => setShowPosition(v => !v), color: 'text-accent-hi' },
           ].map(btn => (
             <button
               key={btn.key}
               onClick={btn.toggle}
-              className={`text-xs px-2 py-0.5 rounded border transition-colors ${
+              className={`text-[11px] px-2 py-1 rounded-md ring-1 ring-inset transition-colors ${
                 btn.active
-                  ? `border-current ${btn.color}`
-                  : 'border-gray-700 text-gray-600 hover:text-gray-400'
+                  ? `ring-current bg-white/5 ${btn.color}`
+                  : 'ring-line text-ink-mute hover:text-ink-soft hover:ring-line-strong'
               }`}
             >
               {btn.label}
             </button>
           ))}
           {snapshot?.technical?.ma50Daily && (
-            <span className="text-xs text-orange-400/60 ml-1">MA50</span>
+            <span className="text-[11px] text-warn/60 ml-1">MA50</span>
           )}
           {snapshot?.technical?.ma200Daily && (
-            <span className="text-xs text-pink-400/60">MA200</span>
+            <span className="text-[11px] text-struct/60">MA200</span>
           )}
           {selectedSymbol && (
             <button
               onClick={() => fetchCandles(selectedSymbol, chartInterval)}
-              className="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-500 hover:text-gray-300 ml-1"
+              className="w-6 h-6 flex items-center justify-center rounded-md bg-raised text-ink-mute hover:text-ink hover:bg-hover ml-1 transition-colors"
               title="Refresh candles"
             >
               ↻
@@ -629,16 +720,16 @@ export function ChartPanel() {
 
       {/* ── Extended session legend ── */}
       {selectedSymbol && (
-        <div className="flex items-center gap-3 px-3 py-1 border-b border-gray-800/50 bg-gray-900/20 flex-shrink-0">
-          <div className="flex items-center gap-1">
-            <div className="w-3 h-3 rounded-sm bg-[#22c55e]" />
-            <span className="text-[10px] text-gray-500">Regular</span>
+        <div className="flex items-center gap-3 px-3 py-1 border-b border-line/50 bg-app/30 flex-shrink-0">
+          <div className="flex items-center gap-1.5">
+            <div className="w-2.5 h-2.5 rounded-sm bg-[#2ebd85]" />
+            <span className="text-[10px] text-ink-mute">Regular</span>
           </div>
-          <div className="flex items-center gap-1">
-            <div className="w-3 h-3 rounded-sm bg-[#2d6a6a]" />
-            <span className="text-[10px] text-gray-500">Extended</span>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2.5 h-2.5 rounded-sm bg-[#2d6a6a]" />
+            <span className="text-[10px] text-ink-mute">Extended</span>
           </div>
-          <span className="text-[10px] text-gray-700">· Times in ET</span>
+          <span className="text-[10px] text-ink-faint">· Times in ET</span>
         </div>
       )}
 
@@ -647,21 +738,21 @@ export function ChartPanel() {
 
         {/* Placeholder when no ticker selected */}
         {!selectedSymbol && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 pointer-events-none">
-            <svg className="w-10 h-10 text-gray-800" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 pointer-events-none">
+            <svg className="w-10 h-10 text-line-strong" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M7 12l3-3 3 3 4-4M4 20h16M4 4h16" />
             </svg>
-            <p className="text-xs text-gray-700">Select a ticker from the scanner to load its chart</p>
+            <p className="text-xs text-ink-mute">Select a ticker from the scanner to load its chart</p>
           </div>
         )}
 
         {/* Loading overlay */}
         {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-[#0e1117]/70 z-10 pointer-events-none">
+          <div className="absolute inset-0 flex items-center justify-center bg-panel/70 z-10 pointer-events-none">
             <div className="flex items-center gap-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '0ms' }} />
-              <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '150ms' }} />
-              <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '300ms' }} />
+              <div className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '0ms' }} />
+              <div className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '150ms' }} />
+              <div className="w-1.5 h-1.5 rounded-full bg-accent animate-bounce" style={{ animationDelay: '300ms' }} />
             </div>
           </div>
         )}
@@ -669,10 +760,20 @@ export function ChartPanel() {
         {/* Error state */}
         {error && !loading && (
           <div className="absolute inset-x-0 top-2 flex justify-center z-10 pointer-events-none">
-            <div className="px-3 py-1.5 bg-red-900/30 border border-red-800/40 rounded text-xs text-red-400 max-w-sm text-center">
+            <div className="px-3 py-1.5 bg-bear/15 ring-1 ring-inset ring-bear/30 rounded-md text-xs text-bear max-w-sm text-center">
               {error}
             </div>
           </div>
+        )}
+
+        {/* Live position badge — broker-authoritative, updates independently of the chart */}
+        {hasOverlay && overlay && candles.length > 0 && (
+          <LivePositionBadge
+            overlay={overlay}
+            stale={broker.stale}
+            error={broker.error}
+            lastSuccessAt={broker.lastSuccessAt}
+          />
         )}
 
         {/* The chart div — always in the DOM so ResizeObserver has a stable target */}

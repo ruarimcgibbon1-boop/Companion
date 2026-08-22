@@ -3,7 +3,9 @@
 import { useState } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { usePositionTracker } from '@/hooks/usePositionTracker'
+import { useBrokerPositions } from '@/hooks/useBrokerPositions'
 import { dataAge } from '@/lib/market-hours'
+import type { BrokerPositionView, ReconciliationStatus } from '@/lib/execution/positions-view'
 import type { Position, PositionDirection, TrailingStopMode, PositionTarget } from '@/types'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -23,10 +25,10 @@ function fmtPnlPct(v: number | null | undefined): string {
 }
 
 function pnlColor(v: number | null | undefined): string {
-  if (v == null) return 'text-gray-400'
-  if (v > 0) return 'text-green-400'
-  if (v < 0) return 'text-red-400'
-  return 'text-gray-400'
+  if (v == null) return 'text-ink-mute'
+  if (v > 0) return 'text-bull'
+  if (v < 0) return 'text-bear'
+  return 'text-ink-mute'
 }
 
 const STATUS_LABELS: Record<Position['status'], string> = {
@@ -39,12 +41,12 @@ const STATUS_LABELS: Record<Position['status'], string> = {
 }
 
 const STATUS_COLORS: Record<Position['status'], string> = {
-  open: 'text-blue-400',
-  t1_hit: 'text-yellow-400',
-  t2_hit: 'text-orange-400',
-  t3_hit: 'text-green-400',
-  stopped: 'text-red-400',
-  closed: 'text-gray-500',
+  open: 'text-info',
+  t1_hit: 'text-warn',
+  t2_hit: 'text-warn',
+  t3_hit: 'text-bull',
+  stopped: 'text-bear',
+  closed: 'text-ink-mute',
 }
 
 // ── Add Position Form ──────────────────────────────────────────────────────
@@ -278,12 +280,12 @@ function PositionCard({ pos }: { pos: Position }) {
 
   return (
     <div
-      className={`border rounded-lg overflow-hidden transition-all ${
+      className={`rounded-lg overflow-hidden transition-all ring-1 ring-inset ${
         isClosed
-          ? 'border-gray-800 bg-gray-900/30 opacity-70'
+          ? 'ring-line bg-surface/40 opacity-70'
           : pos.status === 't1_hit' || pos.status === 't2_hit' || pos.status === 't3_hit'
-          ? 'border-yellow-800/50 bg-yellow-900/10'
-          : 'border-gray-700 bg-gray-900/60'
+          ? 'ring-warn/30 bg-warn/[0.06]'
+          : 'ring-line-strong bg-surface'
       }`}
     >
       {/* Main row */}
@@ -457,18 +459,171 @@ function PositionCard({ pos }: { pos: Position }) {
   )
 }
 
+// ── Broker (Alpaca) Position Row ───────────────────────────────────────────
+// READ-ONLY. Broker positions reflect Alpaca truth; they carry no local-mutation
+// controls (no close / move-stop / breakeven) — those would only alter Zustand,
+// never the broker. Trade controls will later be wired through the executor.
+
+const RECON_META: Record<ReconciliationStatus, { label: string; cls: string; title: string }> = {
+  verified:      { label: 'VERIFIED',      cls: 'text-bull ring-bull/30 bg-bull/10',   title: 'Broker position matches the Companion ledger' },
+  pending:       { label: 'PENDING',       cls: 'text-ink-mute ring-line-strong bg-raised', title: 'Not yet reconciled against the broker' },
+  discrepancy:   { label: 'DISCREPANCY',   cls: 'text-bear ring-bear/40 bg-bear/15',   title: 'Broker and local ledger disagreed — local was corrected to broker truth' },
+  manual_review: { label: 'MANUAL REVIEW', cls: 'text-warn ring-warn/40 bg-warn/15',   title: 'Closed on broker truth but P&L could not be reconstructed — needs a human' },
+}
+
+const SOURCE_BADGE: Record<BrokerPositionView['source'], { label: string; cls: string }> = {
+  companion:    { label: 'COMPANION',    cls: 'bg-accent/10 text-accent-hi ring-accent/25' },
+  external:     { label: 'EXTERNAL',     cls: 'bg-raised text-ink-mute ring-line-strong' },
+  unattributed: { label: 'UNATTRIBUTED', cls: 'bg-warn/10 text-warn ring-warn/30' },
+}
+
+function TargetChip({ label, price, hit }: { label: string; price: number | null; hit: boolean }) {
+  if (price == null) return null
+  return (
+    <span className={`tnum text-[11px] ${hit ? 'text-bull' : 'text-ink-soft'}`}>
+      {label} ${price.toFixed(2)}{hit ? ' ✓' : ''}
+    </span>
+  )
+}
+
+function BrokerPositionRow({ pos }: { pos: BrokerPositionView }) {
+  const { selectSymbol } = useTradingStore()
+  const [expanded, setExpanded] = useState(false)
+
+  const isCompanion = pos.source === 'companion'
+  const t1Hit = pos.targetState === 't1_hit' || pos.targetState === 't2_hit'
+  const t2Hit = pos.targetState === 't2_hit'
+  const recon = pos.reconciliationStatus ? RECON_META[pos.reconciliationStatus] : null
+  // A discrepancy/manual-review row gets an unmissable left edge without breaking layout.
+  const flagged = pos.reconciliationStatus === 'discrepancy' || pos.reconciliationStatus === 'manual_review'
+
+  return (
+    <div className={`rounded-lg overflow-hidden transition-all ring-1 ring-inset ${flagged ? 'ring-bear/40 bg-bear/[0.05]' : 'ring-line-strong bg-surface'}`}>
+      <div className="flex items-center gap-3 px-3 py-2 cursor-pointer" onClick={() => setExpanded(e => !e)}>
+        {/* Symbol + direction + source */}
+        <div className="flex-shrink-0 min-w-[132px]">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <button
+              onClick={e => { e.stopPropagation(); selectSymbol(pos.symbol) }}
+              className="text-sm font-bold text-ink hover:text-accent-hi transition-colors"
+            >
+              {pos.symbol}
+            </button>
+            <span className={`text-[10px] px-1 rounded font-semibold ${pos.direction === 'long' ? 'bg-bull/15 text-bull' : 'bg-bear/15 text-bear'}`}>
+              {pos.direction.toUpperCase()}
+            </span>
+            <span className={`text-[10px] px-1 rounded font-semibold ring-1 ring-inset ${SOURCE_BADGE[pos.source].cls}`}>
+              {SOURCE_BADGE[pos.source].label}
+            </span>
+          </div>
+          <div className="text-[10px] text-ink-mute tnum">{pos.qty.toLocaleString()} sh @ ${pos.avgEntryPrice.toFixed(2)}</div>
+        </div>
+
+        {/* Current price */}
+        <div className="flex-shrink-0">
+          <div className="text-sm tnum text-ink-soft">{pos.currentPrice != null ? `$${pos.currentPrice.toFixed(2)}` : '—'}</div>
+          <div className="text-[10px] text-ink-faint">current</div>
+        </div>
+
+        {/* Unrealised P&L */}
+        <div className="flex-shrink-0 min-w-[84px]">
+          <div className={`text-sm tnum font-semibold ${pnlColor(pos.unrealizedPnl)}`}>{fmtPnl(pos.unrealizedPnl)}</div>
+          <div className={`text-[10px] tnum ${pnlColor(pos.unrealizedPnlPct)}`}>{fmtPnlPct(pos.unrealizedPnlPct)}</div>
+        </div>
+
+        {/* Reconciliation status */}
+        {recon && (
+          <div className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ring-1 ring-inset flex-shrink-0 ${recon.cls}`} title={recon.title}>
+            {recon.label}
+          </div>
+        )}
+
+        <div className="ml-auto text-ink-mute text-xs">{expanded ? '▲' : '▼'}</div>
+      </div>
+
+      {/* Expanded detail — Companion-linked metadata (read-only) */}
+      {expanded && isCompanion && (
+        <div className="px-3 pb-3 border-t border-line/60">
+          <div className="grid grid-cols-2 gap-3 mt-2">
+            <div className="space-y-1">
+              {pos.setupType && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-ink-mute">Setup</span>
+                  <span className="text-ink-soft">{pos.setupType}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-xs">
+                <span className="text-ink-mute">Stop</span>
+                <span className="tnum text-bear">{pos.currentStop != null ? `$${pos.currentStop.toFixed(2)}` : '—'}</span>
+              </div>
+              {pos.initialStop != null && pos.currentStop != null && pos.initialStop !== pos.currentStop && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-ink-mute">Initial stop</span>
+                  <span className="tnum text-ink-faint">${pos.initialStop.toFixed(2)}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-xs">
+                <span className="text-ink-mute">Free to trade</span>
+                <span className="tnum text-ink-soft">{pos.qtyAvailable.toLocaleString()} sh</span>
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs text-ink-mute">Targets</div>
+              <div className="flex flex-col gap-0.5">
+                <TargetChip label="T1" price={pos.t1} hit={t1Hit} />
+                <TargetChip label="T2" price={pos.t2} hit={t2Hit} />
+                {pos.t1 == null && pos.t2 == null && <span className="text-xs text-ink-faint">No targets on ledger</span>}
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 text-[10px] text-ink-faint">
+            Broker-synced · read-only · updated {dataAge(pos.lastUpdatedAt)}
+            {pos.tradeId && <span className="ml-1 text-ink-faint/80">· {pos.tradeId}</span>}
+          </div>
+        </div>
+      )}
+      {expanded && !isCompanion && (
+        <div className="px-3 pb-3 border-t border-line/60 text-[10px] text-ink-faint mt-2">
+          {pos.source === 'unattributed'
+            ? 'Broker position could not be uniquely bound to an active Companion trade — not treated as strategy evidence. Read-only; no strategy metadata.'
+            : 'External Alpaca position — not created by Companion. Read-only; no strategy metadata.'}
+          <span className="ml-1">Free to trade {pos.qtyAvailable.toLocaleString()} sh.</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main Component ─────────────────────────────────────────────────────────
 
 export function PositionTracker() {
   usePositionTracker()
   const { positions, snapshot, selectedSymbol } = useTradingStore()
+  const broker = useBrokerPositions()
   const [open, setOpen] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
 
+  // Manual/local tracker positions (existing behaviour, retained).
   const openPositions = positions.filter(p => p.status !== 'closed' && p.status !== 'stopped')
   const closedPositions = positions.filter(p => p.status === 'closed' || p.status === 'stopped')
-  const totalPnl = openPositions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0)
-  const hasPositions = positions.length > 0
+  const manualPnl = openPositions.reduce((s, p) => s + (p.unrealizedPnl ?? 0), 0)
+
+  // Broker (Alpaca) positions — authoritative exposure.
+  const brokerPositions = broker.positions
+  const brokerPnl = broker.counts?.unrealizedPnl ?? 0
+  const brokerCount = brokerPositions.length
+
+  const hasAnything = brokerCount > 0 || positions.length > 0
+
+  // Collapsed blotter summary line.
+  const syncLabel = broker.lastSuccessAt != null ? dataAge(broker.lastSuccessAt) : null
+  const feedDotCls = broker.error
+    ? 'bg-bear'
+    : broker.stale
+      ? 'bg-warn'
+      : broker.loading && broker.lastSuccessAt == null
+        ? 'bg-ink-faint animate-pulse'
+        : 'bg-bull'
 
   return (
     <>
@@ -484,46 +639,95 @@ export function PositionTracker() {
       )}
 
       {/* Bottom bar */}
-      <div className="flex-shrink-0 border-t border-gray-800 bg-[#080b10]">
-        {/* Header row */}
+      <div className="flex-shrink-0 border-t border-line bg-bar">
+        {/* Header row — compact blotter summary */}
         <div
-          className="flex items-center gap-3 px-4 py-1.5 cursor-pointer select-none"
+          className="flex items-center gap-2.5 px-4 py-2 cursor-pointer select-none"
           onClick={() => setOpen(o => !o)}
         >
-          <span className="text-xs font-semibold text-gray-400">POSITIONS</span>
-          {openPositions.length > 0 && (
-            <span className="text-xs bg-blue-900/40 text-blue-400 px-1.5 py-0.5 rounded">{openPositions.length} open</span>
-          )}
-          {openPositions.length > 0 && (
-            <span className={`text-xs font-mono font-semibold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)} unrealised
+          <span className="eyebrow">Positions</span>
+          <span className={`w-1.5 h-1.5 rounded-full ${feedDotCls}`} />
+          <span className="text-[10px] tnum text-ink-soft font-semibold">
+            {brokerCount} OPEN
+          </span>
+          {brokerCount > 0 && (
+            <span className={`text-xs tnum font-semibold ${brokerPnl >= 0 ? 'text-bull' : 'text-bear'}`}>
+              {brokerPnl >= 0 ? '+' : ''}${brokerPnl.toFixed(2)}
             </span>
           )}
+          <span className="text-[10px] text-ink-mute">ALPACA</span>
+          {broker.error ? (
+            <span className="text-[10px] text-bear">
+              unavailable{syncLabel ? ` — last synced ${syncLabel}` : ''}
+            </span>
+          ) : (
+            <span className={`text-[10px] ${broker.stale ? 'text-warn' : 'text-ink-faint'}`}>
+              {syncLabel ? `synced ${syncLabel}` : broker.loading ? 'connecting…' : ''}
+            </span>
+          )}
+
           <button
             onClick={e => { e.stopPropagation(); setShowAdd(true) }}
-            className="ml-auto text-xs px-2.5 py-0.5 rounded bg-blue-800 hover:bg-blue-700 text-white font-medium transition-colors"
+            className="ring-focus ml-auto text-xs px-2.5 py-1 rounded-md bg-accent hover:bg-accent-hi text-white font-semibold transition-colors"
           >
             + Add
           </button>
-          <span className="text-gray-600 text-xs ml-1">{open ? '▼' : '▲'}</span>
+          <span className="text-ink-mute text-xs ml-1">{open ? '▼' : '▲'}</span>
         </div>
 
-        {/* Positions list */}
-        {open && hasPositions && (
-          <div className="px-3 pb-3 max-h-64 overflow-y-auto space-y-2">
+        {open && (
+          <div className="px-3 pb-3 max-h-72 overflow-y-auto space-y-2">
+            {/* ── Broker positions (Alpaca) ── */}
+            {brokerCount > 0 && (
+              <>
+                <div className="flex items-center gap-2">
+                  <div className="eyebrow pt-0.5">Alpaca — Broker</div>
+                  {broker.stale && !broker.error && (
+                    <span className="text-[10px] text-warn">stale</span>
+                  )}
+                </div>
+                {brokerPositions.map(p => <BrokerPositionRow key={`${p.symbol}-${p.tradeId ?? 'ext'}`} pos={p} />)}
+              </>
+            )}
+
+            {/* Broker feed empty/offline states — never conflate error with flat. */}
+            {brokerCount === 0 && (
+              broker.error ? (
+                <div className="text-xs text-bear/90">
+                  Alpaca positions unavailable{syncLabel ? ` — last synced ${syncLabel}` : ''}. Showing last known state.
+                </div>
+              ) : broker.loading && broker.lastSuccessAt == null ? (
+                <div className="text-xs text-ink-mute">Connecting to Alpaca…</div>
+              ) : broker.brokerFlat ? (
+                <div className="text-xs text-ink-mute">No open Alpaca positions.</div>
+              ) : null
+            )}
+
+            {/* ── Manual tracker (local) ── */}
+            {(openPositions.length > 0 || closedPositions.length > 0) && (
+              <div className="eyebrow pt-1.5">Manual Tracker — Local</div>
+            )}
+            {openPositions.length > 0 && (
+              <div className="flex items-center gap-2 pb-0.5">
+                <span className="text-[10px] text-ink-mute tnum">{openPositions.length} open</span>
+                <span className={`text-[10px] tnum ${manualPnl >= 0 ? 'text-bull' : 'text-bear'}`}>
+                  {manualPnl >= 0 ? '+' : ''}${manualPnl.toFixed(2)} unrealised
+                </span>
+              </div>
+            )}
             {openPositions.map(p => <PositionCard key={p.id} pos={p} />)}
             {closedPositions.length > 0 && (
               <>
-                <div className="text-[10px] text-gray-700 uppercase tracking-wider pt-1">Closed / Stopped</div>
+                <div className="eyebrow pt-1">Closed / Stopped</div>
                 {closedPositions.slice(0, 5).map(p => <PositionCard key={p.id} pos={p} />)}
               </>
             )}
-          </div>
-        )}
 
-        {open && !hasPositions && (
-          <div className="px-4 pb-3 text-xs text-gray-700">
-            No positions. Hit <span className="text-gray-500">+ Add</span> to track a trade.
+            {!hasAnything && !broker.loading && (
+              <div className="text-xs text-ink-mute">
+                No open positions. Companion daemon trades appear here automatically; hit <span className="text-ink-soft">+ Add</span> to track one by hand.
+              </div>
+            )}
           </div>
         )}
       </div>
