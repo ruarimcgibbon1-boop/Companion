@@ -25,50 +25,113 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join } from 'path'
 import { homedir } from 'os'
 
-import type { Candle, SetupLog, DetectedSetup, SetupType } from '@/types'
-import { calculateSessionLevels, calculateTechnical } from '@/lib/technical'
-import { buildKeyLevels } from '@/lib/levels-engine'
-import { detectSetups, type DetectionContext } from '@/lib/setup-detectors'
-import { premarketVolumeProfile } from '@/lib/premarket-volume'
-import { getSessionType, minutesSinceOpen } from '@/lib/market-hours'
+import type { Candle, SetupLog, SetupStateRecord, SetupType, BuySignalRecord } from '@/types'
+// ONE decision engine: this replay walks the SHARED production pipeline (replayDay
+// → real technicals/levels/detectors) and classifies each trigger through the
+// SHARED gate stack (classifyBuy + buy-log constants) — the same modules the live
+// client, the alert daemon, diagnose, and recall use. Nothing about the BUY/drop
+// decision is re-implemented here, so replay and live cannot drift.
+import { replayDay } from '@/lib/replay-day'
+import { classifyBuy, passesTrackingFloor, BOUNCE_TYPES } from '@/lib/buy-log'
+import { getSessionType } from '@/lib/market-hours'
 import { scaledPnl, resolveLogAgainstCandles, slippageForSession } from '@/lib/eod-resolver'
+import { researchWindowDays, weekdaysBetween, classifyDays } from '@/lib/research-window'
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const DAYS = [
-  '2026-07-06', '2026-07-07', '2026-07-08', '2026-07-09', '2026-07-10',
-  '2026-07-13', '2026-07-14', '2026-07-15', '2026-07-16', '2026-07-17',
-  '2026-07-20', '2026-07-21', '2026-07-22', '2026-07-23', '2026-07-24',
-  '2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30', '2026-07-31',
-]
+const REPO = process.cwd()
+const DOWNLOADS = join(homedir(), 'Downloads')
+
+// PRIORITY 4 — the development/research window is July 2026; August 2026 is the
+// held-out validation window (defined in src/lib/research-window.ts). It is NOT
+// listed here: reaching it requires an explicit, recorded opt-in (see below).
+const RESEARCH_WINDOW = researchWindowDays()
+
+// PRIORITY 2 — choose the replay days without editing source:
+//   BACKTEST_DAYS=2026-07-14                        one day
+//   BACKTEST_DAYS=2026-07-06,2026-07-14,2026-07-31  a few
+//   BACKTEST_DAYS=2026-07-06:2026-07-10             an inclusive range over the window
+//   (unset)                                          the full research window
+function selectedDays(): string[] {
+  const spec = process.env.BACKTEST_DAYS?.trim()
+  if (!spec) return RESEARCH_WINDOW
+  if (spec.includes(':')) {
+    const [a, b] = spec.split(':').map(s => s.trim())
+    // Range endpoints may sit outside the known window (e.g. an August validation
+    // range); expand over calendar weekdays so an explicit range still works.
+    return weekdaysBetween(a, b)
+  }
+  return spec.split(',').map(s => s.trim()).filter(Boolean)
+}
+const DAYS = selectedDays()
+
+// PRIORITY 4 — refuse to silently research on the held-out month. Selecting an
+// August date requires VALIDATE=1 + VALIDATION_NOTE; the use is then appended to
+// data/validation-ledger.json so August can never quietly become training data.
+guardHeldOut(DAYS)
+
 const TOP_GAINERS_UNIVERSE = 15          // matches useMonitor gatherUniverse
-const MIN_SCORE_FLOOR = 55               // useMonitor display floor
 const MIN_LEVEL_STRENGTH = 40            // store default notificationSettings.minLevelStrength
-// Buy-log gate constants (mirrored from useMonitor.ts)
-const MIN_BUY_VOLUME = 100_000
-const MIN_PREMARKET_BUY_VOLUME = 50_000
-const PREMARKET_SURGE_RVOL = 10  // a strong RVOL surge clears the absolute floor (thin-float rockets, e.g. YXT 46×)
-const GRADE_FLOOR_EXEMPT = new Set<SetupType>(['opening_drive'])  // PMB dropped 2026-08-05; momentum_pullback exemption tested + reverted (flooded losers)
-const LATE_LOG_CUTOFF_HHMM = 1400  // no new regular-hours BUYs at/after 14:00 ET
-// Per-symbol log-count cap: REMOVED from the live gate stack 2026-08-07, so the
-// replay defaults to uncapped too. Overridable purely so the removal can be A/B'd
-// against the old behaviour on the same tape: MAX_LOGS_PER_SYMBOL=2 npx tsx scripts/backtest.ts
-const MAX_LOGS_PER_SYMBOL = Number(process.env.MAX_LOGS_PER_SYMBOL ?? Infinity)
-const SYMBOL_LOG_WINDOW_MS = 12 * 60 * 60 * 1000
-const ENTRY_SIMILARITY_PCT = 0.03
-const BUY_DEDUP_COOLDOWN_MS = 45 * 60 * 1000
-const STANDDOWN_MS = 120 * 60 * 1000
-const SYMBOL_CAP_MS = 120 * 60 * 1000
-const SYMBOL_WIN_CAP = 2
-const BOUNCE_TYPES = new Set<SetupType>(['pullback', 'vwap_bounce', 'vwap_reclaim', 'ema9_bounce', 'ema21_bounce'])
+
+// PRIORITY 3 — the intraday timeframe is configurable. 1m and 5m run the SAME
+// production pipeline (technicals, levels, detectors, gates, resolver); they differ
+// ONLY in the tape they see and the simulated bar-close clock. TIMEFRAME=1m | 5m.
+const TIMEFRAME = process.env.TIMEFRAME === '1m' ? '1m' : '5m'
+const BAR_SECONDS = TIMEFRAME === '1m' ? 60 : 300
+const INTRADAY_ENDPOINT = TIMEFRAME === '1m' ? '1min' : '5min'
+const INTRADAY_PREFIX = TIMEFRAME === '1m' ? 'm1' : 'm5'   // cache-key prefix per timeframe
+
+// The buy-log GATE STACK is no longer mirrored here — this file imports classifyBuy
+// and its constants directly (see the import block). One consequence worth stating:
+// the per-symbol cap now defaults to the PRODUCTION value (buy-log's
+// MAX_LOGS_PER_SYMBOL = 2), not the old replay-only Infinity, so the replay finally
+// matches live. Override it exactly as live can: MAX_LOGS_PER_SYMBOL=3 npx tsx …
 
 const SCRATCH = process.env.SCRATCH_DIR ||
   '/private/tmp/claude-501/-Users-elonmusk-Companion/e73f584c-b4b9-412c-a4d7-ccaf1e47b222/scratchpad'
-const CACHE_DIR = join(SCRATCH, 'fmp-cache')
-if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true })
 
-const REPO = process.cwd()
-const DOWNLOADS = join(homedir(), 'Downloads')
+// PRIORITY 2 — two cache tiers:
+//   1. tests/fixtures/replay-tape/ — SMALL, committed, deterministic (checked in).
+//   2. the research cache          — LARGE, local only, NEVER committed (gitignored).
+// Reads consult fixtures FIRST, then the research cache; writes only ever go to the
+// research cache, so the committed fixture set stays a curated minimum.
+const FIXTURE_DIR = join(REPO, 'tests', 'fixtures', 'replay-tape')
+const RESEARCH_CACHE = process.env.FMP_CACHE_DIR || join(SCRATCH, 'fmp-cache')
+if (!existsSync(RESEARCH_CACHE)) mkdirSync(RESEARCH_CACHE, { recursive: true })
+// OFFLINE replays only tape already on disk (fixtures + research cache) — no
+// network, so re-runs are fast and deterministic and can't be rate-limited.
+const OFFLINE = process.env.OFFLINE === '1'
+
+const DAILY_TO = DAYS.reduce((m, d) => (d > m ? d : m), '2026-07-31')
+
+// PRIORITY 4 — gate on the held-out month. Selecting any August date is refused
+// unless VALIDATE=1 and a VALIDATION_NOTE are set; the use is then appended to the
+// validation ledger so a held-out judgement is on the record forever.
+function guardHeldOut(days: string[]): void {
+  const { heldout, research } = classifyDays(days)
+  if (heldout.length === 0) return
+  const note = process.env.VALIDATION_NOTE?.trim()
+  if (process.env.VALIDATE !== '1' || !note) {
+    throw new Error(
+      `Refusing to replay held-out days ${heldout.join(', ')}.\n` +
+      `August 2026 is the HELD-OUT validation window and must stay untouched until a\n` +
+      `candidate change is already chosen on July. To spend it deliberately:\n` +
+      `  VALIDATE=1 VALIDATION_NOTE="<candidate id + what you're judging>" BACKTEST_DAYS=… npx tsx scripts/backtest.ts`,
+    )
+  }
+  const ledgerPath = join(REPO, 'data', 'validation-ledger.json')
+  let ledger: { runs: unknown[] } = { runs: [] }
+  try { if (existsSync(ledgerPath)) ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) } catch { /* start fresh */ }
+  ledger.runs.push({
+    timestamp: new Date().toISOString(),
+    heldoutDays: heldout,
+    alsoResearchDays: research,
+    note,
+    runTag: process.env.RUN_TAG ?? null,
+  })
+  writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2) + '\n')
+  console.error(`⚠️  HELD-OUT VALIDATION recorded → ${ledgerPath} (${heldout.length} August day(s), note: "${note}")`)
+}
 
 // ── FMP fetch layer (disk-cached) ─────────────────────────────────────────────
 
@@ -78,19 +141,31 @@ function apiKey(): string {
   if (!m) throw new Error('FMP_API_KEY not found in .env.local')
   return m[1]
 }
-const KEY = apiKey()
+// In OFFLINE mode we never hit the network, so a missing key must not abort the run.
+const KEY = (() => { try { return apiKey() } catch (e) { if (OFFLINE) return ''; throw e } })()
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-async function cachedGet(cacheName: string, url: string): Promise<any> {
-  const f = join(CACHE_DIR, cacheName + '.json')
-  if (existsSync(f)) return JSON.parse(readFileSync(f, 'utf8'))
+// Two-tier read (fixtures first, then research cache); writes go to the research
+// cache only. In OFFLINE mode a miss is final — no fetch.
+function readCached(cacheName: string): unknown {
+  for (const dir of [FIXTURE_DIR, RESEARCH_CACHE]) {
+    const f = join(dir, cacheName + '.json')
+    if (existsSync(f)) return JSON.parse(readFileSync(f, 'utf8'))
+  }
+  return null
+}
+
+async function cachedGet(cacheName: string, url: string): Promise<unknown> {
+  const hit = readCached(cacheName)
+  if (hit != null) return hit
+  if (OFFLINE) throw new Error(`OFFLINE: ${cacheName} not in fixtures or research cache`)
   let lastErr = ''
   for (let attempt = 0; attempt < 6; attempt++) {
     const res = await fetch(url)
     if (res.ok) {
       const json = await res.json()
-      writeFileSync(f, JSON.stringify(json))
+      writeFileSync(join(RESEARCH_CACHE, cacheName + '.json'), JSON.stringify(json))
       return json
     }
     lastErr = `HTTP ${res.status}`
@@ -104,21 +179,22 @@ async function cachedGet(cacheName: string, url: string): Promise<any> {
 interface RawRow { date: string; open: number; high: number; low: number; close: number; volume: number }
 
 async function fetchDaily(symbol: string): Promise<RawRow[]> {
-  const url = `https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=${symbol}&from=2026-05-01&to=2026-07-31&apikey=${KEY}`
+  const url = `https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=${symbol}&from=2026-05-01&to=${DAILY_TO}&apikey=${KEY}`
   const j = await cachedGet(`daily_${symbol}`, url)
-  const arr: RawRow[] = Array.isArray(j) ? j : (j?.historical ?? [])
+  const arr: RawRow[] = Array.isArray(j) ? j : ((j as { historical?: RawRow[] } | null)?.historical ?? [])
   return arr.slice().sort((a, b) => a.date.localeCompare(b.date))
 }
 
-// Extended 5-min tape ending at the replay day. FMP's 5-min endpoint caps each
-// response to ~10 recent days from `to` REGARDLESS of `from`, so a wide window
-// silently returns only the last ~10 days — the `to` must be anchored at the day.
-// 14 calendar days back yields the walk window (day-2..day) + ~8-10 prior sessions
-// for the premarket-volume baseline. Cache key includes the day.
-async function fetch5minForDay(symbol: string, day: string): Promise<RawRow[]> {
+// Extended intraday tape ending at the replay day, at the configured TIMEFRAME.
+// FMP's intraday endpoints cap each response to ~10 recent days from `to`
+// REGARDLESS of `from`, so the `to` must be anchored at the day. 14 calendar days
+// back yields the walk window (day-2..day) + prior sessions for the premarket
+// baseline. The cache key includes both the timeframe prefix and the day, so 1m and
+// 5m tapes never collide.
+async function fetchIntradayForDay(symbol: string, day: string): Promise<RawRow[]> {
   const fromDay = etDayKey(etStrToUnixSec(day) - 14 * 86400)
-  const url = `https://financialmodelingprep.com/stable/historical-chart/5min?symbol=${symbol}&from=${fromDay}&to=${day}&extended=true&apikey=${KEY}`
-  const j = await cachedGet(`m5_${symbol}_${day}`, url)
+  const url = `https://financialmodelingprep.com/stable/historical-chart/${INTRADAY_ENDPOINT}?symbol=${symbol}&from=${fromDay}&to=${day}&extended=true&apikey=${KEY}`
+  const j = await cachedGet(`${INTRADAY_PREFIX}_${symbol}_${day}`, url)
   const arr: RawRow[] = Array.isArray(j) ? j : []
   return arr.slice().sort((a, b) => a.date.localeCompare(b.date))
 }
@@ -144,14 +220,6 @@ function etDayKey(unixSec: number): string {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(new Date(unixSec * 1000))
 }
-function etHHMM(unixMs: number): number {
-  const s = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
-  }).format(new Date(unixMs))
-  const [h, m] = s.split(':').map(Number)
-  return h * 100 + m
-}
-
 function toCandles(rows: RawRow[]): Candle[] {
   return rows.map(r => ({
     time: etStrToUnixSec(r.date),
@@ -177,7 +245,7 @@ function poolFromDownloads(): string[] {
 }
 function poolFromCache(): string[] {
   const set = new Set<string>()
-  for (const f of readdirSync(CACHE_DIR)) {
+  for (const f of readdirSync(RESEARCH_CACHE)) {
     const m = f.match(/^daily_([A-Z]{1,6})\.json$/)
     if (m) set.add(m[1])
   }
@@ -232,21 +300,6 @@ interface Buy {
 }
 interface MiniLog { id: string; symbol: string; type: SetupType; invalidation: number; t1: number | null; outcome: 'open' | 'invalidated' | 'target_hit'; resolvedAt: number | null; direction: 'long' }
 
-function isDuplicateBuy(sym: string, entryHigh: number, now: number, prior: Buy[]): boolean {
-  for (const b of prior) {
-    if (b.symbol !== sym) continue
-    if (now - b.timestamp > BUY_DEDUP_COOLDOWN_MS) continue
-    if (b.entryHigh > 0 && Math.abs(entryHigh - b.entryHigh) / b.entryHigh < ENTRY_SIMILARITY_PCT) return true
-  }
-  return false
-}
-function symbolCapReached(sym: string, now: number, logs: MiniLog[], buys: Buy[]): boolean {
-  const lostIds = new Set(logs.filter(l => l.outcome === 'invalidated' && l.resolvedAt != null && now - l.resolvedAt < SYMBOL_CAP_MS).map(l => l.id))
-  if (buys.some(b => b.symbol === sym && lostIds.has(b.setupId))) return true
-  const wins = logs.filter(l => l.symbol === sym && l.outcome === 'target_hit' && l.resolvedAt != null && now - l.resolvedAt < SYMBOL_CAP_MS).length
-  return wins >= SYMBOL_WIN_CAP
-}
-
 // ── Concurrency helper ─────────────────────────────────────────────────────────
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
@@ -266,100 +319,39 @@ function replaySymbolDay(
   dayBuys: Buy[], dayLogs: Map<string, MiniLog>, failedBounces: { symbol: string; type: SetupType; at: number }[],
   drops: DropCounts, funnel: { triggered: number },
 ): void {
-  const dailyUpTo = daily.filter(r => r.date.slice(0, 10) <= day)
-  if (dailyUpTo.length < 2) return
-  const dailyCandles = toCandles(dailyUpTo)
-  const dayIdx = dailyUpTo.findIndex(r => r.date.slice(0, 10) === day)
-  if (dayIdx <= 0) return
-  const prevClose = dailyUpTo[dayIdx - 1].close
-  // Baseline avg volume = 20 trading days before the replay day.
-  const priorDaily = dailyUpTo.slice(Math.max(0, dayIdx - 20), dayIdx)
-  const avgVolume = priorDaily.length ? priorDaily.reduce((s, r) => s + r.volume, 0) / priorDaily.length : 0
-
-  const allCandles = toCandles(wide5)
-  // Walk window: prior 2 days + the replay day (warm-up for EMAs/ATR), like getIntradayCandles.
-  const windowStartDay = etDayKey(etStrToUnixSec(day) - 2 * 86400)
-  const walkCandles = allCandles.filter(c => etDayKey(c.time) >= windowStartDay && etDayKey(c.time) <= day)
-  const dayBars = walkCandles.filter(c => etDayKey(c.time) === day)
-  if (dayBars.length === 0) return
-
   const seenLog = new Set<string>()  // ensure one log per setup.id (like ensureLog)
 
-  for (let bi = 0; bi < walkCandles.length; bi++) {
-    const bar = walkCandles[bi]
-    if (etDayKey(bar.time) !== day) continue
-    const nowTs = (bar.time + 300) * 1000   // "now" = the just-closed 5-min bar's close
-    const session = getSessionType(nowTs)
-    if (session !== 'premarket' && session !== 'regular') continue
+  // The pipeline (technicals → levels → detectors → MonitorResult) is the SHARED
+  // production code, driven by a simulated clock. We only add the gate classification
+  // and the per-bar log latching around it.
+  for (const rb of replayDay(symbol, day, wide5, daily, float, BAR_SECONDS)) {
+    // Feed the win/loss cap and the failed-bounce stand-down the same evidence the
+    // live client does: latched setup logs + failed-bounce state records. (The
+    // daemon and recall stub these out with []; live and this replay do not.)
+    const priorLogs = [...dayLogs.values()] as unknown as SetupLog[]
+    const priorStates = failedBounces.map(fb => ({
+      symbol: fb.symbol, type: fb.type, state: 'failed', updatedAt: fb.at,
+    })) as unknown as SetupStateRecord[]
 
-    const candlesSoFar = walkCandles.slice(0, bi + 1)
-    const price = bar.close
-    if (!(price > 0)) continue
-    const todayVol = candlesSoFar.filter(c => etDayKey(c.time) === day).reduce((s, c) => s + c.volume, 0)
-
-    const sessionLevels = calculateSessionLevels(candlesSoFar, dailyCandles, undefined, undefined, nowTs)
-    const technical = calculateTechnical(candlesSoFar, dailyCandles, todayVol, avgVolume, sessionLevels, undefined, nowTs)
-
-    let premarketVolForGate: number | null = null
-    if (session === 'premarket') {
-      const profile = premarketVolumeProfile(wide5, { todayEt: day, throughHHMM: etHHMM(nowTs) })
-      if (profile.relativeVolume != null) technical.relativeVolume = profile.relativeVolume
-      premarketVolForGate = profile.measured ? profile.todayVolume : null
-    }
-
-    const changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0
-    const levels = buildKeyLevels({ intraday: candlesSoFar, daily: dailyCandles, sessionLevels, technical, currentPrice: price, nowTs })
-
-    const detCtx: DetectionContext = {
-      symbol, price, candles: candlesSoFar, sessionLevels, technical, levels,
-      catalystScore: 0, hasCatalyst: false, spreadPct: null, changePct, session,
-      minutesSinceOpen: minutesSinceOpen(nowTs), float,
-    }
-    const setups = detectSetups(detCtx)
-
-    for (const setup of setups) {
-      const meetsLevel = (setup.breakdown.levelQuality / 20) * 100 >= MIN_LEVEL_STRENGTH * 0.2 || setup.confidence >= MIN_LEVEL_STRENGTH
-      if (setup.score < MIN_SCORE_FLOOR && !meetsLevel) continue
+    for (const setup of rb.setups) {
       if (!(setup.direction === 'long' && setup.triggeredRaw)) continue
+      if (!passesTrackingFloor(setup, MIN_LEVEL_STRENGTH)) continue
       funnel.triggered++
 
-      const fill = setup.entryFill ?? setup.zoneUpper
-      const dup = isDuplicateBuy(symbol, fill, nowTs, dayBuys)
-      const volumeOk = session === 'premarket'
-        ? premarketVolForGate == null || premarketVolForGate >= MIN_PREMARKET_BUY_VOLUME || (technical.relativeVolume != null && technical.relativeVolume >= PREMARKET_SURGE_RVOL)
-        : todayVol === 0 || todayVol >= MIN_BUY_VOLUME
-      // (The strong-continuation override lived here 2026-08-06→07; reverted after
-      // a clean A/B showed it cut expectancy +0.76% → +0.41%/trade.)
-      const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
-      const standDown = BOUNCE_TYPES.has(setup.type) &&
-        failedBounces.some(fb => fb.symbol === symbol && nowTs - fb.at < STANDDOWN_MS)
-      const symbolLogsThisSession = dayBuys.filter(b => b.symbol === symbol && nowTs - b.timestamp < SYMBOL_LOG_WINDOW_MS).length
-      const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
-      const capped = overLogged || symbolCapReached(symbol, nowTs, [...dayLogs.values()], dayBuys)
-
-      // Late-session cutoff: regular-hours BUYs stop at 14:00 ET (premarket exempt).
-      if (session === 'regular' && etHHMM(nowTs) >= LATE_LOG_CUTOFF_HHMM) { drops.session++; continue }
-      if (!volumeOk) { drops.volume++; continue }
-      if (setup.qualityVetoed || gradeFloorFail) { drops.veto++; continue }
-      if (standDown) { drops.standDown++; continue }
-      if (capped) { drops.capped++; continue }
-      if (dup) { drops.dup++; continue }
-
-      const t1 = setup.targets[0]?.price ?? null
-      const rr = t1 != null && fill > setup.stopReference
-        ? Math.round(((t1 - fill) / (fill - setup.stopReference)) * 10) / 10
-        : setup.rewardRisk
-      dayBuys.push({
-        id: `${setup.id}:${Math.floor(nowTs / 1000)}`, setupId: setup.id, symbol, timestamp: nowTs,
-        setupType: setup.type, entryLow: setup.zoneLower, entryHigh: fill, invalidation: setup.invalidation,
-        stop: setup.stopReference, targets: setup.targets.map(t => t.price), score: setup.score, grade: setup.grade,
-        rewardRisk: rr, priceAtSignal: price, session,
-        ctxDistDayHighPct: technical.distanceFromDayHighPct, ctxRelVol: technical.relativeVolume,
-        ctxAtrPct: technical.atr != null && price > 0 ? (technical.atr / price) * 100 : null,
+      const { verdict, buy } = classifyBuy(setup, rb.result, {
+        now: rb.nowTs, priorBuys: dayBuys as unknown as BuySignalRecord[], priorLogs, priorStates,
       })
+      if (verdict !== 'logged' || !buy) { drops[verdict as keyof DropCounts]++; continue }
+
+      // classifyBuy returns the production BuySignalRecord; the replay's Buy shape is
+      // that plus the entry session (used by the resolver's slippage haircut).
+      dayBuys.push({ ...buy, session: rb.session } as unknown as Buy)
       if (!seenLog.has(setup.id)) {
         seenLog.add(setup.id)
-        dayLogs.set(setup.id, { id: setup.id, symbol, type: setup.type, invalidation: setup.stopReference, t1, outcome: 'open', resolvedAt: null, direction: 'long' })
+        dayLogs.set(setup.id, {
+          id: setup.id, symbol, type: setup.type, invalidation: setup.stopReference,
+          t1: setup.targets[0]?.price ?? null, outcome: 'open', resolvedAt: null, direction: 'long',
+        })
       }
     }
 
@@ -367,11 +359,11 @@ function replaySymbolDay(
     // happen (adverse-first within a bar). Feeds symbolCapReached + stand-down.
     for (const log of dayLogs.values()) {
       if (log.outcome !== 'open') continue
-      if (bar.low <= log.invalidation) {
-        log.outcome = 'invalidated'; log.resolvedAt = nowTs
-        if (BOUNCE_TYPES.has(log.type)) failedBounces.push({ symbol, type: log.type, at: nowTs })
-      } else if (log.t1 != null && bar.high >= log.t1) {
-        log.outcome = 'target_hit'; log.resolvedAt = nowTs
+      if (rb.low <= log.invalidation) {
+        log.outcome = 'invalidated'; log.resolvedAt = rb.nowTs
+        if (BOUNCE_TYPES.has(log.type)) failedBounces.push({ symbol, type: log.type, at: rb.nowTs })
+      } else if (log.t1 != null && rb.high >= log.t1) {
+        log.outcome = 'target_hit'; log.resolvedAt = rb.nowTs
       }
     }
   }
@@ -379,7 +371,15 @@ function replaySymbolDay(
 
 // ── Resolution + reporting ─────────────────────────────────────────────────────
 
-interface Resolved extends Buy { pnlPct: number; outcome: string; fullyClosed: boolean; mfePct: number; maePct: number }
+interface Resolved extends Buy {
+  pnlPct: number; outcome: string; fullyClosed: boolean; mfePct: number; maePct: number
+  // Anatomy of the scale-out ladder for the winner-capture study (additive; the
+  // decision/P&L are unchanged — this only DECOMPOSES the P&L the resolver produced).
+  t1Reached: boolean; t2Reached: boolean; breakevenActivated: boolean
+  fracRemainingAtClose: number; realisedBeforeCloseR: number; closeMarkR: number
+  endReason: string; tT1Min: number | null; tT2Min: number | null; tMfeMin: number | null
+  lastBarMin: number | null; lastClose: number | null
+}
 
 function resolveBuy(b: Buy, dayCandles: Candle[]): Resolved {
   const slip = slippageForSession(getSessionType(b.timestamp))
@@ -387,16 +387,52 @@ function resolveBuy(b: Buy, dayCandles: Candle[]): Resolved {
   const log: SetupLog = {
     id: b.id, symbol: b.symbol, type: b.setupType, direction: 'long',
     identifiedAt: b.timestamp, priceAtIdentification: b.entryHigh,
-    zoneLower: b.entryLow, zoneUpper: b.entryHigh, score: b.score, grade: b.grade as any,
+    zoneLower: b.entryLow, zoneUpper: b.entryHigh, score: b.score, grade: b.grade as SetupLog['grade'],
     confirmation: [], invalidation: b.stop, targets: b.targets.map((p, i) => ({ price: p, label: `T${i + 1}`, rewardRisk: null })),
     statesReached: [], maxFavorablePrice: b.entryHigh, maxAdversePrice: b.entryHigh,
     maxFavorablePct: 0, maxAdversePct: 0, outcome: 'open', outcomeReason: null,
     triggeredAt: b.timestamp, resolvedAt: null, relativeVolumeAtId: null, sessionAtId: b.session, testCount: 0,
   }
   const r = resolveLogAgainstCandles(log, dayCandles)
+
+  // ── Ladder decomposition (R attribution per leg) ──
+  const legs = pnl?.legs ?? []
+  const entryEff = b.entryHigh * (1 + slip)
+  const stopFrac = b.entryHigh > 0 ? (b.entryHigh - b.stop) / b.entryHigh : 0   // one R, as a fraction of entry
+  let realisedBeforeCloseR = 0, closeMarkR = 0
+  for (const leg of legs) {
+    const exitEff = leg.exitPrice * (1 - slip)
+    const legR = stopFrac > 0 ? ((exitEff - entryEff) / entryEff) * leg.fraction / stopFrac : 0
+    if (leg.reason === 'close') closeMarkR += legR; else realisedBeforeCloseR += legR
+  }
+  const closeLeg = legs.find(l => l.reason === 'close')
+
+  // ── Timing (minutes from entry) over the entry day's post-signal tape ──
+  const signalSec = Math.floor(b.timestamp / 1000)
+  const day = dayCandles.filter(c => c.time >= signalSec && getSessionType(c.time * 1000 + 60000)).sort((x, y) => x.time - y.time)
+  const t1 = b.targets[0] ?? null, t2 = b.targets[1] ?? null
+  let tT1Min: number | null = null, tT2Min: number | null = null, tMfeMin: number | null = null, hi = -Infinity
+  for (const c of day) {
+    const min = Math.round((c.time * 1000 - b.timestamp) / 60000)
+    if (min < 0) continue
+    if (tT1Min == null && t1 != null && c.high >= t1) tT1Min = min
+    if (tT2Min == null && t2 != null && c.high >= t2) tT2Min = min
+    if (c.high > hi) { hi = c.high; tMfeMin = min }
+  }
+  const lastBar = day[day.length - 1] ?? null
+
   return {
     ...b, pnlPct: pnl?.pnlPct ?? 0, fullyClosed: pnl?.fullyClosed ?? false,
     outcome: r?.outcome ?? 'open', mfePct: r?.maxFavorablePct ?? 0, maePct: r?.maxAdversePct ?? 0,
+    t1Reached: legs.some(l => l.reason === 'T1'),
+    t2Reached: legs.some(l => l.reason === 'T2'),
+    breakevenActivated: legs.some(l => l.reason === 'breakeven'),
+    fracRemainingAtClose: closeLeg?.fraction ?? 0,
+    realisedBeforeCloseR, closeMarkR,
+    endReason: legs.length ? legs[legs.length - 1].reason : 'none',
+    tT1Min, tT2Min, tMfeMin,
+    lastBarMin: lastBar ? Math.round((lastBar.time * 1000 - b.timestamp) / 60000) : null,
+    lastClose: lastBar?.close ?? null,
   }
 }
 
@@ -409,8 +445,24 @@ async function main() {
   await mapLimit(pool, 3, async sym => { try { dailyBySym.set(sym, await fetchDaily(sym)) } catch { dailyBySym.set(sym, []) } })
 
   // Reconstruct each day's universe, then gather the distinct symbols to fetch 5-min tape for.
+  // UNIVERSE_FROM pins the per-day universe to the symbols in an existing signals
+  // CSV, instead of re-ranking the (drift-prone) cache pool. This is how a prior
+  // canonical run is reproduced exactly for e.g. an anatomy pass: the pool grows as
+  // more days are cached, which changes the top-N-by-move ranking, so re-running
+  // free-form would replay a different universe. Pinning removes that drift.
   const universeByDay = new Map<string, string[]>()
-  for (const day of DAYS) universeByDay.set(day, await reconstructUniverse(day, pool, dailyBySym))
+  const pinPath = process.env.UNIVERSE_FROM
+  if (pinPath) {
+    const pinned = new Map<string, Set<string>>()
+    for (const ln of readFileSync(pinPath, 'utf8').trim().split('\n').slice(1)) {
+      const c = ln.split(','); const d = c[0]?.trim(); const sym = c[2]?.trim()
+      if (d && sym) { if (!pinned.has(d)) pinned.set(d, new Set()); pinned.get(d)!.add(sym) }
+    }
+    for (const day of DAYS) universeByDay.set(day, [...(pinned.get(day) ?? new Set<string>())])
+    console.error(`Universe PINNED from ${pinPath}`)
+  } else {
+    for (const day of DAYS) universeByDay.set(day, await reconstructUniverse(day, pool, dailyBySym))
+  }
   const need = new Set<string>()
   for (const u of universeByDay.values()) for (const s of u) need.add(s)
   console.error(`Universe symbols to replay: ${need.size} distinct. Fetching floats…`)
@@ -442,7 +494,7 @@ async function main() {
     // Fetch each universe symbol's day-anchored 5-min tape (concurrency-limited).
     const dayRowsBySym = new Map<string, RawRow[]>()
     await mapLimit(universe, 3, async sym => {
-      try { dayRowsBySym.set(sym, await fetch5minForDay(sym, day)) }
+      try { dayRowsBySym.set(sym, await fetchIntradayForDay(sym, day)) }
       catch (e) { console.error(`5min ${sym} ${day} failed:`, (e as Error).message); dayRowsBySym.set(sym, []) }
     })
 
@@ -547,13 +599,35 @@ async function main() {
   const outPath = join(SCRATCH, `backtest-july${tag}.md`)
   writeFileSync(outPath, report)
   // Also dump the reconstructed signals as CSV.
-  const csv = ['day,time_ET,symbol,setup,grade,entry,stop,t1,rvol,off_high_pct,outcome,scaled_pnl_pct']
+  // mae_pct/mfe_pct are already computed per signal (resolveBuy → resolveLogAgainstCandles);
+  // exporting them lets scripts/research.ts run its excursion section (how much stop
+  // room a winner actually needed) instead of reporting "not available".
+  const csv = ['day,time_ET,symbol,setup,grade,entry,stop,t1,rvol,off_high_pct,outcome,scaled_pnl_pct,mae_pct,mfe_pct']
   for (const r of allResolved.slice().sort((a, b) => a.timestamp - b.timestamp)) {
     const day = etDayKey(Math.floor(r.timestamp / 1000))
     const t = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(r.timestamp))
-    csv.push([day, t, r.symbol, r.setupType, r.grade, r.entryHigh.toFixed(2), r.stop.toFixed(2), r.targets[0]?.toFixed(2) ?? '', r.ctxRelVol?.toFixed(1) ?? '', r.ctxDistDayHighPct?.toFixed(1) ?? '', r.outcome, r.pnlPct.toFixed(2)].join(','))
+    csv.push([day, t, r.symbol, r.setupType, r.grade, r.entryHigh.toFixed(2), r.stop.toFixed(2), r.targets[0]?.toFixed(2) ?? '', r.ctxRelVol?.toFixed(1) ?? '', r.ctxDistDayHighPct?.toFixed(1) ?? '', r.outcome, r.pnlPct.toFixed(2), r.maePct.toFixed(2), r.mfePct.toFixed(2)].join(','))
   }
   writeFileSync(join(SCRATCH, `backtest-july${tag}-signals.csv`), csv.join('\n'))
+
+  // Per-trade ANATOMY of the scale-out ladder (additive research output; does not
+  // affect the signals CSV above or any decision). Columns decompose the resolver's
+  // P&L into realised-before-close vs EOD-mark, with ladder events and timing, in R.
+  const anat = ['day,time_ET,symbol,setup,session,grade,entry,stop,t1,t2,outcome,total_R,realised_before_close_R,close_mark_R,frac_remaining_close,t1_reached,t2_reached,breakeven_activated,end_reason,mfe_R,mae_R,t_t1_min,t_t2_min,t_mfe_min,last_bar_min,last_close']
+  for (const r of allResolved.slice().sort((a, b) => a.timestamp - b.timestamp)) {
+    const day = etDayKey(Math.floor(r.timestamp / 1000))
+    const t = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(r.timestamp))
+    const stopFrac = r.entryHigh > 0 ? (r.entryHigh - r.stop) / r.entryHigh * 100 : 0   // 1R in %
+    const totalR = stopFrac > 0 ? r.pnlPct / stopFrac : 0
+    const mfeR = stopFrac > 0 ? r.mfePct / stopFrac : 0
+    const maeR = stopFrac > 0 ? r.maePct / stopFrac : 0
+    anat.push([day, t, r.symbol, r.setupType, r.session, r.grade, r.entryHigh.toFixed(2), r.stop.toFixed(2),
+      r.targets[0]?.toFixed(2) ?? '', r.targets[1]?.toFixed(2) ?? '', r.outcome, totalR.toFixed(3),
+      r.realisedBeforeCloseR.toFixed(3), r.closeMarkR.toFixed(3), r.fracRemainingAtClose.toFixed(3),
+      r.t1Reached ? '1' : '0', r.t2Reached ? '1' : '0', r.breakevenActivated ? '1' : '0', r.endReason,
+      mfeR.toFixed(3), maeR.toFixed(3), r.tT1Min ?? '', r.tT2Min ?? '', r.tMfeMin ?? '', r.lastBarMin ?? '', r.lastClose?.toFixed(2) ?? ''].join(','))
+  }
+  writeFileSync(join(SCRATCH, `backtest-july${tag}-anatomy.csv`), anat.join('\n'))
 
   console.log(report)
   console.error(`\n\nReport → ${outPath}`)

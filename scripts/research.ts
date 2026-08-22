@@ -47,6 +47,9 @@ interface Signal {
   stopPct: number
   /** P/L in R: pnlPct / stopPct. The only comparable measure across setups. */
   r: number
+  /** Max adverse / favorable excursion %, when the source carries them (null otherwise). */
+  maePct: number | null
+  mfePct: number | null
 }
 
 /** Column aliases, so a backtest CSV and a live Buy Log export both load. */
@@ -62,6 +65,8 @@ const COLUMNS: Record<string, string[]> = {
   offHigh: ['off_high_pct', 'dist_dayhigh_pct'],
   outcome: ['outcome'],
   pnl: ['scaled_pnl_pct', 'pnl_pct'],
+  mae: ['mae_pct', 'maePct'],
+  mfe: ['mfe_pct', 'mfePct'],
 }
 
 function pick(header: string[], names: string[]): number {
@@ -106,6 +111,8 @@ function load(path: string): Signal[] {
       offHigh: get('offHigh') ? Number(get('offHigh')) : null,
       outcome, pnlPct, stopPct,
       r: stopPct > 0 ? pnlPct / stopPct : 0,
+      maePct: get('mae') !== '' && Number.isFinite(Number(get('mae'))) ? Number(get('mae')) : null,
+      mfePct: get('mfe') !== '' && Number.isFinite(Number(get('mfe'))) ? Number(get('mfe')) : null,
     })
   }
   return out
@@ -114,11 +121,22 @@ function load(path: string): Signal[] {
 // ── Reporting ────────────────────────────────────────────────────────────────
 
 const sumR = (xs: Signal[]) => xs.reduce((s, x) => s + x.r, 0)
+const median = (xs: number[]): number => {
+  if (xs.length === 0) return 0
+  const b = xs.slice().sort((a, c) => a - c)
+  const n = b.length
+  return n % 2 ? b[(n - 1) / 2] : (b[n / 2 - 1] + b[n / 2]) / 2
+}
 
+// Median R sits alongside avg/trade because this book's edge is outlier-driven: a
+// positive mean can hide a negative median (the typical trade is a loss), which is
+// exactly what a mean-only view misses. See the "Robustness" section for the
+// top-N-trade and per-ticker concentration that make this concrete.
 function line(label: string, xs: Signal[], days: number): string {
   const w = xs.filter(x => x.outcome === 'target_hit' || x.outcome === 'win').length
   const l = xs.filter(x => x.outcome === 'invalidated' || x.outcome === 'loss').length
   const net = sumR(xs)
+  const med = median(xs.map(x => x.r))
   const wr = (w + l) ? ((w / (w + l)) * 100).toFixed(0) + '%' : '—'
   return [
     label.padEnd(24),
@@ -126,16 +144,75 @@ function line(label: string, xs: Signal[], days: number): string {
     (xs.length / days).toFixed(1).padStart(6),
     wr.padStart(6),
     ((net / xs.length >= 0 ? '+' : '') + (net / xs.length).toFixed(3) + 'R').padStart(9),
+    ((med >= 0 ? '+' : '') + med.toFixed(2) + 'R').padStart(8),
     ((net >= 0 ? '+' : '') + net.toFixed(1) + 'R').padStart(9),
   ].join(' ')
 }
 
+const HEADER = 'bucket                      n   /day    win  avg/trade    medR    net R'
+
 function section(title: string, groups: Map<string, Signal[]>, days: number) {
   console.log(`\n### ${title}`)
-  console.log('bucket                      n   /day    win  avg/trade    net R')
+  console.log(HEADER)
   for (const [k, xs] of [...groups.entries()].sort((a, b) => sumR(b[1]) - sumR(a[1]))) {
     console.log(line(k, xs, days))
   }
+}
+
+// ── Robustness: is the edge real, or a handful of trades on a handful of names? ──
+// A +net-R book can still be one where the median trade loses and the whole edge
+// is 5 trades on 2 tickers. This section makes that explicit so a filter is never
+// tuned to noise.
+function robustness(signals: Signal[]) {
+  const rs = signals.map(s => s.r)
+  const net = sumR(signals)
+  console.log('\n### Robustness (outlier + concentration)')
+  console.log(`mean/trade ${net / signals.length >= 0 ? '+' : ''}${(net / signals.length).toFixed(3)}R  ·  median/trade ${median(rs) >= 0 ? '+' : ''}${median(rs).toFixed(2)}R  ·  net ${net >= 0 ? '+' : ''}${net.toFixed(1)}R`)
+
+  // Top-N trade dependence: how much of the net comes from the best few trades.
+  const sorted = signals.slice().sort((a, b) => b.r - a.r)
+  for (const n of [1, 3, 5, 10]) {
+    if (n > sorted.length) break
+    const topR = sorted.slice(0, n).reduce((s, x) => s + x.r, 0)
+    console.log(`  net minus top-${String(n).padStart(2)} trades: ${(net - topR) >= 0 ? '+' : ''}${(net - topR).toFixed(1)}R   (top-${n} = ${((topR / net) * 100).toFixed(0)}% of net)`)
+  }
+
+  // Max drawdown of the time-ordered cumulative-R curve (equity roughness).
+  const ordered = signals.slice().sort((a, b) => (a.day + a.time).localeCompare(b.day + b.time))
+  let cum = 0, peak = 0, dd = 0
+  for (const s of ordered) { cum += s.r; peak = Math.max(peak, cum); dd = Math.min(dd, cum - peak) }
+  console.log(`  max drawdown (time-ordered): ${dd.toFixed(1)}R  ·  net/|maxDD| = ${dd < 0 ? (net / -dd).toFixed(2) : '∞'}`)
+
+  // Per-ticker concentration.
+  const bySym = groupBy(signals, s => s.symbol || '?')
+  const ticks = [...bySym.entries()].map(([k, xs]) => ({ k, n: xs.length, r: sumR(xs) })).sort((a, b) => b.r - a.r)
+  const top2 = ticks.slice(0, 2).reduce((s, x) => s + x.r, 0)
+  console.log(`  distinct tickers: ${ticks.length}  ·  top-2 tickers = ${net ? ((top2 / net) * 100).toFixed(0) : '—'}% of net`)
+  console.log(`  best:  ${ticks.slice(0, 4).map(t => `${t.k}(${t.n},${t.r >= 0 ? '+' : ''}${t.r.toFixed(1)}R)`).join('  ')}`)
+  console.log(`  worst: ${ticks.slice(-3).map(t => `${t.k}(${t.n},${t.r >= 0 ? '+' : ''}${t.r.toFixed(1)}R)`).join('  ')}`)
+}
+
+// ── Excursion: MAE/MFE, only when the source CSV carries the columns. ───────────
+function excursion(signals: Signal[]) {
+  const withEx = signals.filter(s => s.maePct != null || s.mfePct != null)
+  if (withEx.length === 0) {
+    console.log('\n### Excursion (MAE/MFE)')
+    console.log('  not available — the source CSV has no mae_pct/mfe_pct columns.')
+    console.log('  (backtest.ts now exports them; re-run the replay to populate this.)')
+    return
+  }
+  const wins = withEx.filter(s => s.outcome === 'target_hit' || s.outcome === 'win')
+  const loss = withEx.filter(s => s.outcome === 'invalidated' || s.outcome === 'loss')
+  const avg = (xs: Signal[], f: (s: Signal) => number | null) => {
+    const v = xs.map(f).filter((x): x is number => x != null)
+    return v.length ? v.reduce((s, x) => s + x, 0) / v.length : NaN
+  }
+  const fmt = (n: number) => Number.isNaN(n) ? '—' : (n >= 0 ? '+' : '') + n.toFixed(2) + '%'
+  console.log('\n### Excursion (MAE/MFE)')
+  console.log(`  ALL    avg MAE ${fmt(avg(withEx, s => s.maePct))}  avg MFE ${fmt(avg(withEx, s => s.mfePct))}  (n=${withEx.length})`)
+  console.log(`  wins   avg MAE ${fmt(avg(wins, s => s.maePct))}  avg MFE ${fmt(avg(wins, s => s.mfePct))}  (n=${wins.length})`)
+  console.log(`  losses avg MAE ${fmt(avg(loss, s => s.maePct))}  avg MFE ${fmt(avg(loss, s => s.mfePct))}  (n=${loss.length})`)
+  console.log('  (heat taken before the winner ran = how much stop room the entry actually needed.)')
 }
 
 const groupBy = (xs: Signal[], fn: (s: Signal) => string) => {
@@ -174,8 +251,11 @@ function main() {
   console.log('\n(all figures in R = P/L ÷ stop width; judge on NET R, not avg/trade)')
 
   console.log('\n### Whole book')
-  console.log('bucket                      n   /day    win  avg/trade    net R')
+  console.log(HEADER)
   console.log(line('ALL', signals, days))
+
+  robustness(signals)
+  excursion(signals)
 
   section('By setup', groupBy(signals, s => s.setup), days)
   section('By session', groupBy(signals, s =>
@@ -201,7 +281,7 @@ function main() {
   console.log('\n### Cull simulation — ESTIMATE ONLY')
   console.log('A veto reshuffles the book (freed cap/dedup slots backfill other signals),')
   console.log('so confirm any cut with a real replay run before shipping it.\n')
-  console.log('book                        n   /day    win  avg/trade    net R')
+  console.log(HEADER.replace('bucket', 'book  '))
   console.log(line('baseline', signals, days))
 
   // Greedily drop the worst net-R setup while net R keeps improving.
