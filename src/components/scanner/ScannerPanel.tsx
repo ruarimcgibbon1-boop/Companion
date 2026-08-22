@@ -7,25 +7,25 @@ import { dataAge, getSessionType } from '@/lib/market-hours'
 import { useScanner } from '@/hooks/useScanner'
 
 const BADGE_COLORS: Record<BadgeType, string> = {
-  'Fresh News': 'bg-blue-500/20 text-blue-400 border border-blue-500/30',
-  'Low Float': 'bg-purple-500/20 text-purple-400 border border-purple-500/30',
-  'High RVOL': 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30',
-  'Extended': 'bg-red-500/20 text-red-400 border border-red-500/30',
-  'Halt Risk': 'bg-red-600/20 text-red-300 border border-red-600/30',
-  'Dilution Risk': 'bg-orange-500/20 text-orange-400 border border-orange-500/30',
-  'No Catalyst': 'bg-gray-500/20 text-gray-400 border border-gray-500/30',
-  'VWAP Hold': 'bg-green-500/20 text-green-400 border border-green-500/30',
-  'VWAP Lost': 'bg-red-500/20 text-red-400 border border-red-500/30',
+  'Fresh News': 'bg-info/10 text-info ring-1 ring-inset ring-info/25',
+  'Low Float': 'bg-struct/10 text-struct ring-1 ring-inset ring-struct/25',
+  'High RVOL': 'bg-warn/10 text-warn ring-1 ring-inset ring-warn/25',
+  'Extended': 'bg-bear/10 text-bear ring-1 ring-inset ring-bear/25',
+  'Halt Risk': 'bg-bear/15 text-bear ring-1 ring-inset ring-bear/40',
+  'Dilution Risk': 'bg-warn/10 text-warn ring-1 ring-inset ring-warn/25',
+  'No Catalyst': 'bg-white/5 text-ink-mute ring-1 ring-inset ring-white/10',
+  'VWAP Hold': 'bg-bull/10 text-bull ring-1 ring-inset ring-bull/25',
+  'VWAP Lost': 'bg-bear/10 text-bear ring-1 ring-inset ring-bear/25',
 }
 
 const STATUS_COLORS: Record<string, string> = {
-  'Constructive': 'text-green-400',
-  'Developing': 'text-yellow-400',
-  'Extended': 'text-orange-400',
-  'Chasing Risk': 'text-red-400',
-  'Weakening': 'text-orange-400',
-  'Breakdown Risk': 'text-red-500',
-  'No Clean Setup': 'text-gray-400',
+  'Constructive': 'text-bull',
+  'Developing': 'text-warn',
+  'Extended': 'text-warn',
+  'Chasing Risk': 'text-bear',
+  'Weakening': 'text-warn',
+  'Breakdown Risk': 'text-bear',
+  'No Clean Setup': 'text-ink-mute',
 }
 
 function formatNum(n: number, decimals = 2): string {
@@ -85,18 +85,18 @@ export function ScannerPanel() {
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#0e1117] border-r border-gray-800">
+    <div className="flex flex-col h-full bg-panel border-r border-line">
       {/* Symbol search */}
-      <form onSubmit={handleSearchSubmit} className="px-3 py-2 border-b border-gray-800">
+      <form onSubmit={handleSearchSubmit} className="px-3 py-2.5 border-b border-line">
         <div className="flex gap-1.5">
           <input
             ref={searchRef}
             type="text"
             value={search}
             onChange={e => setSearch(e.target.value.toUpperCase())}
-            placeholder="Search ticker… e.g. LHAI"
+            placeholder="Search ticker…"
             maxLength={10}
-            className="flex-1 bg-gray-900 border border-gray-700 focus:border-blue-500 rounded px-2.5 py-1.5 text-sm text-white placeholder-gray-600 focus:outline-none font-mono tracking-wide"
+            className="ring-focus flex-1 bg-raised border border-line-strong focus:border-accent rounded-md px-2.5 py-1.5 text-sm text-ink placeholder-ink-faint focus:outline-none font-mono tracking-wide"
             autoCapitalize="characters"
             autoCorrect="off"
             autoComplete="off"
@@ -105,7 +105,7 @@ export function ScannerPanel() {
           <button
             type="submit"
             disabled={!search.trim()}
-            className="px-3 py-1.5 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors"
+            className="ring-focus px-3.5 py-1.5 rounded-md bg-accent hover:bg-accent-hi disabled:opacity-30 disabled:cursor-not-allowed text-white text-xs font-semibold transition-colors"
           >
             Go
           </button>
@@ -113,24 +113,25 @@ export function ScannerPanel() {
       </form>
 
       {/* Header */}
-      <div className="px-3 py-2 border-b border-gray-800">
-        <div className="flex items-center justify-between mb-2">
+      <div className="px-3 py-2.5 border-b border-line">
+        <div className="flex items-center justify-between mb-2.5">
           <div className="flex items-center gap-2">
-            <h2 className="text-sm font-semibold text-gray-200">Market Scanner</h2>
+            <h2 className="eyebrow !text-[11px] text-ink-soft">Market Scanner</h2>
             {isPremarketSession && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/40 text-blue-400 border border-blue-800 font-medium">PRE-MKT</span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-info/10 text-info ring-1 ring-inset ring-info/25 font-semibold tracking-wide">PRE-MKT</span>
             )}
           </div>
           <div className="flex items-center gap-2">
             {scannerLoading && (
-              <span className="text-xs text-gray-500 animate-pulse">Scanning...</span>
+              <span className="text-[11px] text-ink-mute animate-pulse">Scanning…</span>
             )}
             {lastScanTime && !scannerLoading && (
-              <span className="text-xs text-gray-600">{dataAge(lastScanTime)}</span>
+              <span className="text-[11px] text-ink-faint tnum">{dataAge(lastScanTime)}</span>
             )}
             <button
               onClick={() => scan(true)}
-              className="text-xs px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400"
+              className="ring-focus w-6 h-6 flex items-center justify-center rounded-md bg-raised hover:bg-hover text-ink-mute hover:text-ink transition-colors"
+              title="Refresh scan"
             >
               ↻
             </button>
@@ -138,12 +139,12 @@ export function ScannerPanel() {
         </div>
 
         {/* Quick presets */}
-        <div className="flex flex-wrap gap-1 mb-2">
+        <div className="flex flex-wrap gap-1 mb-2.5">
           {QUICK_PRESETS.map(p => (
             <button
               key={p.label}
               onClick={() => setFilters(p.filters)}
-              className="text-xs px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200"
+              className="text-[11px] px-2 py-0.5 rounded-md bg-raised/70 hover:bg-hover text-ink-soft hover:text-ink ring-1 ring-inset ring-line transition-colors"
             >
               {p.label}
             </button>
@@ -151,46 +152,34 @@ export function ScannerPanel() {
         </div>
 
         {/* Filter row */}
-        <div className="grid grid-cols-3 gap-1">
-          <label className="text-xs text-gray-600">
-            Min%
-            <input
-              type="number"
-              value={filters.minChangePct}
-              onChange={e => setFilters({ minChangePct: Number(e.target.value) })}
-              className="block w-full mt-0.5 px-1 py-0.5 bg-gray-900 border border-gray-700 rounded text-gray-300 text-xs"
-            />
-          </label>
-          <label className="text-xs text-gray-600">
-            MaxP
-            <input
-              type="number"
-              value={filters.maxPrice}
-              onChange={e => setFilters({ maxPrice: Number(e.target.value) })}
-              className="block w-full mt-0.5 px-1 py-0.5 bg-gray-900 border border-gray-700 rounded text-gray-300 text-xs"
-            />
-          </label>
-          <label className="text-xs text-gray-600">
-            MinVol
-            <input
-              type="number"
-              value={filters.minVolume}
-              onChange={e => setFilters({ minVolume: Number(e.target.value) })}
-              className="block w-full mt-0.5 px-1 py-0.5 bg-gray-900 border border-gray-700 rounded text-gray-300 text-xs"
-            />
-          </label>
+        <div className="grid grid-cols-3 gap-1.5">
+          {([
+            { key: 'minChangePct', label: 'Min %', value: filters.minChangePct },
+            { key: 'maxPrice', label: 'Max $', value: filters.maxPrice },
+            { key: 'minVolume', label: 'Min Vol', value: filters.minVolume },
+          ] as const).map(f => (
+            <label key={f.key} className="eyebrow !tracking-wide flex flex-col gap-1">
+              {f.label}
+              <input
+                type="number"
+                value={f.value}
+                onChange={e => setFilters({ [f.key]: Number(e.target.value) })}
+                className="ring-focus w-full px-1.5 py-1 bg-raised border border-line rounded-md text-ink-soft text-xs tnum focus:border-accent focus:outline-none"
+              />
+            </label>
+          ))}
         </div>
       </div>
 
       {/* Error */}
       {scannerError && (
-        <div className="px-3 py-2 text-xs text-red-400 bg-red-900/10 border-b border-red-900/20">
+        <div className="px-3 py-2 text-xs text-bear bg-bear/5 border-b border-bear/20">
           {scannerError}
         </div>
       )}
 
       {/* Table header */}
-      <div className="grid grid-cols-[2rem_4rem_1fr_3rem_3rem_3rem] gap-1 px-3 py-1 border-b border-gray-800 text-xs text-gray-600 font-medium">
+      <div className="grid grid-cols-[1.5rem_4rem_1fr_3rem_3rem_3rem] gap-1 px-3 py-1.5 border-b border-line eyebrow !text-[9px] bg-app/40">
         <span>#</span>
         <span>Sym</span>
         <span>Name</span>
@@ -202,7 +191,7 @@ export function ScannerPanel() {
       {/* Rows */}
       <div className="flex-1 overflow-y-auto">
         {scannerRows.length === 0 && !scannerLoading && (
-          <div className="px-3 py-8 text-center text-xs text-gray-600">
+          <div className="px-4 py-10 text-center text-xs text-ink-mute">
             {scannerError ? 'Error loading scanner' : 'No results. Check filters or API key.'}
           </div>
         )}
@@ -216,7 +205,7 @@ export function ScannerPanel() {
         ))}
       </div>
 
-      <div className="px-3 py-1.5 border-t border-gray-800 text-xs text-gray-700">
+      <div className="px-3 py-1.5 border-t border-line text-[10px] text-ink-faint tnum">
         {scannerRows.length} results
       </div>
     </div>
@@ -235,38 +224,42 @@ function ScannerRowItem({
   return (
     <div
       onClick={onSelect}
-      className={`cursor-pointer border-b border-gray-800/50 px-3 py-2 hover:bg-gray-800/40 transition-colors ${selected ? 'bg-blue-900/20 border-l-2 border-l-blue-500' : ''}`}
+      className={`relative cursor-pointer px-3 py-2 transition-colors ${
+        selected
+          ? 'bg-accent/10 before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:bg-accent before:shadow-[0_0_10px_var(--color-accent)]'
+          : 'border-b border-line/50 hover:bg-hover'
+      }`}
     >
       {/* Row 1: rank, symbol, price, change */}
-      <div className="grid grid-cols-[2rem_4rem_1fr_3rem_3rem_3rem] gap-1 items-center">
-        <span className="text-xs text-gray-600">{row.rank}</span>
-        <span className="text-sm font-bold text-white">{row.symbol}</span>
-        <span className="text-xs text-gray-500 truncate">{row.name.slice(0, 14)}</span>
-        <span className={`text-xs text-right font-medium ${row.changePct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+      <div className="grid grid-cols-[1.5rem_4rem_1fr_3rem_3rem_3rem] gap-1 items-center">
+        <span className="text-[11px] text-ink-faint tnum">{row.rank}</span>
+        <span className={`text-sm font-bold tracking-wide ${selected ? 'text-accent-hi' : 'text-ink'}`}>{row.symbol}</span>
+        <span className="text-[11px] text-ink-mute truncate">{row.name.slice(0, 14)}</span>
+        <span className={`text-xs text-right font-semibold tnum ${row.changePct >= 0 ? 'text-bull' : 'text-bear'}`}>
           {row.changePct >= 0 ? '+' : ''}{formatNum(row.changePct, 1)}%
         </span>
-        <span className="text-xs text-right text-gray-400">{formatVol(row.volume)}</span>
-        <span className="text-xs text-right text-yellow-400">
-          {row.relativeVolume ? `${formatNum(row.relativeVolume, 1)}x` : '—'}
+        <span className="text-xs text-right text-ink-soft tnum">{formatVol(row.volume)}</span>
+        <span className="text-xs text-right text-warn tnum">
+          {row.relativeVolume ? `${formatNum(row.relativeVolume, 1)}×` : '—'}
         </span>
       </div>
 
-      {/* Row 2: price, mktcap, badges */}
-      <div className="flex items-center gap-2 mt-0.5">
-        <span className="text-xs text-gray-300 font-medium">${formatNum(row.price)}</span>
-        <span className="text-xs text-gray-600">{formatMktCap(row.marketCap)}</span>
-        <span className={`text-xs ml-auto ${STATUS_COLORS[row.status] ?? 'text-gray-400'}`}>
+      {/* Row 2: price, mktcap, status */}
+      <div className="flex items-center gap-2 mt-1">
+        <span className="text-xs text-ink font-semibold tnum">${formatNum(row.price)}</span>
+        <span className="text-[11px] text-ink-mute tnum">{formatMktCap(row.marketCap)}</span>
+        <span className={`text-[11px] ml-auto font-medium ${STATUS_COLORS[row.status] ?? 'text-ink-mute'}`}>
           {row.status}
         </span>
       </div>
 
       {/* Badges */}
       {row.badges.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-1">
+        <div className="flex flex-wrap gap-1 mt-1.5">
           {row.badges.map(b => (
             <span
               key={b.type}
-              className={`text-[10px] px-1.5 py-0.5 rounded-sm font-medium ${BADGE_COLORS[b.type] ?? 'bg-gray-700 text-gray-400'}`}
+              className={`text-[10px] px-1.5 py-0.5 rounded font-semibold tracking-wide ${BADGE_COLORS[b.type] ?? 'bg-white/5 text-ink-mute'}`}
             >
               {b.label}
             </span>

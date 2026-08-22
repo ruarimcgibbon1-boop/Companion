@@ -1,6 +1,11 @@
 import type { Metadata } from "next";
-import { Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
@@ -22,8 +27,8 @@ export default function RootLayout({
     // bis_register, __processed_*) onto <html>/<body> before React hydrates,
     // which would otherwise log a hydration mismatch. This only relaxes the
     // warning for these two elements' own attributes, not their descendants.
-    <html lang="en" className={`${geistMono.variable} h-full dark`} suppressHydrationWarning>
-      <body className="h-full bg-[#0e1117] text-gray-100 antialiased" suppressHydrationWarning>{children}</body>
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full dark`} suppressHydrationWarning>
+      <body className="h-full bg-app text-ink antialiased" suppressHydrationWarning>{children}</body>
     </html>
   );
 }
