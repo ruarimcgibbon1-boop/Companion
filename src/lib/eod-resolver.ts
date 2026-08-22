@@ -143,7 +143,14 @@ export function resolveLogAgainstCandles(log: SetupLog, candles: Candle[]): Setu
 // Scale-out schedule: sell this fraction at T1, the remainder at T2. Breakeven
 // stop moves under the remainder once T1 books. Tunable knobs.
 const SCALE_T1_FRACTION = 0.5
-const BREAKEVEN_AFTER_T1 = true
+// Move the runner's stop to breakeven once T1 books. PRODUCTION DEFAULT = true
+// (unchanged). Research-configurable ONLY via an explicit env flag so an A/B can
+// test hypothesis M1 (breakeven-after-T1 truncates runners) without touching the
+// live default: BREAKEVEN_AFTER_T1=0 keeps the runner on its original invalidation
+// stop until T2/EOD. The env is inert in the browser (process undefined), so the
+// live client and daemon always get `true`.
+const BREAKEVEN_AFTER_T1 =
+  (typeof process !== 'undefined' && process.env && process.env.BREAKEVEN_AFTER_T1 === '0') ? false : true
 
 // Slippage haircut (per side, as a fraction of price): the resolver fills at the
 // exact level, but real fills are worse — you pay up on entry and give up on the

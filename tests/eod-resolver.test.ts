@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { resolveLogAgainstCandles, resolveOpenLogs, sameEtDay, isDayClosed, scaledPnl, resolveBuyPnl, normalizeCandles, slippageForSession } from '../src/lib/eod-resolver'
 import type { Candle, SetupLog, BuySignalRecord } from '../src/types'
 
@@ -278,5 +278,45 @@ describe('slippage haircut', () => {
     const ah = slippageForSession('afterhours')
     expect(pm).toBeGreaterThan(rth)
     expect(ah).toBeGreaterThan(rth)
+  })
+})
+
+// C2a — BREAKEVEN_AFTER_T1 is a module-load env gate (research only): default true,
+// disabled ONLY by the exact string '0'. It affects eod-resolver's scaled-P&L
+// resolution, never live executor stop placement (executor.ts has its own hardcoded
+// breakeven-after-T1). Re-import per case so the top-level const re-reads the env.
+describe('scaledPnl — BREAKEVEN_AFTER_T1 env override (research)', () => {
+  const entry = 100, stop = 98, targets = [102, 105]
+  // After T1 the runner dips to 99 (above the ORIGINAL stop 98, below breakeven 100)
+  // then recovers and closes 104. Default breakeven-stops at 100; override rides on.
+  const cs: Candle[] = [
+    candle([17, 5], 100, 102.3, 100.2, 102),   // T1 → book ½ +2%
+    candle([17, 10], 101, 104, 99, 104),       // dip 99, recover, close 104
+  ]
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules() })
+
+  it('DEFAULT (env unset) breakeven-stops the remainder (unchanged production behaviour)', async () => {
+    vi.resetModules()
+    const { scaledPnl: fn } = await import('../src/lib/eod-resolver')
+    const r = fn(entry, stop, targets, cs, DAY_ET_1PM)!
+    expect(r.legs.some(l => l.reason === 'breakeven')).toBe(true)
+    expect(r.pnlPct).toBeCloseTo(1, 6)   // 0.5*2 + 0.5*0
+  })
+
+  it('BREAKEVEN_AFTER_T1=0 disables it: runner keeps its original stop, no breakeven leg', async () => {
+    vi.stubEnv('BREAKEVEN_AFTER_T1', '0')
+    vi.resetModules()
+    const { scaledPnl: fn } = await import('../src/lib/eod-resolver')
+    const r = fn(entry, stop, targets, cs, DAY_ET_1PM)!
+    expect(r.legs.some(l => l.reason === 'breakeven')).toBe(false)
+    expect(r.pnlPct).toBeCloseTo(3, 6)   // 0.5*2 + 0.5*4 (rode to close 104)
+  })
+
+  it('only the exact string "0" disables — "false" does NOT (no invented aliases)', async () => {
+    vi.stubEnv('BREAKEVEN_AFTER_T1', 'false')
+    vi.resetModules()
+    const { scaledPnl: fn } = await import('../src/lib/eod-resolver')
+    const r = fn(entry, stop, targets, cs, DAY_ET_1PM)!
+    expect(r.legs.some(l => l.reason === 'breakeven')).toBe(true)
   })
 })
