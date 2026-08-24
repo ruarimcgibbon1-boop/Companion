@@ -38,9 +38,14 @@ No ad-hoc constants were introduced.
 - The shadow does NOT recompute or reinterpret this field.
 
 ## Validation window (frozen)
-- The next **10 complete US trading sessions**: `2026-08-24, 08-25, 08-26, 08-27, 08-28, 08-31, 09-01, 09-02, 09-03, 09-04` (Labor Day 09-07 is a market holiday and excluded; the window ends 09-04). Corrected 2026-08-22 to include Monday 2026-08-24, a normal NYSE session with no operational reason for exclusion (prior draft erroneously started 08-25).
+- **10 usable US trading sessions** (as amended below): `2026-08-25, 08-26, 08-27, 08-28, 08-31, 09-01, 09-02, 09-03, 09-04, 09-08`. Labor Day 09-07 is a market holiday and excluded.
 - No early stop for good/bad results. No extension without explicit approval.
 - A session with a process outage, missing/empty tape, corrupted logs, or market-data failure is marked **DATA_INCOMPLETE** and neither silently replaced nor omitted. Report the final usable session count.
+
+### Operational amendment — 2026-08-24 (window only; no hypothesis/evaluator/verdict change)
+- **2026-08-24 = DATA_INCOMPLETE.** Reason: no Companion/trading/capture processes were running for the session, so no candidate stream or fills were recorded. Marked incomplete, not silently omitted.
+- Because this occurred **before any usable prospective validation data was collected**, the unusable session is replaced by the next eligible US trading session, **2026-09-08**, preserving a 10-usable-session horizon.
+- This is an **operational-window amendment only.** The originally frozen window was `08-24…09-04`; the amended usable schedule is the list above. 09-07 remains excluded (Labor Day).
 
 ## Shadow portfolio method — v2 event-anchored (`scripts/shadow-validate.ts`)
 Evaluated AFTER each session:
