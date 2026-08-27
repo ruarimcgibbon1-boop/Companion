@@ -68,15 +68,15 @@ taking the on-disk file to **327 rows** with a changed whole-file hash
 | Metric | Value |
 |---|---|
 | Local P&L $ | **+1,218.79** |
-| Broker P&L $ | **+1,018.19** (session exact, equity-anchored) |
-| Difference (local − broker) $ | **+200.60** — local **overstated net** (hid ≈$239.5 of FWDI loss, offset by ≈$38.9 of hidden YYGH gain) |
+| Broker P&L $ | **+1,018.19** (exact, from primary Alpaca FILL ledger — not equity subtraction) |
+| Difference (local − broker) $ | **+200.60** — local **overstated net** (hid $239.49 of FWDI loss, offset by $38.90 of hidden YYGH gain) |
 
-**Broker precision tiers (see `POST_SESSION_REVIEW.md §1`):**
-- **Tier A (exact, independent):** equity Δ +$1,018.19; four trades reconcile exactly
-  (NVDL −468.16, WKSP −15.14, CRWD +872.57, CRM +813.83); combined YYGH+FWDI = **−$184.91**.
-- **Tier B (bounded estimate):** YYGH ≈ +$71.8 / +0.678R (limit exit, known 798 qty);
-  FWDI ≈ −$256.7 / −0.924R (equity-constrained, YYGH-bounded).
-- **Tier C (UNRESOLVED):** FWDI's 2,529 un-ingested exit shares are not individually priced.
+**Broker economics — EXACT per-trade (Alpaca FILL ledger; `retrievalComplete=true`, all 6
+mapped, unmapped=0; see `POST_SESSION_REVIEW.md §1`):** NVDL −$468.16, WKSP −$15.14, YYGH
+**+$71.82**, CRWD +$872.57, CRM +$813.83, FWDI **−$256.73** → total **+$1,018.19**. The prior
+Tier-A/B/C equity-subtraction framing is superseded: every previously "UNRESOLVED" per-share
+fill (FWDI's 2,529, YYGH's 389) is now individually priced. Equity Δ +$1,018.19 corroborates
+the total to the cent.
 
 ## Shadow arms (R)
 | Arm | Net R |

@@ -35,29 +35,45 @@ Stale rows are dominated by illiquid premarket quote age (WKSP/OKTA/DAIC/CYPH; q
   (e.g. CRWD 1,954, against the breakeven trail 213.66) did not stop positions that kept
   trading above the stop. **No stale/null observation is used as stop evidence.**
 
-## Latency — two distinct sub-latencies (not conflated)
-The artifacts provide `submitted → local-recognized-fill` intervals (event pairs) but **no
-independent broker-side fill timestamp**. For cleanly-filled trades the broker-fill instant and
-the local-recognition instant **cannot be separated** — they collapse into the submit→local-fill
-interval. The one trade with a measurable broker-fill→recognition gap is **FWDI**.
+## Latency — corrected with primary broker-fill timestamps (2026-08-28)
 
-| Symbol | submit → broker fill | broker fill → local recognition | combined (submit→local-fill) | Note |
+> The earlier version lacked broker-side fill timestamps and inferred a "broker-fill →
+> recognition lag" **up to ≈ 2h26m** for FWDI. The Alpaca FILL ledger now supplies exact
+> transaction timestamps, which **overturn that reading** (details below). The broker-fill
+> and local-recognition instants are now separable for the stop-liquidated trades.
+
+| Symbol | broker stop fill (ET, from FILL stream) | local recognition (ET) | broker-fill → recognition lag | Note |
 |---|---|---|---|---|
-| NVDL | not separable | not separable | **3.39 s** (exit) | clean broker stop @35.34 (gap −0.018%). *Corrected:* this is submit→local-fill, **not** a "recognition delay"; no evidence of lag. |
-| WKSP | not separable | not separable | 31.1 s + 4.4 s (2 legs) | illiquid stop-market; **market-gap** ≈ −2.2R (fills 5–8% below stop 0.5818) |
-| YYGH (runner) | not separable | not separable | ~0 on fill | 293 fresh bid≤stop from 09:30; broker stop trade-triggered 10:03:38 @1.88 |
-| CRWD | not separable | not separable | 3.6 s (t1) / 3.3 s (t2) | winner; breakeven-stop bid touches held on trade prints |
-| CRM | not separable | not separable | 3.5 s (t1) / 3.4 s (t2) | winner |
-| FWDI | placed 11:31:31; broker fills across 11:31–13:57 (not individually timestamped) | **up to ≈ 2h26m** (protective_stop placed 11:31:31 → reconcile discovery 13:57:24) | 182-share residual only | **broker-fill→recognition lag is the measurable defect (Issue 1)** |
+| NVDL | 07:36:5x | 07:36:56 | ~seconds | clean broker stop @35.34; no defect |
+| WKSP | 05:04:04–08 | 05:04:08 | ~seconds | illiquid stop-market; **market-gap** ≈ −2.2R (fills 5–8% below stop) |
+| YYGH | t1 11:52:08 (798 in 3 frags); stop 14:02:54–55 (798) | t1 11:52:08 / mismatch 11:52:53 | ~seconds | qty reconciled in seconds; the defect is the **omitted 389-share t1 P&L**, not stale qty |
+| CRWD | — | on fill | ~seconds | winner |
+| CRM | — | on fill | ~seconds | winner |
+| FWDI | **single ~1-second liquidation 13:56:41–42** (2,711 in 4 frags, one stop order) | ~13:57:24 (reconcile) | **≈ 43 s** | position legitimately open until 13:56:41; NOT a 2h26m stale window |
 
-## Partial-exit ingestion check (Issue 1)
-- **FWDI — most severe instance of the trial.** Entry 2,711 @6.83 (11:31 ET); the broker stop
-  sold the position down over the session, but local ingested **none** of those exits for
-  ~2h26m (`reconcile brokerQty=182 localQty=2711` at 13:57), then forced flat and priced the
-  residual 182 externally (`external_close_priced extFills=4` @6.7353). Local booked P&L on
-  **182 of 2,711 shares**: local −$17.24/−0.062R vs broker ≈ −$256.7/−0.924R.
-- **YYGH — mild instance.** 798-share t1 filled at broker; local ingested only one 409-share
-  leg (`reconcile brokerQty=798 localQty=1187`). Local +$32.92/+0.311R vs broker ≈ +$71.8/+0.678R.
+**FWDI correction (material).** The FILL stream shows the FWDI stop did **not** bleed the
+position down across the afternoon. It rested from placement (11:31 ET) while the **2,711-share
+position remained legitimately open** — broker qty and local qty were **both 2,711** — until
+the stop triggered and liquidated the entire position in a **~1-second fill burst at 13:56:41
+ET** (fragments 1,274+305+950+182). Local reconciliation recognized the change at ~13:57:24 ET.
+The supported **broker-fill → local-recognition lag is therefore ≈ 43 seconds**, not ≈ 2h26m;
+the 2h26m interval was the **holding period between stop placement and stop execution**, during
+which local state was *correct*, not stale. This remains distinct from the 2026-08-26 HOWL
+**network outage** (Issue 2): continuous EQ coverage confirms connectivity was healthy.
+
+## Partial-exit ingestion check (Issue 1) — accounting defect stands
+- **FWDI — largest $ under-book of the trial.** Entry 2,711 @6.83 (11:31 ET). The stop
+  liquidated all 2,711 shares at ≈6.7353 vwap in one ~1-second burst (13:56:41 ET); the local
+  executor ingested **only the 182-share fragment** (priced via `external_close_priced` after
+  the 13:57 reconcile) and **omitted 2,529 exit shares** from realized P&L. Exact broker
+  **−$256.73 / −0.924R** vs local **−$17.24 / −0.062R** (from the FILL ledger, not equity
+  subtraction). The recognition-lag diagnosis is corrected (≈43 s); **the accounting
+  incompleteness is real and material and is NOT retracted.**
+- **YYGH.** The t1 target order filled **798 shares** (fragments 409+136+253 @1.99); local
+  ingested only the first **409** and **omitted 389 t1 shares** from realized P&L. Exact broker
+  **+$71.82 / +0.678R** vs local **+$32.92 / +0.311R**. Qty was reconciled to 798 within
+  seconds (11:52:53) — no stale-qty window; the defect is the omitted-P&L on the un-ingested
+  fragments.
 
 **FWDI lag = Issue 1 (ingestion), NOT Issue 2 (network).** The EQ tape shows **4,376 continuous
 FWDI observations at steady 2 s cadence across the whole 11:31→13:57 window** — connectivity was

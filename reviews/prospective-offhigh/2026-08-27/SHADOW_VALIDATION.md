@@ -58,9 +58,13 @@ empty. The single capacity-reason difference is the **intended** experiment beha
 - Dollar gates not modeled — applied equally to both arms.
 
 ## Data-quality caveat (information only — does NOT alter the frozen figures or PASS/FAIL)
-CONTROL R is scored on the **local executor fills by definition**, which under-booked YYGH
-(+0.311R local vs ≈+0.678R broker) and FWDI (−0.062R local vs ≈−0.924R broker) — see
+The frozen CONTROL/direct-only/reshuffle arms above are the **authoritative trial figures and
+are unchanged.** Separately, for accounting context: CONTROL R is scored on the **local executor
+fills by definition**, which under-booked YYGH (+0.311R local vs **+0.678R broker, exact**) and
+FWDI (−0.062R local vs **−0.924R broker, exact**) — now measured directly from the Alpaca FILL
+ledger (`retrievalComplete=true`, unmapped=0), see
 [ISSUE_LEDGER §1](../ISSUE_LEDGER.md#issue-1--partial-exit-fill-ingestion). A broker-true CONTROL
-would be ≈ +1.90R. This is **recorded as accounting context, not a reinterpretation of the
-frozen evaluator**; the frozen +2.395R figure stands as the validation input. Session 3 is one
-usable evidence point (3 of 10). No hypothesis verdict; no threshold tuning.
+would be **+1.899R**. This is **accounting context, NOT a reinterpretation of the frozen
+evaluator** — the frozen **+2.395R** figure (local-defined CONTROL) stands as the validation
+input and must not be rewritten with broker truth. Session 3 is one usable evidence point (3 of
+10). No hypothesis verdict; no threshold tuning.

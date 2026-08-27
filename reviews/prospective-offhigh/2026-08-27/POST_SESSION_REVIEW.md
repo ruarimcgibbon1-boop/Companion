@@ -8,44 +8,39 @@ Both experiment arms were positive this session. The session's central finding i
 not strategic: the **most severe partial-exit ingestion instance of the trial (FWDI)**.
 Session verdict **CLEAN_WITH_FINDINGS** — the CONTROL arm is intact and usable.
 
-## 1. Broker truth — corrected precision tiers
+## 1. Broker truth — EXACT, from primary Alpaca FILL retrieval
 
-Broker economics are stated in three tiers rather than as a single "exact" figure, because
-FWDI's individual exit fills were not all ingested/priced.
+> **Provenance upgrade (2026-08-28).** Broker economics below are now **exact per-trade
+> values reconstructed directly from the Alpaca account FILL activity stream** (complete
+> paginated retrieval: `retrievalComplete=true`, all 6 trades mapped by `client_order_id`,
+> **unmapped fills = 0**, total **+$1,018.19**). This **replaces** the earlier
+> equity-subtraction estimate and its Tier-A/B/C precision framing — every previously
+> "UNRESOLVED" per-share fill is now individually priced. Equity change still corroborates
+> the total to the cent, but is no longer the basis. Source: `scripts/broker-ledger.ts` run
+> on the frozen paper-trades against the live paper account (READ-ONLY).
 
-**Tier A — exact & independent (Alpaca-reported):**
-- EOD equity $91,485.34 → $92,503.53, **Δ = +$1,018.19**. Paper account carries no
-  commissions/fees and was flat at EOD, so this delta equals total realized P&L (only
-  assumption: no non-trade equity effects — holds for Alpaca paper).
-- Four trades reconcile **local == broker exactly** (`verified`/matched): NVDL −$468.16,
-  WKSP −$15.14, CRWD +$872.57, CRM +$813.83 → sum **+$1,203.10**.
-- Therefore combined broker P&L of the two under-booked trades (**YYGH + FWDI**) =
-  1,018.19 − 1,203.10 = **−$184.91** — exact and independent at the pair level.
+| Symbol | Broker P&L | Broker R | Exit reconstruction (primary fills) |
+|---|---|---|---|
+| NVDL | **−$468.16** | **−1.015** | 418 @36.46 → 418 @35.34 (stop); local == broker |
+| WKSP | **−$15.14** | **−3.243** | 258 @0.5999 → 258 @0.5412 vwap (stop); local == broker |
+| YYGH | **+$71.82** | **+0.678** | t1 = 798 @1.99 in **3 fragments 409+136+253**; stop = 798 @1.88 (492+306); full 1,596 exited |
+| CRWD | **+$872.57** | **+3.552** | 85 @213.66 → t1/t2 223.9255 vwap; local == broker |
+| CRM | **+$813.83** | **+2.851** | 77 @237.55 → t1/t2 248.12 vwap; local == broker |
+| FWDI | **−$256.73** | **−0.924** | 2,711 @6.83 → **2,711 @≈6.7353 vwap** in **4 fragments 1,274+305+950+182** (one stop order) |
+| **TOTAL** | **+$1,018.19** | | direct fill reconstruction — **no equity subtraction** |
 
-**Tier B — estimated trade-level split of the −$184.91:**
-- **YYGH is tightly bounded.** Broker held exactly 798 after t1 (`reconcile brokerQty=798`,
-  entry 1596) → 798 sold at t1, 798 at stop. The stop leg (798 @1.88) is recorded; the t1 leg
-  is a **limit sell at the 2.00 target** (409 recorded @1.99, 389 un-ingested). A limit exit
-  fills at/above its limit → YYGH broker P&L ≈ **+$71.8 / +0.678R** (bounded ~+$71.4…+$72.2).
-- **FWDI follows by subtraction:** −184.91 − (+71.8) ≈ **−$256.7 / −0.924R**.
+- **YYGH is fully resolved:** the t1 target order filled **798 shares** in three fragments
+  (409+136+253 @1.99); the local executor ingested only the first **409**. Adding the stop
+  leg (798 @1.88), the **entire 1,596-share position** is accounted → **+$71.82 / +0.678R**.
+- **FWDI is fully resolved:** the entire 2,711-share position exited on **one protective-stop
+  order** in four fragments (1,274+305+950+182) at ≈6.7353 vwap → **−$256.73 / −0.924R**. The
+  local executor booked only the **182-share** fragment; the other **2,529 exit shares are now
+  priced from the fill stream** (previously omitted from local realized P&L).
 
-**Tier C — UNRESOLVED (fill-level):** FWDI's **2,529 exit shares are not individually
-ingested or priced** in the artifacts; only the aggregate is constrained.
-
-**Is the equity tie genuinely independent?** *Partly.* The session/pair-level figure
-(−$184.91 combined) is independent (equity minus four exactly-reconciled trades). The FWDI
-**trade-level** −$256.73 is **not independently pinned** — equity constrains only the *sum*
-YYGH+FWDI, so recovering FWDI requires the (well-bounded) YYGH estimate. The alternative
-route (external-close avg 6.7353 × 2,711 = −$256.73) **applies the recorded price of the last
-182 shares to 2,529 unobserved shares and is NOT independently confirmed by equity** — its
-agreement is corroborative, not proof. Honest label: **FWDI ≈ −$256.7 / −0.924R is an
-equity-constrained estimate (YYGH-bounded); per-share precision UNRESOLVED.**
-
-**Exposure language (supported claim only):** *broker flat at EOD, no residual exposure
-identified, and protective broker execution occurred (stops/targets filled at the broker).*
-The artifacts contain **no continuous, timestamped broker position/fill timeline**, so
-instant-by-instant safety during FWDI's 11:31–13:57 ET window is not provable — only that a
-protective stop was placed and ultimately executed.
+**Exposure (supported claim):** *broker flat at EOD, no residual exposure identified,
+protective broker execution occurred.* The fill stream additionally shows FWDI's exit was a
+single ~1-second stop liquidation (see §5 and `OPERATIONAL_DIAGNOSIS.md`), not a prolonged
+open-and-uncovered window.
 
 ## 2. Local executor accounting
 
@@ -55,8 +50,8 @@ protective stop was placed and ultimately executed.
 | WKSP | −$15.14 | −3.243 | verified | match | NONE |
 | CRWD | +$872.57 | +3.552 | closed | match | NONE |
 | CRM | +$813.83 | +2.851 | verified | match | NONE |
-| YYGH | +$32.92 | +0.311 | `discrepancy` | under-booked **win** ≈ +$38.9 | **KNOWN_PARTIAL_EXIT_INGESTION** |
-| FWDI | −$17.24 | −0.062 | `manual_review` | under-booked **loss** ≈ −$239.5 | **KNOWN_PARTIAL_EXIT_INGESTION** (most severe of trial) |
+| YYGH | +$32.92 | +0.311 | `discrepancy` | under-booked **win** by **+$38.90** (broker +$71.82; 389 t1 shares omitted) | **KNOWN_PARTIAL_EXIT_INGESTION** |
+| FWDI | −$17.24 | −0.062 | `manual_review` | under-booked **loss** by **−$239.49** (broker −$256.73; 2,529 exit shares omitted) | **KNOWN_PARTIAL_EXIT_INGESTION** (largest $ under-book of the trial) |
 
 **Net local +$1,218.79 vs broker +$1,018.19 → local − broker = +$200.60** (local overstated
 net). Both discrepancies are Issue 1; broker/equity is authoritative. See
@@ -68,15 +63,15 @@ net). Both discrepancies are Issue 1; broker/equity is authoritative. See
 |---|---|---|---|---|---|---|---|---|---|---|
 | NVDL | hod_break | 04:29 | pre | −0.01 | 36.45 | 35.3565 | 461.26 | −468.16 | −1.015 | Stop (clean) |
 | WKSP | break_of_structure | 05:01 | pre | −0.03 | 0.5998 | 0.5818 | 4.67 | −15.14 | −3.243 | Stop (gap-through) |
-| YYGH | break_of_structure | 06:26 | pre | **−3.59** | 1.88 | 1.8236 | 105.97 | ≈+71.8ᵉ | ≈+0.678ᵉ | t1 + trail stop |
+| YYGH | break_of_structure | 06:26 | pre | **−3.59** | 1.88 | 1.8236 | 105.97 | +71.82 | +0.678 | t1 + trail stop (exact from fill ledger) |
 | CRWD | opening_drive | 09:34 | reg | −0.77 | 213.98 | 210.77 | 245.62 | +872.57 | +3.552 | t1+t2 |
 | CRM | opening_drive | 09:37 | reg | +0.10 | 237.41 | 233.84 | 285.41 | +813.83 | +2.851 | t1+t2 |
-| FWDI | opening_range_break | 11:31 | reg | −0.65 | 6.83 | 6.7276 | 277.74 | ≈−256.7ᵉ | ≈−0.924ᵉ | Stop (ingestion-distorted book) |
+| FWDI | opening_range_break | 11:31 | reg | −0.65 | 6.83 | 6.7276 | 277.74 | −256.73 | −0.924 | Stop (exact from fill ledger; local book was ingestion-distorted) |
 
 Aborted (90 s entry timeout, unfilled): OKTA, DAIC, CYPH.
 
-**Broker-true summary:** 6 trades · 3W/3L · ≈ **+1.90R / +$1,018.19** · win 50% · PF(broker R)
-≈ 1.37 · mean R ≈ +0.32 · median R ≈ +0.31. **Guards:** premarket loss sub-budget (−$457.43)
+**Broker-true summary:** 6 trades · 3W/3L · **+1.899R / +$1,018.19** (exact, from the fill
+ledger) · win 50% · PF(broker R) ≈ 1.37 · mean R ≈ +0.317 · median R ≈ +0.308. **Guards:** premarket loss sub-budget (−$457.43)
 **triggered** at −$483.30 (blocked BRNX/ANET/ANF); **daily-loss guard not approached**
 (net-positive day). Strategy-vs-execution: NVDL clean −1R; WKSP excess to −3.24R is market-gap
 on an illiquid $0.60 name; FWDI's book figure is accounting-distorted, not a strategy signal.
@@ -92,8 +87,8 @@ on an illiquid $0.60 name; FWDI's book figure is accounting-distorted, not a str
 
 ## 5. Reconciliation note
 Local **+$1,218.79** vs broker **+$1,018.19** → **local − broker = +$200.60**. Driver: **FWDI**
-(local −$17.24/−0.062R vs broker ≈ −$256.7/−0.924R — an under-booked *loss*), partly offset by
-**YYGH** (local +$32.92/+0.311R vs broker ≈ +$71.8/+0.678R — an under-booked *win*). Broker is
+(local −$17.24/−0.062R vs broker **−$256.73/−0.924R** — an under-booked *loss*), partly offset by
+**YYGH** (local +$32.92/+0.311R vs broker **+$71.82/+0.678R** — an under-booked *win*). Broker is
 authoritative; broker flat at EOD. See [ISSUE_LEDGER §1](../ISSUE_LEDGER.md#issue-1--partial-exit-fill-ingestion).
 
 ## 6. Post-signal excursion — REVIEW-ONLY diagnostic (NOT part of the frozen criterion)

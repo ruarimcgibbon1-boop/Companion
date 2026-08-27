@@ -17,7 +17,7 @@ unsafe; none observed).
 | **First observed** | 2026-08-25 |
 | **Last observed** | 2026-08-27 |
 | **Status** | OPEN — fix DEFERRED during the frozen trial |
-| **Severity** | MEDIUM → **HIGH watch** (2026-08-27 was the most severe instance; broker exposure still safe) |
+| **Severity** | **MEDIUM** (2026-08-27 is the **largest $ under-book of the trial**, but broker exposure was safe and recognition was prompt — see severity note below) |
 | **Category** | LOCAL ACCOUNTING / EXIT-FILL INGESTION |
 
 **Description.** During **fragmented exit fills**, the local process may ingest only a
@@ -34,22 +34,45 @@ loss** or **understate a win**.
   - 2026-08-26: local **under-booked the ANF winner** (broker +$986.33 / +3.72R vs local
     +$619.50 / +2.34R), contributing to a **total local-vs-broker discrepancy of −$363.94**
     (local −931.66 vs broker −567.72).
-  - 2026-08-27 (**most severe instance of the trial**): **FWDI** — broker sold the position
-    down over ~2h26m but local ingested **none** of those exits, booking P&L on only **182 of
-    2,711 shares** (local −$17.24 / −0.062R vs broker ≈ −$256.7 / −0.924R, an under-booked
-    *loss*); plus **YYGH** — one 409-share t1 leg ingested of 798 (local +$32.92 / +0.311R vs
-    broker ≈ +$71.8 / +0.678R, an under-booked *win*). Session total: local +$1,218.79 vs
-    broker +$1,018.19 → **local overstated net by +$200.60**. Broker precision is tiered: the
-    combined YYGH+FWDI figure (−$184.91) is exact via equity, the per-trade split is a bounded
-    estimate, and FWDI's 2,529 un-ingested exit shares are **UNRESOLVED at fill level** (not
-    individually priced). **FWDI's ~2h26m recognition lag is THIS issue (ingestion), NOT Issue 2
-    (network)** — the EQ tape has 4,376 continuous FWDI observations at 2 s cadence across the
-    lag, so connectivity was healthy.
+  - 2026-08-27 (**largest $ under-book of the trial**): **FWDI** — the protective stop
+    liquidated the entire 2,711-share position in a **~1-second burst at 13:56:41 ET** (4
+    fragments 1,274+305+950+182 @≈6.7353), but local ingested only the **182-share** fragment
+    and **omitted 2,529 exit shares** (local −$17.24 / −0.062R vs broker **−$256.73 / −0.924R**,
+    an under-booked *loss*); plus **YYGH** — t1 filled **798** shares (fragments 409+136+253
+    @1.99) of which local ingested only **409**, omitting **389** (local +$32.92 / +0.311R vs
+    broker **+$71.82 / +0.678R**, an under-booked *win*). Session total: local +$1,218.79 vs
+    broker **+$1,018.19** → **local overstated net by +$200.60**. Broker economics are **exact
+    from the Alpaca FILL ledger** (`retrievalComplete=true`, all 6 mapped, unmapped=0, direct
+    fill reconstruction — no equity subtraction); the earlier equity-subtraction estimate and
+    its "UNRESOLVED per-share" caveat are superseded (every share now individually priced).
+    **Diagnosis correction (2026-08-28):** the earlier "~2h26m recognition lag" is **wrong** —
+    FWDI was legitimately open (broker qty = local qty = 2,711) for that interval; the true
+    **broker-fill → recognition lag is ≈43 s** (13:56:41 → ~13:57:24). Still **THIS issue
+    (ingestion), NOT Issue 2 (network)** — the EQ tape has 4,376 continuous FWDI observations at
+    2 s cadence, so connectivity was healthy; the executor reconciles off an eventually-consistent
+    `getPosition` that lagged the FILL stream.
 - **Capacity/admission impact:** none directly; admission is entry-driven and entries
-  ingest correctly.
+  ingest correctly. No admission-set change was demonstrated in Session 3 (the frozen
+  reconciliation matched 6/6; the challenger's removal/replacement are unaffected).
 - **Daily-loss-limit impact:** the daily-loss accounting is computed off local economics,
   so it **may diverge from broker truth** while an exit is under-booked. This is a
   reason the nightly reconciliation is mandatory.
+
+**Severity decision (2026-08-28) — held at MEDIUM, from five factors:**
+1. **Accounting incompleteness:** real and material — the **largest single-trade $ under-book of
+   the trial** (FWDI −$239.49; YYGH +$38.90; session net overstated +$200.60). This is what
+   keeps the issue firmly at MEDIUM rather than LOW.
+2. **Potential risk/capacity consequences:** latent, unrealized in Session 3 — under-booked
+   realized P&L can mis-feed the daily-loss/open-risk gates; open-position quantity was correct
+   until the stop fired, so no slot was wrongly held.
+3. **Actual observed recognition delay:** ≈**43 s** (fill burst 13:56:41 → reconcile ~13:57:24),
+   **not** the ≈2h26m the first review inferred without fill timestamps.
+4. **Residual EOD exposure:** none — account flat; FWDI covered by a resting stop until execution.
+5. **Admission-set change:** none demonstrated (reconciliation 6/6).
+
+The earlier "HIGH watch" framing rested partly on the ≈2h26m stale-state reading, now corrected;
+with prompt recognition and no exposure/admission impact, MEDIUM is the defensible level — **not
+downgraded below MEDIUM**, because the accounting incompleteness (factor 1) is genuinely large.
 
 **Evidence paths (path · sha256 · rows):**
 - `~/.companion-paper-trades-2026-08-25.json` · `2d7ec7ff…3e7a` · 576 lines
