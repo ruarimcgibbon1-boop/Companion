@@ -76,4 +76,16 @@ describe('buildBrokerLedger — exact broker fills resolve the under-booked trad
     expect(a.perTrade[0].flags).toContain('residual_exposure')
     expect(a.contentSha256).toBe(b.contentSha256)   // pure/deterministic
   })
+
+  it('retrievalComplete=false is carried through and changes the content hash (fail-closed)', () => {
+    const fills: LedgerFill[] = [
+      f({ symbol: 'NVDL', side: 'buy', qty: 418, price: 36.46, clientOrderId: NVDL.id }),
+      f({ symbol: 'NVDL', side: 'sell', qty: 418, price: 35.34, clientOrderId: `${NVDL.id}:stop:1` }),
+    ]
+    const complete = buildBrokerLedger('2026-08-27', fills, [NVDL], 'src', true)
+    const partial = buildBrokerLedger('2026-08-27', fills, [NVDL], 'src', false)
+    expect(complete.retrievalComplete).toBe(true)
+    expect(partial.retrievalComplete).toBe(false)
+    expect(partial.contentSha256).not.toBe(complete.contentSha256)
+  })
 })

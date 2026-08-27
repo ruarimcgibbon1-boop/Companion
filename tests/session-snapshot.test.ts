@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { classifyDrift, isBytePrefix, countRows, fileStats, summarizeJsonlTail } from '@/lib/research/session-snapshot'
+import { classifyDrift, isBytePrefix, countRows, fileStats, summarizeJsonlTail, sha256Bytes, verifyManifestFile } from '@/lib/research/session-snapshot'
 import { sha256 } from '@/lib/research/phantom-tape'
 
 const FROZEN_DECISIONS_SHA = '826b136ceae4fcf9aecbca970d57309afdf5916b28b84a423f4a9231d8393877'
@@ -54,6 +54,47 @@ describe('summarizeJsonlTail — metadata only, no performance', () => {
     expect(s.symbols).toEqual(['CRWD', 'GSUN'])
     expect(s.verdictCounts).toEqual({ session: 2 })
     expect(Object.keys(s)).not.toContain('pnl')
+  })
+})
+
+describe('sha256Bytes — exact byte hashing (Finding 6)', () => {
+  it('hashes bytes; equals the utf8-string hash for ASCII (826b… fixtures unchanged)', () => {
+    const ascii = 'row1\nrow2\n'
+    expect(sha256Bytes(Buffer.from(ascii))).toBe(sha256(ascii))
+  })
+  it('distinguishes byte content that a utf8 decode would mangle', () => {
+    // Lone continuation bytes are invalid UTF-8 and both decode to U+FFFD, so a
+    // utf8-string hash collides while a true byte hash does not.
+    const a = Buffer.from([0x80])
+    const b = Buffer.from([0x81])
+    expect(a.toString('utf8')).toBe(b.toString('utf8'))          // same decoded string
+    expect(sha256(a.toString('utf8'))).toBe(sha256(b.toString('utf8'))) // → utf8-string hash collides
+    expect(sha256Bytes(a)).not.toBe(sha256Bytes(b))              // byte hash does not
+  })
+})
+
+describe('verifyManifestFile — snapshot self-integrity (Finding 3)', () => {
+  const content = Buffer.from('a\nb\nc\n')
+  const mf = fileStats('x', 'snapshot/x', content)
+  it('passes for an intact snapshot file', () => {
+    expect(verifyManifestFile(mf, content).ok).toBe(true)
+  })
+  it('fails on a modified byte', () => {
+    const r = verifyManifestFile(mf, Buffer.from('a\nX\nc\n'))
+    expect(r.ok).toBe(false)
+    expect(r.reason).toMatch(/sha256/)
+  })
+  it('fails on truncation (byte count mismatch)', () => {
+    const r = verifyManifestFile(mf, Buffer.from('a\nb\n'))
+    expect(r.ok).toBe(false)
+    expect(r.reason).toMatch(/bytes/)
+  })
+  it('fails when the manifest SHA is wrong for the content', () => {
+    const tampered = { ...mf, sha256: 'deadbeef'.repeat(8) }
+    expect(verifyManifestFile(tampered, content).ok).toBe(false)
+  })
+  it('fails when the snapshot file is missing', () => {
+    expect(verifyManifestFile(mf, null).ok).toBe(false)
   })
 })
 

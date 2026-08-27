@@ -56,6 +56,12 @@ export interface PerTradeLedger {
 export interface BrokerLedger {
   day: string
   source: string
+  /**
+   * FALSE means the underlying FILL retrieval was incomplete (pagination failed /
+   * truncated). When false the ledger is NOT authoritative broker truth — callers
+   * must fail closed rather than trust `totals.brokerPnl`.
+   */
+  retrievalComplete: boolean
   perTrade: PerTradeLedger[]
   unmapped: LedgerFill[]
   totals: {
@@ -94,6 +100,7 @@ export function buildBrokerLedger(
   fills: readonly LedgerFill[],
   trades: readonly LedgerTradeRef[],
   source = 'alpaca-paper-activities/FILL',
+  retrievalComplete = true,
 ): BrokerLedger {
   const byTrade = new Map<string, LedgerFill[]>()
   const unmapped: LedgerFill[] = []
@@ -148,6 +155,7 @@ export function buildBrokerLedger(
   const ledgerNoHash = {
     day,
     source,
+    retrievalComplete,
     perTrade,
     unmapped,
     totals: {
