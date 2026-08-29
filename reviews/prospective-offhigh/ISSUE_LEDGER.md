@@ -15,9 +15,9 @@ unsafe; none observed).
 |---|---|
 | **Issue ID** | `partial-exit-fill-ingestion` |
 | **First observed** | 2026-08-25 |
-| **Last observed** | 2026-08-27 |
+| **Last observed** | 2026-08-28 |
 | **Status** | OPEN — fix DEFERRED during the frozen trial |
-| **Severity** | **MEDIUM** (2026-08-27 is the **largest $ under-book of the trial**, but broker exposure was safe and recognition was prompt — see severity note below) |
+| **Severity** | **MEDIUM** (2026-08-27 is the **largest $ under-book of the trial**; recurred on 3 of 7 trades in Session 4 at smaller magnitude with broker truth fully reconciled — see severity note below) |
 | **Category** | LOCAL ACCOUNTING / EXIT-FILL INGESTION |
 
 **Description.** During **fragmented exit fills**, the local process may ingest only a
@@ -51,9 +51,24 @@ loss** or **understate a win**.
     (ingestion), NOT Issue 2 (network)** — the EQ tape has 4,376 continuous FWDI observations at
     2 s cadence, so connectivity was healthy; the executor reconciles off an eventually-consistent
     `getPosition` that lagged the FILL stream.
+  - 2026-08-28 (**recurrence, 3 of 7 trades — smaller magnitude, broker truth fully
+    reconciled**): **TE** (broker −$81.46/−1.054R vs local −$6.90/−0.089R — local booked **46 of
+    512** exit shares), **UMC** (broker −$487.29/−1.055R vs local −$168.29/−0.364R — booked **244
+    of 739**), and **PURR** (broker −$249.58/−1.073R vs local −$227.43/−0.978R — booked **1197 of
+    1312**). All three self-flagged `manual_review` (*"broker flat but local held … — closed by an
+    unrecorded/external order"*). Session total: local −$1,929.21 vs broker −$2,344.97 → **local
+    understated the loss by +$415.76**. Broker economics **exact from the Alpaca FILL ledger**
+    (`retrievalComplete=true`, 34 mapped fills, unmapped=0, residual 0 on every trade; AFRM/CYCU/PD
+    reconcile exactly, CHGA rounding only) — consistent with the corrected Session-3 method, no
+    equity subtraction. **CHGA — the trade removed by the off-high rule — reconciles effectively
+    exactly (local −$458.75 vs broker −$458.80), so the +1.046R experiment−control delta is NOT
+    caused by this defect** (the under-booked trades are UNCHANGED in both observed arms and cancel
+    in the delta). Ingestion, **NOT Issue 2** (EQ continuous during each trade's life).
 - **Capacity/admission impact:** none directly; admission is entry-driven and entries
   ingest correctly. No admission-set change was demonstrated in Session 3 (the frozen
-  reconciliation matched 6/6; the challenger's removal/replacement are unaffected).
+  reconciliation matched 6/6; the challenger's removal/replacement are unaffected). Session 4
+  likewise showed no admission-set change (reconciliation 7/7; removal/replacement/cascade sets
+  are independent of exit-P&L accuracy).
 - **Daily-loss-limit impact:** the daily-loss accounting is computed off local economics,
   so it **may diverge from broker truth** while an exit is under-booked. This is a
   reason the nightly reconciliation is mandatory.
@@ -78,6 +93,7 @@ downgraded below MEDIUM**, because the accounting incompleteness (factor 1) is g
 - `~/.companion-paper-trades-2026-08-25.json` · `2d7ec7ff…3e7a` · 576 lines
 - `~/.companion-paper-trades-2026-08-26.json` · `fc6ea10d…e1a7` · 5487 lines
 - `~/.companion-paper-trades-2026-08-27.json` · `e1f2aff2…44a0f` · 9 trade objects (FWDI `manual_review`, YYGH `discrepancy`)
+- `~/.companion-paper-trades-2026-08-28.json` (frozen `2026-08-28/snapshot/paper-trades.json`) · `10f703e2…b649c4` · 7 trade objects (TE/UMC/PURR `manual_review`) · broker ledger `broker-ledger-2026-08-28.json` contentSha `f0491f8e…93b2b` (retrievalComplete=true, 34 mapped fills, 0 unmapped)
 - `~/.companion-paper-events-2026-08-25.jsonl` · `b73614ad…acb78` · 79 lines
 - `~/.companion-paper-events-2026-08-26.jsonl` · `23a725c5…6db0` · 55 lines
 - `~/.companion-paper-events-2026-08-27.jsonl` · `23e486c0…6b34c` · 77 lines (FWDI `reconcile_qty_mismatch`/`reconcile_forced_flat`/`external_close_priced`; YYGH `reconcile_qty_mismatch`)
@@ -228,3 +244,116 @@ stable whole-file hash rather than a prefix.
 **Escalation criteria.** Escalate if a future decisions file is **not** an exact prefix of its
 frozen hash (would indicate a rewrite, not an append), or if appended post-freeze rows are ever
 found *admitted* (would contaminate the tradeable set).
+
+**2026-08-28 note (standing risk realized as Issue 6).** The standing mitigation above was **not
+followed** in Session 4: the daemon again ran unbounded (decisions written through 20:00 ET) and
+**no freeze was performed at EOD at all** — so there was no frozen hash to drift *from*. This is
+a distinct, more severe failure mode than post-freeze append drift and is tracked separately as
+[Issue 6 — missed-contemporaneous-eod-freeze](#issue-6--missed-contemporaneous-eod-freeze). All
+394 Session-4 decision rows are 2026-08-28 in ET (04:33→20:00 ET); no non-prefix rewrite is
+alleged.
+
+---
+
+## ISSUE 5 — daemon-startup-before-dev-server
+
+| Field | Value |
+|---|---|
+| **Issue ID** | `daemon-startup-before-dev-server` |
+| **First observed** | 2026-08-28 |
+| **Last observed** | 2026-08-28 |
+| **Status** | OPEN — operational; startup-ordering fix DEFERRED (post-trial) |
+| **Severity** | LOW (brief premarket scanner gap; no observed impact) |
+| **Category** | LAUNCH ORDERING / SCANNER AVAILABILITY |
+
+**Description.** On 2026-08-28 the Mac `alert-daemon.ts` started at **08:29:03Z (04:29:03 ET)**
+before the local Next dev server was serving. The daemon logged repeated **"sweep error (is the
+dev server up?): fetch failed"** until local HTTP 200 at ~**08:33:00Z (04:33 ET)** — a ~4-minute
+premarket window in which the scanner produced no candidate stream. **Operational/process
+finding, not a strategy defect.**
+
+- **Broker exposure impact:** none — no open positions existed during the gap (first fill
+  ~04:46 ET).
+- **Observed prospective impact:** none — the first decision row is **04:33:47 ET** (immediately
+  post-recovery); the observed removal (CHGA, 10:13 ET), the empty replacement set, and the
+  cascade (0) are far outside the gap.
+- **Unobservable-interval impact:** because the scanner was down, whether an eligible signal —
+  and therefore whether a **CONTROL admission** — could have occurred in the gap is **UNKNOWN**.
+  Recorded as UNKNOWN (do **not** strengthen to NO).
+
+**Determinations.** Missed prospective signal **UNKNOWN**; missed CONTROL admission **UNKNOWN —
+no evidence of one**; changed observed direct-removal set **NO**; changed observed replacement
+set **NO**; changed observed cascade **NO**; executor authority loss **NO**; broker exposure
+issue **NO**.
+
+> "The 04:29–04:33 ET scanner outage creates an unobservable prospective interval. Whether an
+> eligible signal or CONTROL admission occurred during that interval is UNKNOWN. No observed
+> Session 4 admission, removal, replacement, execution-authority event, or broker exposure was
+> affected. Under the preregistered materiality rule, absence of evidence that this brief startup
+> gap altered the prospective comparison is insufficient by itself to invalidate Session 4."
+
+**Evidence paths.** Decisions snapshot `2026-08-28/snapshot/decisions.jsonl` (`624f7498…a02a8`;
+first row ts `2026-08-28T08:33:47.122Z`); EQ first observation `2026-08-28T08:45:59Z`.
+
+**Root cause.** No readiness gate ordering the daemon start after the dev server is serving.
+
+**Mitigation (standing).** Start the local dev server (HTTP 200) **before** launching the daemon,
+or add a readiness/health check that blocks the first sweep until the scan API responds.
+
+**Deferred fix.** Launch-ordering/readiness gate is post-trial engineering (does not touch the
+executor, strategy, or evaluator).
+
+**Escalation criteria.** Escalate if a startup gap ever overlaps an **open, un-stopped** position,
+recurs long enough to threaten session usability, or a signal/admission in the gap is later shown
+to have been missed.
+
+---
+
+## ISSUE 6 — missed-contemporaneous-eod-freeze
+
+| Field | Value |
+|---|---|
+| **Issue ID** | `missed-contemporaneous-eod-freeze` |
+| **First observed** | 2026-08-28 |
+| **Last observed** | 2026-08-28 |
+| **Status** | OPEN — operational / trial-integrity; process fix DEFERRED (post-trial) |
+| **Severity** | MEDIUM (trial-integrity process finding; no evidence of data corruption) |
+| **Category** | ARTIFACT FREEZE / TRIAL INTEGRITY |
+
+**Description.** No contemporaneous EOD freeze was performed for Session 4. At the start of
+validation the daemon was still running; after shutdown there was **no snapshot, no manifest, and
+no shadow output**, and every review doc was the blank PENDING template. The evaluator and
+`session-freeze` were therefore run **during validation on 2026-08-29 (~15:25Z), ~9 h after the
+16:00 ET close**, against the now-static live files. **Operational/process finding, NOT proven
+data corruption.**
+
+- **Integrity impact:** the eventual snapshot passes `session-verify` **CLEAN** (all five files
+  match the manifest; live drift clean). **However, CLEAN late-snapshot integrity does NOT
+  retroactively establish an independent true-EOD baseline** — with no earlier baseline captured,
+  there is no independent proof the live files were unaltered between 16:00 ET and the late
+  freeze.
+- **Corroboration (not proof):** the daemon was confirmed stopped before the freeze; the
+  decisions log is internally consistent (all 394 rows 2026-08-28 ET, 04:33→20:00 ET); no
+  artifact shows any rewrite.
+- **Classification:** operational / trial-integrity finding, **NOT** evidence corruption — no
+  artifact evidence of tampering exists. This is the realized form of the Issue 4 standing risk.
+- **Broker/accounting/decision-set impact:** none demonstrated — broker truth is complete
+  (retrievalComplete=true), recon 7/7, and the admission/removal/replacement/cascade sets are
+  independent of the freeze timing.
+
+**Evidence paths.** Manifest `2026-08-28/snapshot/MANIFEST.json` (`frozenAtUtc
+2026-08-29T15:25:45.642Z`, `daemonRuntime UNKNOWN`); shadow output `resolvedAtUtc
+2026-08-29T15:25:27.766Z`; `session-verify` result CLEAN (all five files).
+
+**Root cause.** The EOD freeze step was not run at session close (daemon left running; no cutoff
+enforced), so the snapshot could only be created late during validation.
+
+**Mitigation (standing).** Enforce an EOD cutoff: stop the daemon and run `session-freeze`
+**at session close** so the snapshot is a contemporaneous baseline; verify before hashing.
+
+**Deferred fix.** Process/automation to run the freeze at a defined EOD cutoff is post-trial
+work.
+
+**Escalation criteria.** Escalate if a future session is again frozen late, if a late freeze ever
+shows non-prefix drift or unmapped broker fills (would indicate real mutation), or if the missing
+baseline coincides with a disputed admission/removal.
