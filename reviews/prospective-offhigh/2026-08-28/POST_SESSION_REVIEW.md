@@ -6,7 +6,7 @@ CONTROL session (net **−5.713R / PF 0**, 0 wins) in which the off-high challen
 single **DIRECT_REMOVAL** (`CHGA:opening_range_break`, offHighPct −12.67) and **0 replacements**
 → both experiment arms **−4.667R** (removing one realized loser improves the frozen day by
 **+1.046R**). The session's central findings are operational/accounting, not strategic:
-**(1)** a **late (~9h) EOD freeze** with no contemporaneous true-EOD baseline, **(2)** an
+**(1)** a **late (~19h26m) EOD freeze** with no contemporaneous true-EOD baseline, **(2)** an
 **Issue 1 recurrence** (TE/UMC/PURR under-booked, +$415.76 local-vs-broker), and **(3)** a brief
 **startup daemon-before-dev-server gap** (~04:29–04:33 ET). Session verdicts: **USABLE**,
 **CLEAN_WITH_FINDINGS**, **accounting quality FAIL**.
@@ -108,7 +108,7 @@ strategy change. Sample = **one session / seven trades**; this is descriptive on
   not the admission/removal/replacement/cascade sets (all determined independently of exit P&L),
   and CHGA (the removal) reconciles exactly — so the **+1.046R experiment−control delta is
   broker-faithful**.
-- Two operational findings: the **late (~9h) EOD freeze** (Issue 6 — no contemporaneous
+- Two operational findings: the **late (~19h26m) EOD freeze** (Issue 6 — no contemporaneous
   baseline; snapshot CLEAN but not a true-EOD proof) and the **startup daemon-before-dev-server
   gap** (Issue 5, ~04:29–04:33 ET). See `OPERATIONAL_DIAGNOSIS.md`.
 

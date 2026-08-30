@@ -2,7 +2,7 @@
 
 Session 4 had **anomalies**. Three operational findings are recorded, none of which altered the
 observed prospective comparison: **(A)** a startup daemon-before-dev-server gap, **(B)** a missed
-contemporaneous EOD freeze (late ~9h freeze), and **(C)** the Issue 1 partial-exit ingestion
+contemporaneous EOD freeze (late ~19h26m freeze), and **(C)** the Issue 1 partial-exit ingestion
 recurrence. Broker exposure was safe throughout (account flat at EOD).
 
 ## A. Startup incident — daemon started before local dev server (Issue 5)
@@ -40,12 +40,12 @@ was down in the gap, so the existence of a signal — and therefore whether it c
 CONTROL admission — is unobservable, and cannot logically be asserted as definitively NO. See
 [ISSUE_LEDGER §5](../ISSUE_LEDGER.md#issue-5--daemon-startup-before-dev-server).
 
-## B. Missed contemporaneous EOD freeze — late ~9h freeze (Issue 6)
+## B. Missed contemporaneous EOD freeze — late ~19h26m freeze (Issue 6)
 - **No contemporaneous EOD freeze was performed.** At the start of validation the daemon was
   still running; after shutdown there was **no snapshot, no manifest, and no shadow output**, and
   every review doc was still a blank PENDING template.
-- The evaluator and `session-freeze` were run **during validation on 2026-08-29 (~15:25Z), ~9 h
-  after the 16:00 ET close**, against the now-static live files.
+- The evaluator and `session-freeze` were run **during validation on 2026-08-29 (~15:25Z), ~19h26m
+  (1166 minutes) after the 16:00 ET close**, against the now-static live files.
 - The eventual snapshot passes `session-verify` **CLEAN** (all five files match the manifest;
   live drift clean, integrity OK).
 - **However: CLEAN late-snapshot integrity does NOT retroactively establish an independent
@@ -91,4 +91,4 @@ finding; no evidence it drove any trade decision. Issue 3 remains resolved (obse
 - [Issue 3 — execution-observer-launch-config](../ISSUE_LEDGER.md#issue-3--execution-observer-launch-config) — remains resolved (25,870 EQ rows)
 - [Issue 4 — decisions-log post-freeze append drift](../ISSUE_LEDGER.md#issue-4--decisions-log-post-freeze-append-drift) — related (daemon ran unbounded again; here the freeze was missed entirely, see Issue 6)
 - [Issue 5 — daemon-startup-before-dev-server](../ISSUE_LEDGER.md#issue-5--daemon-startup-before-dev-server) — **new** (04:29–04:33 ET gap)
-- [Issue 6 — missed-contemporaneous-eod-freeze](../ISSUE_LEDGER.md#issue-6--missed-contemporaneous-eod-freeze) — **new** (late ~9h freeze)
+- [Issue 6 — missed-contemporaneous-eod-freeze](../ISSUE_LEDGER.md#issue-6--missed-contemporaneous-eod-freeze) — **new** (late ~19h26m freeze)

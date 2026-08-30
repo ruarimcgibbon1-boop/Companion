@@ -4,7 +4,7 @@
 - Source: `data/research-cache/shadow-offhigh/2026-08-28.json` (git-ignored raw; frozen into `snapshot/shadow-output.json`)
 - Source sha256 (frozen): `781a4507402f0e67f1d79b4cb63820d0cd15b9ba5908d3e28f5873dfac816b7d` (69 lines, 1,989 bytes)
 - gitHead recorded in output: **`eead9b2810b080761a56a4c4fa53d081f728e684`** · rule `offHighPct < -3` · model `v2-event-anchored`
-- resolvedAtUtc: `2026-08-29T15:25:27.766Z` (**run ~9h after close — late freeze; see `SESSION_MANIFEST.md`**)
+- resolvedAtUtc: `2026-08-29T15:25:27.766Z` (**run ~19h26m after close — late freeze; see `SESSION_MANIFEST.md`**)
 
 The evaluator was run once, unmodified, with `SHADOW_DAYS=2026-08-28` and
 `GIT_HEAD=eead9b2…`. All three arms and every reshuffle class below are the frozen evaluator

@@ -4,7 +4,7 @@
 > off-high challenger acted (1 removal, 0 replacements). All 7 filled trades were losers
 > (0 wins). Session verdicts: **trial usability USABLE**, **operational cleanliness
 > CLEAN_WITH_FINDINGS**, **accounting quality FAIL** (Issue 1 recurrence). Two operational
-> findings dominate: a **late (~9h) EOD freeze** (no contemporaneous baseline) and a
+> findings dominate: a **late (~19h26m) EOD freeze** (no contemporaneous baseline) and a
 > **startup daemon-before-dev-server gap** (~04:29–04:33 ET). Neither altered any observed
 > admission, removal, replacement, cascade, execution-authority, or broker-exposure event.
 
@@ -18,7 +18,7 @@
 | Rule | `offHighPct < -3` |
 | Daemon runtime | started **2026-08-28T08:29:03Z (04:29:03 ET)**; first decision row **04:33:47 ET** (after the dev-server startup gap cleared ~04:33 ET); scanner continued afterhours to last decision **20:00 ET**. All 7 positions closed by **~11:09 ET** (last paper-trade `updatedAt` 11:09:13 ET; last EQ observation 11:09:12 ET). |
 | Observer status | **HEALTHY-WITH-FINDINGS** — `EXEC_OBSERVER=1` active; 25,870 rows; 0 errors, 0 dropped; but ~82–83% stale quote/trade observations (IEX-only, `feedConsolidated=false`) — see `EXECUTION_QUALITY_REVIEW.md`. |
-| **EOD freeze timing** | **LATE.** No contemporaneous EOD freeze existed. Evaluator + `session-freeze` were run during validation on **2026-08-29 (~15:25Z, ~9h after the 16:00 ET close)**. Snapshot passes `session-verify` **CLEAN**, but a late freeze **cannot** establish an independent true-EOD baseline — see integrity note below and [ISSUE_LEDGER §6](../ISSUE_LEDGER.md#issue-6--missed-contemporaneous-eod-freeze). |
+| **EOD freeze timing** | **LATE.** No contemporaneous EOD freeze existed. Evaluator + `session-freeze` were run during validation on **2026-08-29 (~15:25Z, ~19h26m / 1166 minutes after the 16:00 ET close)**. Snapshot passes `session-verify` **CLEAN**, but a late freeze **cannot** establish an independent true-EOD baseline — see integrity note below and [ISSUE_LEDGER §6](../ISSUE_LEDGER.md#issue-6--missed-contemporaneous-eod-freeze). |
 
 ## Raw artifacts — frozen snapshot basis (path · sha256 · rows · bytes)
 
@@ -44,7 +44,7 @@ Manifest `frozenAtUtc = 2026-08-29T15:25:45.642Z`, `daemonRuntime = UNKNOWN` (ho
 The intended contemporaneous Session 4 EOD freeze was **missed**. When validation began the
 daemon was still running; after shutdown, **no snapshot, manifest, or shadow output existed**
 and `SESSION_MANIFEST.md` was still the blank template. The evaluator and `session-freeze`
-were therefore executed **~9 hours after the 16:00 ET close** against the now-static live
+were therefore executed **~19h26m (1166 minutes) after the 16:00 ET close** against the now-static live
 files.
 
 - The eventual snapshot passes `session-verify` **CLEAN** (all five files match the manifest;
@@ -94,6 +94,6 @@ files.
 | Trial usability | **USABLE** (see rationale in `POST_SESSION_REVIEW.md` §8) |
 | Operational cleanliness | **CLEAN_WITH_FINDINGS** |
 | Accounting quality | **FAIL** — local under-booked $415.76 (Issue 1, TE/UMC/PURR); broker layer complete and authoritative; decision sets unaffected |
-| Operational issues encountered | Issue 1 (partial-exit ingestion — TE/UMC/PURR); Issue 5 (daemon-before-dev-server startup gap 04:29–04:33 ET); Issue 6 (missed contemporaneous EOD freeze; late ~9h freeze) |
+| Operational issues encountered | Issue 1 (partial-exit ingestion — TE/UMC/PURR); Issue 5 (daemon-before-dev-server startup gap 04:29–04:33 ET); Issue 6 (missed contemporaneous EOD freeze; late ~19h26m freeze) |
 | Corrections/adjustments | see [`ADJUSTMENTS.md`](ADJUSTMENTS.md) |
 | Final archive status | ARCHIVED |

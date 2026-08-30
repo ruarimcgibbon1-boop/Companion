@@ -38,7 +38,7 @@ step was needed for Session 4. AFRM/CYCU/PD reconcile exactly; CHGA differs by r
 ## Integrity note — LATE FREEZE (missed contemporaneous EOD freeze)
 | Date | Field | From | To | Reason |
 |------|-------|------|----|--------|
-| 2026-08-29 | Session 4 freeze timing | intended contemporaneous EOD freeze (≤ 16:00 ET 2026-08-28) | actual freeze **2026-08-29 ~15:25Z (~9 h late)** | No snapshot/manifest/shadow output existed at EOD; evaluator + `session-freeze` were run during validation. Snapshot passes `session-verify` **CLEAN**, but a late CLEAN snapshot **cannot** establish an independent true-EOD baseline. Operational/trial-integrity finding, **not** evidence corruption (no artifact evidence of tampering). See [ISSUE_LEDGER §6](../ISSUE_LEDGER.md#issue-6--missed-contemporaneous-eod-freeze). |
+| 2026-08-29 | Session 4 freeze timing | intended contemporaneous EOD freeze (≤ 16:00 ET 2026-08-28) | actual freeze **2026-08-29 ~15:25Z (~19h26m / 1166 min late)** | No snapshot/manifest/shadow output existed at EOD; evaluator + `session-freeze` were run during validation. Snapshot passes `session-verify` **CLEAN**, but a late CLEAN snapshot **cannot** establish an independent true-EOD baseline. Operational/trial-integrity finding, **not** evidence corruption (no artifact evidence of tampering). See [ISSUE_LEDGER §6](../ISSUE_LEDGER.md#issue-6--missed-contemporaneous-eod-freeze). |
 
 ## Startup note — daemon before dev server
 | Date | Field | From | To | Reason |

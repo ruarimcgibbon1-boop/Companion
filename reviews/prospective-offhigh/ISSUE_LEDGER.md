@@ -323,8 +323,8 @@ to have been missed.
 **Description.** No contemporaneous EOD freeze was performed for Session 4. At the start of
 validation the daemon was still running; after shutdown there was **no snapshot, no manifest, and
 no shadow output**, and every review doc was the blank PENDING template. The evaluator and
-`session-freeze` were therefore run **during validation on 2026-08-29 (~15:25Z), ~9 h after the
-16:00 ET close**, against the now-static live files. **Operational/process finding, NOT proven
+`session-freeze` were therefore run **during validation on 2026-08-29 (~15:25Z), ~19h26m (1166
+minutes) after the 16:00 ET close**, against the now-static live files. **Operational/process finding, NOT proven
 data corruption.**
 
 - **Integrity impact:** the eventual snapshot passes `session-verify` **CLEAN** (all five files
