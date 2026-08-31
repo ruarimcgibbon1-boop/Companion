@@ -174,6 +174,23 @@ async function getPremarketQuote(sym: string): Promise<PMData | null> {
   }
 }
 
+/**
+ * Premarket volume as a MEASUREMENT, never a feed gap.
+ *
+ * `getPremarketQuote` sums the Yahoo premarket candle volumes, but that feed
+ * returns premarket bars with a price and `volume: 0` for a name whose tape it
+ * never captured (FNGR, PSQL premarket 2026-08-31). That 0 is missing data, not
+ * "zero shares traded" — the same reason the `volume` field above uses `||`.
+ * Recording a literal 0 in `premarketVolume` lets the premarket volume floor
+ * read it as a measured zero and drop the candidate — exactly the rockets the
+ * scanner exists to surface. So a non-positive reading here is UNKNOWN (null);
+ * the real measured number arrives later from the extended-feed backfill, and a
+ * genuinely low measured volume is a positive value that still fails the floor.
+ */
+export function premarketVolumeReading(pmVolume: number | null | undefined): number | null {
+  return typeof pmVolume === 'number' && pmVolume > 0 ? pmVolume : null
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
   const forceRefresh = searchParams.get('refresh') === '1'
@@ -462,7 +479,7 @@ export async function GET(request: Request) {
           lastUpdate: Date.now(),
           premarketChangePct,
           premarketChange,
-          premarketVolume: pm?.volume ?? null,
+          premarketVolume: premarketVolumeReading(pm?.volume),
           bid: null,
           ask: null,
           spread: null,
