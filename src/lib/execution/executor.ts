@@ -461,18 +461,51 @@ export class PaperExecutor {
       }
     }
 
-    const holding = this.trades.filter(t => t.state === 'open' && t.openQty > 0)
-    // Same guard as the tick head: keep going for post-close reconciliation work.
-    if (holding.length === 0 && !needsPostClose) { this.persist(); return }
+    // Still-pending entries need the live price too — not to fill them, but to
+    // check whether the market has already invalidated the plan (PENDING-ENTRY
+    // GEOMETRY INVALIDATION) while the entry order is still working at the broker.
+    const pending = this.openTrades().filter(t => t.state === 'pending_entry')
+    const preHolding = this.trades.filter(t => t.state === 'open' && t.openQty > 0)
+    // Same guard as the tick head: keep going for post-close reconciliation work,
+    // and now also when a pending entry needs a geometry check.
+    if (preHolding.length === 0 && pending.length === 0 && !needsPostClose) { this.persist(); return }
 
     let prices: Map<string, number>
     try {
-      prices = await this.getPrices([...new Set(holding.map(t => t.symbol))])
+      prices = await this.getPrices([...new Set([...preHolding.map(t => t.symbol), ...pending.map(t => t.symbol)])])
     } catch (e) {
       this.log(`price fetch failed, holding positions untouched: ${(e as Error).message}`)
       this.persist()
       return
     }
+
+    // PENDING-ENTRY GEOMETRY INVALIDATION. Cancel a still-working long entry once the
+    // live market has reached/crossed its ORIGINAL stop — the setup is invalid before
+    // we're even filled. This is an EXECUTION-POLICY change (it can drop an entry the
+    // producer would otherwise have filled), NOT a strategy change. It trusts exactly the
+    // same FMP-derived price the open-position stop (decideExit) already trusts, so a
+    // stale/transient sub-stop print carries the same false-trigger risk here as it does
+    // for a live stop-out today — no new feed dependency. Broker truth stays authoritative:
+    // a fill that raced the cancel is booked (never disowned) and handed to the existing
+    // post-fill geometry guard.
+    for (const trade of pending) {
+      if (trade.state !== 'pending_entry') continue   // reconcileEntry above may have moved it
+      const price = prices.get(trade.symbol)
+      if (price == null || !(price > 0)) continue
+      if (price <= trade.initialStop) {
+        try {
+          await this.invalidatePendingEntry(trade, price, now)
+        } catch (e) {
+          this.log(`pending-entry geometry check failed ${trade.symbol}: ${(e as Error).message}`)
+        }
+      }
+    }
+
+    // Recompute holdings AFTER the geometry pass: a raced fill above the stop promotes
+    // a pending trade to a valid open one (managed this same tick), and an invalid one
+    // has already been flattened/closed by the guard.
+    const holding = this.trades.filter(t => t.state === 'open' && t.openQty > 0)
+    if (holding.length === 0 && !needsPostClose) { this.persist(); return }
 
     const etMinute = etMinutesOfDay(now)
     for (const trade of holding) {
@@ -542,6 +575,65 @@ export class PaperExecutor {
         appendEvent({ event: 'entry_timeout', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id, limitPrice: trade.limitPrice })
       }
     }
+  }
+
+  /**
+   * PENDING-ENTRY GEOMETRY INVALIDATION. A long entry is still working at the broker,
+   * but the live market has already reached/crossed the trade's ORIGINAL stop — the
+   * plan is invalidated before we're even filled (the Session-9 CHPT race: the entry
+   * order rested ~93s while price moved through the stop, then filled below it). Cancel
+   * the working entry so we don't buy into an already-dead setup, then reconcile broker
+   * truth. A fill that raced the cancel is NEVER disowned: it's booked and handed to the
+   * existing post-fill geometry guard (bookEntryFill), which flattens invalid geometry.
+   * Broker-truth-first throughout — cancellation is best-effort; getOrder is authoritative.
+   *
+   * Idempotent: the ENTRY_GEOMETRY_INVALIDATED marker makes the cancel + audit fire once;
+   * a repeat tick (order not yet acknowledged) only re-reads broker truth.
+   */
+  private async invalidatePendingEntry(trade: PaperTrade, price: number, now: number): Promise<void> {
+    if (!trade.entryOrderId) { trade.state = 'aborted'; return }
+    const marker = 'ENTRY_GEOMETRY_INVALIDATED'
+    if (!trade.executionWarnings.some(w => w.startsWith(marker))) {
+      trade.executionWarnings.push(`${marker}: price ${price} <= stop ${trade.initialStop} while pending (intended ${trade.intendedEntry})`)
+      this.touch(trade, `${marker} — cancelling pending entry`)
+      this.log(`ENTRY GEOMETRY INVALID ${trade.symbol} — price ${price.toFixed(4)} <= stop ${trade.initialStop.toFixed(4)}; cancelling pending entry ${trade.entryOrderId}`)
+      appendEvent({
+        event: 'entry_geometry_invalidated',
+        symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id,
+        currentPrice: price, initialStop: trade.initialStop, intendedEntry: trade.intendedEntry,
+        entryOrderId: trade.entryOrderId, timestamp: now,
+      })
+      // Best-effort cancel: the getOrder below, not this call, decides what happened.
+      try { await this.broker.cancelOrder(trade.entryOrderId) } catch { /* reconcile below is authoritative */ }
+    }
+
+    // Reconcile broker truth — a partial/full fill may have raced the cancellation.
+    const order = await this.broker.getOrder(trade.entryOrderId)
+    if (!order) return   // transient read failure — stays pending, retried next tick
+
+    if (order.filledQty > 0) {
+      // CASE B/C: shares filled despite the cancel. Book the ACTUAL fill (never a lost
+      // quantity); the post-fill geometry guard inside bookEntryFill flattens it if the
+      // fill is at/below the stop, or carries it as a valid open position if somehow above.
+      await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
+      // Cancel any unfilled remainder of a partial (handleInvalidPostFillGeometry also
+      // sweeps the symbol's open orders; this is a harmless, idempotent belt-and-braces).
+      if (order.status !== 'filled') { try { await this.broker.cancelOrder(trade.entryOrderId) } catch { /* best-effort */ } }
+      return
+    }
+
+    if (order.status === 'canceled' || order.status === 'rejected' || order.status === 'expired') {
+      // CASE A: broker confirms no fill — clean abort, no position.
+      trade.state = 'aborted'
+      this.touch(trade, `entry aborted on geometry invalidation (${order.status}, unfilled)`)
+      appendEvent({
+        event: 'entry_aborted', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id,
+        status: order.status, reason: 'geometry_invalidated',
+      })
+      return
+    }
+    // Still working (cancel not yet acknowledged, nothing filled) — stay pending; the
+    // next tick re-checks broker truth without re-issuing the cancel or the audit event.
   }
 
   private async bookEntryFill(trade: PaperTrade, qty: number, price: number, now: number): Promise<void> {

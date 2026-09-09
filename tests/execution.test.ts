@@ -12,11 +12,11 @@ import type { BuySignalRecord } from '@/types'
 
 // The store writes to $HOME; keep tests off the real filesystem. `loaded` lets a test
 // preload trades that init()'s loadTrades() should return (for startup reconciliation).
-const mockStore = vi.hoisted(() => ({ loaded: [] as unknown[] }))
+const mockStore = vi.hoisted(() => ({ loaded: [] as unknown[], events: [] as Array<Record<string, unknown>> }))
 vi.mock('@/lib/execution/store', () => ({
   loadTrades: () => mockStore.loaded,
   saveTrades: () => {},
-  appendEvent: () => {},
+  appendEvent: (e: Record<string, unknown>) => { mockStore.events.push(e) },
   isHalted: () => false,
   haltFile: () => '/tmp/.companion-halt',
   etDayKey: () => '2026-08-07',
@@ -310,6 +310,12 @@ class FakeBroker implements Broker {
   /** When set, the NEXT sell/stop rejects with this exact message (one-shot). Models
    *  Alpaca's "cannot be sold short" / "stop price must be less than current price". */
   rejectNextSellWith: string | null = null
+  /** One-shot: a cancelOrder on a still-open BUY loses the race and the broker fills it
+   *  instead (models the Session-9 CHPT fill that raced our cancellation). */
+  raceFill: { price?: number; qty?: number; status?: BrokerOrder['status'] } | null = null
+  /** cancelOrder is recorded but does NOT change status — models a cancel request the
+   *  broker hasn't acknowledged yet (the order is still working after we asked). */
+  ignoreCancel = false
   private seq = 0
 
   async getAccount() {
@@ -460,7 +466,21 @@ class FakeBroker implements Broker {
   async cancelOrder(id: string) {
     this.canceled.push(id)
     const o = this.orders.get(id)
-    if (o && o.status === 'open') o.status = 'canceled'
+    if (!o) return
+    if (this.ignoreCancel) return          // request unacknowledged — order stays working
+    // A cancel that loses the race: the broker completes (part of) the buy instead.
+    if (o.side === 'buy' && o.status === 'open' && this.raceFill) {
+      const rf = this.raceFill
+      this.raceFill = null                 // one-shot
+      const fq = rf.qty ?? o.qty
+      o.filledQty = fq
+      o.filledAvgPrice = rf.price ?? o.limitPrice
+      o.status = rf.status ?? (fq >= o.qty ? 'filled' : 'partially_filled')
+      this.held.set(o.symbol, (this.held.get(o.symbol) ?? 0) + fq)
+      this.fills.push({ symbol: o.symbol, side: 'buy', qty: fq, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
+      return
+    }
+    if (o.status === 'open') o.status = 'canceled'
   }
 
   async cancelOpenOrders(symbol: string) {
@@ -490,6 +510,7 @@ describe('PaperExecutor', () => {
     broker = new FakeBroker()
     price = 10
     mockStore.loaded = []
+    mockStore.events = []
   })
   afterEach(() => { vi.useRealTimers() })
 
@@ -913,6 +934,236 @@ describe('PaperExecutor', () => {
       const ex = build(); await ex.init()
       expect(ex.isReconciliationUnresolved()).toBe(true)
       expect((await ex.onSignal(signal(), { sessionVolume: 10_000_000 })).taken).toBe(false)
+    })
+  })
+
+  // ── Pending-entry geometry invalidation (Session-9 CHPT race) ───────────────
+  // A working long entry must be cancelled once the live market reaches/crosses its
+  // ORIGINAL stop BEFORE the broker fills — without ever disowning a fill that races
+  // the cancel. The 90s entry timeout is a SEPARATE, unchanged mechanism.
+  describe('pending-entry geometry invalidation', () => {
+    /** Submit a signal and leave its entry genuinely working at the broker (unfilled). */
+    const armPending = async () => {
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      const t = ex.allTrades()[0]
+      broker.neverFill.add(t.entryOrderId!)   // broker has NOT filled it yet
+      return { ex, t }
+    }
+
+    it('TEST 1 — price ABOVE stop: entry stays pending, nothing cancelled', async () => {
+      const { ex, t } = await armPending()
+      price = 9.6                             // above the 9.5 stop
+      await ex.tick()
+      expect(t.state).toBe('pending_entry')
+      expect(broker.canceled).toEqual([])
+      expect(t.executionWarnings.some(w => w.startsWith('ENTRY_GEOMETRY_INVALIDATED'))).toBe(false)
+      expect(mockStore.events.some(e => e.event === 'entry_geometry_invalidated')).toBe(false)
+    })
+
+    it('TEST 2 — price AT stop: cancel requested, aborts on broker no-fill, event emitted', async () => {
+      const { ex, t } = await armPending()
+      const orderId = t.entryOrderId!
+      price = 9.5                             // exactly the stop → invalidated
+      await ex.tick()
+      expect(broker.canceled).toContain(orderId)
+      expect(t.state).toBe('aborted')
+      expect(t.openQty).toBe(0)
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+      expect(mockStore.events.some(e => e.event === 'entry_geometry_invalidated')).toBe(true)
+    })
+
+    it('TEST 3 — price BELOW stop: same safety-cancel abort path', async () => {
+      const { ex, t } = await armPending()
+      const orderId = t.entryOrderId!
+      price = 9.2                             // through the stop
+      await ex.tick()
+      expect(broker.canceled).toContain(orderId)
+      expect(t.state).toBe('aborted')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+    })
+
+    it('TEST 4 — cancel loses race, broker reports FULL fill: booked, post-fill guard flattens, no lost qty', async () => {
+      const { ex, t } = await armPending()
+      broker.raceFill = { price: 9.4, status: 'filled' }   // full 1000 fills below stop as we cancel
+      price = 9.4
+      await ex.tick()
+      expect(t.entryFillQty).toBe(1000)                                              // fill NOT disowned
+      expect(t.executionWarnings.some(w => w.startsWith('INVALID_POST_FILL_GEOMETRY'))).toBe(true)
+      expect(t.exits.some(l => l.reason === 'invalid_geometry')).toBe(true)
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)                                   // flattened, nothing stranded
+      expect(mockStore.events.some(e => e.event === 'entry_geometry_invalidated')).toBe(true)
+    })
+
+    it('TEST 5 — cancel loses race, broker reports PARTIAL fill: partial booked+flattened, remainder cancelled', async () => {
+      const { ex, t } = await armPending()
+      broker.raceFill = { price: 9.4, qty: 700, status: 'partially_filled' }   // 700/1000 below stop
+      price = 9.4
+      await ex.tick()
+      expect(t.entryFillQty).toBe(700)                                          // only the 700 that filled
+      const invalidLegs = t.exits.filter(l => l.reason === 'invalid_geometry')
+      expect(invalidLegs).toHaveLength(1)
+      expect(invalidLegs[0].qty).toBe(700)
+      expect(broker.canceled.length).toBeGreaterThan(0)                         // remainder cancelled
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)                             // 700 flattened, nothing stranded
+    })
+
+    it('TEST 6 — normal entry fill ABOVE stop: unchanged, no geometry action', async () => {
+      const ex = build()
+      await ex.init()
+      await ex.onSignal(signal(), { sessionVolume: 10_000_000 })
+      price = 10.05                            // fills at the limit, well above the 9.5 stop
+      await ex.tick()
+      const t = ex.allTrades()[0]
+      expect(t.state).toBe('open')
+      expect(t.openQty).toBe(1000)
+      expect(broker.canceled).toEqual([])
+      expect(t.executionWarnings.some(w => w.startsWith('ENTRY_GEOMETRY_INVALIDATED'))).toBe(false)
+      expect(mockStore.events.some(e => e.event === 'entry_geometry_invalidated')).toBe(false)
+    })
+
+    it('TEST 7 — existing 90s timeout with zero fill: unchanged abort (not a geometry cancel)', async () => {
+      const { ex, t } = await armPending()
+      const orderId = t.entryOrderId!
+      price = 9.6                              // ABOVE stop, so geometry never fires
+      await ex.tick()
+      expect(t.state).toBe('pending_entry')
+      vi.setSystemTime(REGULAR_HOURS + DEFAULT_EXECUTOR.entryTimeoutMs + 1_000)
+      await ex.tick()
+      expect(t.state).toBe('aborted')
+      expect(broker.canceled).toContain(orderId)
+      expect(mockStore.events.some(e => e.event === 'entry_timeout')).toBe(true)
+      expect(mockStore.events.some(e => e.event === 'entry_geometry_invalidated')).toBe(false)
+    })
+
+    it('TEST 8 — completed fill slightly AFTER 90s is still honored, never ignored', async () => {
+      const { ex, t } = await armPending()
+      const orderId = t.entryOrderId!
+      price = 10.05                            // above stop → geometry never fires
+      await ex.tick()
+      expect(t.state).toBe('pending_entry')
+      // The broker now reports the entry filled, and we look only after the timeout.
+      broker.neverFill.delete(orderId)
+      vi.setSystemTime(REGULAR_HOURS + DEFAULT_EXECUTOR.entryTimeoutMs + 5_000)
+      await ex.tick()
+      expect(t.state).toBe('open')             // fill honored despite crossing the timeout
+      expect(t.entryFillQty).toBe(1000)
+      expect(t.entryFillPrice).toBeCloseTo(10.05)
+    })
+
+    it('TEST 9 — repeated ticks after invalidation: no duplicate cancel, no duplicate flatten', async () => {
+      const { ex, t } = await armPending()
+      const orderId = t.entryOrderId!
+      price = 9.3
+      await ex.tick()
+      expect(t.state).toBe('aborted')
+      const cancelsAfterFirst = broker.canceled.filter(id => id === orderId).length
+      const eventsAfterFirst = mockStore.events.filter(e => e.event === 'entry_geometry_invalidated').length
+      await ex.tick(); await ex.tick()         // aborted trades are no longer live — must be inert
+      expect(broker.canceled.filter(id => id === orderId).length).toBe(cancelsAfterFirst)
+      expect(mockStore.events.filter(e => e.event === 'entry_geometry_invalidated').length).toBe(eventsAfterFirst)
+    })
+
+    it('TEST 10 — audit event carries setupId/tradeId and full geometry for forensics', async () => {
+      const { ex, t } = await armPending()
+      price = 9.45
+      await ex.tick()
+      const ev = mockStore.events.find(e => e.event === 'entry_geometry_invalidated')!
+      expect(ev).toBeTruthy()
+      expect(ev.symbol).toBe('TEST')
+      expect(ev.setupId).toBe(t.setupId)
+      expect(ev.tradeId).toBe(t.id)
+      expect(ev.currentPrice).toBeCloseTo(9.45)
+      expect(ev.initialStop).toBeCloseTo(9.5)
+      expect(ev.intendedEntry).toBeCloseTo(10)
+      expect(ev.entryOrderId).toBeTruthy()
+      expect(typeof ev.timestamp).toBe('number')
+    })
+
+    it('TEST 11 — cancel unacknowledged, fill lands a LATER tick: event once, no cancel spam, fill booked once', async () => {
+      const { ex, t } = await armPending()
+      const orderId = t.entryOrderId!
+      broker.ignoreCancel = true               // broker keeps the order working after our cancel
+      price = 9.4                              // through the stop
+      await ex.tick()                          // tick 1: geometry event + cancel request, order still working
+      expect(t.state).toBe('pending_entry')    // not aborted — broker hasn't confirmed a terminal state
+      expect(mockStore.events.filter(e => e.event === 'entry_geometry_invalidated')).toHaveLength(1)
+      const cancelsAfterTick1 = broker.canceled.filter(id => id === orderId).length
+
+      broker.ignoreCancel = false
+      broker.neverFill.delete(orderId)         // broker now acts on the order
+      broker.buyFill = { price: 9.4 }          // tick 2: broker reports the full fill (below stop)
+      await ex.tick()
+
+      // Geometry event fired exactly once (marker suppressed the re-issue), cancel not spammed.
+      expect(mockStore.events.filter(e => e.event === 'entry_geometry_invalidated')).toHaveLength(1)
+      expect(broker.canceled.filter(id => id === orderId).length).toBe(cancelsAfterTick1)
+      // The raced fill was booked exactly once and the post-fill guard flattened it.
+      expect(t.entryFillQty).toBe(1000)
+      expect(t.exits.filter(l => l.reason === 'invalid_geometry')).toHaveLength(1)
+      expect(t.state).toBe('closed')
+      expect(broker.held.get('TEST') ?? 0).toBe(0)   // nothing stranded, nothing double-flattened
+    })
+
+    it('TEST 12 — raced fill ABOVE stop while current price ≤ stop: opened AND stopped out the SAME tick', async () => {
+      const { ex, t } = await armPending()
+      broker.raceFill = { price: 9.6, status: 'filled' }   // fills above the 9.5 stop as we cancel
+      price = 9.4                                          // but the live feed is already below the stop
+      await ex.tick()
+      // Valid fill (9.6 > 9.5) → opened, then decideExit sees price 9.4 ≤ stop → exits, all in ONE tick.
+      expect(t.entryFillPrice).toBeCloseTo(9.6)
+      expect(t.plannedRisk).toBeGreaterThan(0)             // a valid position, not invalid-geometry
+      expect(t.state).toBe('closed')
+      expect(t.exits.some(l => l.reason === 'stop')).toBe(true)
+      expect(t.exits.some(l => l.reason === 'invalid_geometry')).toBe(false)
+      expect(broker.held.get('TEST') ?? 0).toBe(0)
+    })
+
+    // ── Step-5 accounting-interaction: the geometry safety path must respect the
+    //    Step-3 idempotent terminal accounting (terminalBooked / closeCount / one trade_closed).
+    it('TEST 13 (accounting) — race fill below stop → flatten books exactly ONE terminal record with correct P&L', async () => {
+      const { ex, t } = await armPending()
+      broker.raceFill = { price: 9.4, status: 'filled' }   // full fill below stop as we cancel
+      price = 9.4
+      await ex.tick()
+      expect(t.state).toBe('closed')
+      expect(t.terminalBooked).toBe(true)
+      expect(t.closeCount).toBe(1)
+      expect(t.fullyClosed).toBe(true)
+      expect(t.realizedPnl).not.toBeNull()                 // P&L booked from real fills, never null-swallowed
+      expect(mockStore.events.filter(e => e.event === 'trade_closed')).toHaveLength(1)   // exactly once
+    })
+
+    it('TEST 14 (accounting) — repeated ticks after a race-fill close never double-emit terminal accounting', async () => {
+      const { ex, t } = await armPending()
+      broker.raceFill = { price: 9.4, status: 'filled' }
+      price = 9.4
+      await ex.tick()
+      const pnl = t.realizedPnl
+      await ex.tick(); await ex.tick()                     // idempotent across further ticks
+      expect(mockStore.events.filter(e => e.event === 'trade_closed')).toHaveLength(1)
+      expect(t.realizedPnl).toBe(pnl)
+      expect(t.closeCount).toBe(1)
+    })
+
+    it('TEST 15 (restart) — a race-fill-closed trade reloaded from persistence does not re-emit terminal accounting', async () => {
+      const { ex, t } = await armPending()
+      broker.raceFill = { price: 9.4, status: 'filled' }
+      price = 9.4
+      await ex.tick()
+      expect(t.state).toBe('closed')
+      // Simulate a process restart: serialize the trade, reload it into a fresh executor.
+      const reloaded = JSON.parse(JSON.stringify(t))
+      expect(reloaded.terminalBooked).toBe(true)
+      mockStore.loaded = [reloaded]
+      mockStore.events = []
+      const ex2 = build()
+      await ex2.init()
+      await ex2.tick(); await ex2.tick()
+      expect(mockStore.events.filter(e => e.event === 'trade_closed')).toHaveLength(0)   // no duplicate on restart
     })
   })
 
