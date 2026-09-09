@@ -6,6 +6,11 @@ import { useEodResolution } from '@/hooks/useEodResolution'
 import { dataAge } from '@/lib/market-hours'
 import { GRADE_DESCRIPTIONS } from '@/lib/scoring-matrix'
 import {
+  groupSetupsByTicker, filterSetupTickers, triggeredSetupTickers,
+  summarizeSetupTickers, setupSummaryText, eventsForTicker, unreadForTicker,
+  SIGNAL_STATE_FILTERS, type SignalStateFilter, type TickerSetupGroup,
+} from '@/lib/signal-views'
+import {
   SETUP_TYPE_LABELS, SETUP_STATE_LABELS,
   PATTERN_LABELS,
   type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType, type BuySignalRecord, type PatternHit,
@@ -471,6 +476,17 @@ function RoadmapRow({ l, side, idx }: { l: import('@/types').RoadmapLevel; side:
 }
 
 // ── Signals ─────────────────────────────────────────────────────────────────
+//
+// A live decision surface. Three views, with a deliberate source split:
+//   Active     — one card per ticker from the LIVE `monitoredSetups` (current,
+//                rebuilt each sweep); collapses multiple setups to one primary
+//                and expands to the rest + that ticker's event history
+//   Triggered  — tickers whose current setup state is triggered (live setups)
+//   History    — the raw `monitorAlerts` chronological log (audit, unchanged)
+// The grouping/filter/summary math lives in lib/signal-views.ts (pure, tested).
+// This component only renders; it changes no strategy, alert, or persistence
+// logic. Read/unread behaviour is preserved: rows never mark events read on
+// click — only the explicit "Mark all read" action does.
 
 const KIND_COLOR: Record<MonitorAlert['kind'], string> = {
   take_profit: 'border-l-emerald-300',
@@ -482,20 +498,226 @@ const KIND_COLOR: Record<MonitorAlert['kind'], string> = {
   score_upgrade: 'border-l-purple-400',
 }
 
-function SignalsTab({ onPick }: { onPick: () => void }) {
+// Restrained left-accent per lifecycle state (badge already carries the colour).
+const STATE_ACCENT: Record<SetupState, string> = {
+  identified: 'border-l-gray-600',
+  approaching: 'border-l-blue-400',
+  at_level: 'border-l-cyan-400',
+  confirming: 'border-l-yellow-400',
+  triggered: 'border-l-emerald-400',
+  failed: 'border-l-red-400',
+  expired: 'border-l-gray-700',
+}
+
+type SignalsView = 'active' | 'triggered' | 'history'
+
+export function SignalsTab({ onPick }: { onPick: () => void }) {
+  const [view, setView] = useState<SignalsView>('active')
   const alerts = useTradingStore(s => s.monitorAlerts)
-  const selectSymbol = useTradingStore(s => s.selectSymbol)
   const clear = useTradingStore(s => s.clearMonitorAlerts)
   const markAll = useTradingStore(s => s.markAllMonitorAlertsRead)
+  const unread = useMemo(() => alerts.reduce((n, a) => n + (a.read ? 0 : 1), 0), [alerts])
+
+  const VIEWS: { id: SignalsView; label: string }[] = [
+    { id: 'active', label: 'Active' },
+    { id: 'triggered', label: 'Triggered' },
+    { id: 'history', label: 'History' },
+  ]
 
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
-        <span className="text-[11px] text-gray-500">{alerts.length} signals · newest first</span>
-        <div className="flex gap-2">
-          <button onClick={markAll} className="text-[11px] text-gray-500 hover:text-gray-300">Mark all read</button>
-          <button onClick={clear} className="text-[11px] text-gray-500 hover:text-gray-300">Clear</button>
+        <div className="flex items-center gap-1">
+          {VIEWS.map(v => (
+            <button key={v.id} onClick={() => setView(v.id)}
+              className={`text-[11px] px-2.5 py-1 rounded transition-colors ${
+                view === v.id ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300 hover:bg-gray-800'
+              }`}>
+              {v.label}
+            </button>
+          ))}
         </div>
+        <div className="flex items-center gap-2">
+          {unread > 0 && <span className="text-[11px] text-gray-600">{unread} unread</span>}
+          <button onClick={markAll} disabled={!alerts.length} className="text-[11px] text-gray-500 hover:text-gray-300 disabled:opacity-40">Mark all read</button>
+          <button onClick={clear} disabled={!alerts.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
+        </div>
+      </div>
+
+      {view === 'active' && <ActiveSignals alerts={alerts} onPick={onPick} />}
+      {view === 'triggered' && <TriggeredSignals alerts={alerts} onPick={onPick} />}
+      {view === 'history' && <SignalHistory alerts={alerts} onPick={onPick} />}
+    </div>
+  )
+}
+
+// ── Active: one current ticker card (live setups), filterable, expandable ────
+//
+// Source of truth is the LIVE `monitoredSetups` (rebuilt every sweep), NOT the
+// alert log — so a ticker only appears while it has a current setup. The
+// expandable event history below each card still comes from `monitorAlerts`.
+
+function ActiveSignals({ alerts, onPick }: { alerts: MonitorAlert[]; onPick: () => void }) {
+  const setups = useTradingStore(s => s.monitoredSetups)
+  const roadmaps = useTradingStore(s => s.roadmaps)
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+  const [filter, setFilter] = useState<SignalStateFilter>('all')
+
+  const rows = useMemo(() => groupSetupsByTicker(setups), [setups])
+  const summary = useMemo(() => summarizeSetupTickers(rows), [rows])
+  const shown = useMemo(() => filterSetupTickers(rows, filter), [rows, filter])
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-800 flex-wrap">
+        {SIGNAL_STATE_FILTERS.map(f => (
+          <button key={f.key} onClick={() => setFilter(f.key)}
+            className={`text-[11px] px-2 py-0.5 rounded ${filter === f.key ? 'bg-gray-700 text-white' : 'bg-gray-900 text-gray-500 hover:text-gray-300'}`}>
+            {f.label}
+          </button>
+        ))}
+        <span className="ml-auto text-[11px] text-gray-500">{setupSummaryText(summary)}</span>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        {rows.length === 0 ? (
+          <div className="text-center text-gray-600 text-sm py-16">No active setups right now. Tickers appear here while the engine has a live setup on them — the History tab keeps every past signal event.</div>
+        ) : shown.length === 0 ? (
+          <div className="text-center text-gray-600 text-sm py-16">No {filter} setups right now.</div>
+        ) : (
+          shown.map(row => (
+            <TickerSetupCard key={row.symbol} group={row} price={roadmaps[row.symbol]?.currentPrice ?? null}
+              events={eventsForTicker(alerts, row.symbol)} unread={unreadForTicker(alerts, row.symbol)}
+              onOpen={() => { selectSymbol(row.symbol); onPick() }} />
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+function TriggeredSignals({ alerts, onPick }: { alerts: MonitorAlert[]; onPick: () => void }) {
+  const setups = useTradingStore(s => s.monitoredSetups)
+  const roadmaps = useTradingStore(s => s.roadmaps)
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+  const rows = useMemo(() => triggeredSetupTickers(groupSetupsByTicker(setups)), [setups])
+  return (
+    <div className="flex-1 overflow-y-auto">
+      {rows.length === 0 ? (
+        <div className="text-center text-gray-600 text-sm py-16">Nothing triggered right now. Tickers appear here the moment a current setup reaches the triggered state.</div>
+      ) : (
+        rows.map(row => (
+          <TickerSetupCard key={row.symbol} group={row} price={roadmaps[row.symbol]?.currentPrice ?? null}
+            events={eventsForTicker(alerts, row.symbol)} unread={unreadForTicker(alerts, row.symbol)}
+            onOpen={() => { selectSymbol(row.symbol); onPick() }} />
+        ))
+      )}
+    </div>
+  )
+}
+
+function TickerSetupCard({ group, price, events, unread, onOpen }: {
+  group: TickerSetupGroup; price: number | null; events: MonitorAlert[]; unread: number; onOpen: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const s = group.primary
+  const trigger = s.confirmation[0] ?? s.signal.triggerCondition
+  const dp = (price ?? s.zoneMidpoint) < 1 ? 3 : 2
+  const others = group.setups.length - 1
+  const canExpand = group.setups.length > 1 || events.length > 0
+  // Collapsed control label — names exactly what expansion reveals.
+  const expandLabel = [
+    others > 0 ? `${others} more setup${others > 1 ? 's' : ''}` : null,
+    events.length > 0 ? `signal history (${events.length})` : null,
+  ].filter(Boolean).join(' · ')
+
+  return (
+    <div className={`border-b border-gray-800/50 border-l-2 ${STATE_ACCENT[s.state]}`}>
+      <div className="w-full flex items-stretch">
+        <button onClick={onOpen} className="flex-1 text-left px-4 py-2.5 hover:bg-gray-800/40 min-w-0">
+          {/* Header: ticker · direction · state · score/grade · type */}
+          <div className="flex items-center gap-2 mb-1 min-w-0">
+            {unread > 0 && <span className="w-1.5 h-1.5 rounded-full bg-blue-400 flex-shrink-0" title={`${unread} unread event${unread > 1 ? 's' : ''}`} />}
+            <span className="text-sm font-bold text-white">{group.symbol}</span>
+            <span className={`text-[11px] ${s.direction === 'long' ? 'text-green-400' : 'text-red-400'}`}>{s.direction === 'long' ? '▲' : '▼'}</span>
+            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${STATE_COLOR[s.state]}`}>{SETUP_STATE_LABELS[s.state]}</span>
+            <span className="text-[11px] text-gray-400 tabular-nums">{s.score}<span className="text-gray-600"> · {s.grade === 'below' ? '<C' : s.grade}</span></span>
+            <span className="text-[10px] text-gray-500 truncate">{SETUP_TYPE_LABELS[s.type]}</span>
+          </div>
+
+          {/* Current price (live, from the roadmap) */}
+          <div className="text-lg font-bold text-white leading-tight tabular-nums">{price != null ? `$${fmt(price, dp)}` : '—'}</div>
+
+          {/* Trigger (structured, from confirmation[0]) */}
+          {trigger && <div className="text-xs text-gray-300 leading-snug mt-0.5">{trigger}</div>}
+
+          {/* Stop / zone */}
+          <div className="flex items-center gap-3 text-[11px] mt-1 min-w-0">
+            <span className="text-red-400/90">Stop ${fmt(s.invalidation, dp)}</span>
+            <span className="text-gray-600">Zone ${fmt(s.zoneLower, dp)}–${fmt(s.zoneUpper, dp)}</span>
+          </div>
+        </button>
+      </div>
+
+      {/* Expand toggle — obvious labeled control; separate button, never marks read */}
+      {canExpand && (
+        <button
+          onClick={() => setExpanded(e => !e)}
+          className="w-full text-left px-4 pb-2 -mt-0.5 text-[11px] text-gray-500 hover:text-gray-300 flex items-center gap-1.5"
+        >
+          <span className="inline-flex items-center justify-center w-4 h-4 rounded bg-gray-800/80 text-gray-400 text-[10px] leading-none">{expanded ? '▴' : '▾'}</span>
+          <span>{expanded ? 'Hide current setups & signal history' : expandLabel}</span>
+        </button>
+      )}
+
+      {expanded && (
+        <div className="px-4 pb-2.5 pt-0.5 bg-gray-900/40 space-y-2.5">
+          {/* Current setups — the live picture (all of this ticker's setups) */}
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Current setups ({group.setups.length})</div>
+            <div className="space-y-1">
+              {group.setups.map(su => (
+                <div key={su.id} className="grid grid-cols-[1fr_5.5rem_2.5rem] gap-2 items-baseline text-[11px]">
+                  <span className="text-gray-300 truncate">
+                    <span className={su.direction === 'long' ? 'text-green-400' : 'text-red-400'}>{su.direction === 'long' ? '▲' : '▼'}</span>{' '}
+                    {SETUP_TYPE_LABELS[su.type]}
+                  </span>
+                  <span className={`px-1 rounded justify-self-start ${STATE_COLOR[su.state]}`}>{SETUP_STATE_LABELS[su.state]}</span>
+                  <span className="text-gray-400 text-right tabular-nums">{su.score}{su.grade !== 'below' ? ` ${su.grade}` : ''}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Event history — the chronological audit log for this ticker (separate concept) */}
+          {events.length > 0 && (
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Signal history ({events.length})</div>
+              <div className="space-y-1">
+                {events.map(ev => (
+                  <div key={ev.id} className={`grid grid-cols-[3.5rem_5.5rem_1fr] gap-2 items-baseline text-[11px] ${ev.read ? 'opacity-70' : ''}`}>
+                    <span className="text-gray-600 tabular-nums">{dataAge(ev.timestamp)}</span>
+                    <span className={`px-1 rounded justify-self-start ${STATE_COLOR[ev.state]}`}>{SETUP_STATE_LABELS[ev.state]}</span>
+                    <span className="text-gray-400 truncate" title={ev.confirmation[0] ?? ev.body}>{ev.confirmation[0] ?? ev.body}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── History: the raw chronological event log (audit trail) ───────────────────
+
+function SignalHistory({ alerts, onPick }: { alerts: MonitorAlert[]; onPick: () => void }) {
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+  return (
+    <div className="flex-1 flex flex-col min-h-0">
+      <div className="px-4 py-1.5 border-b border-gray-800">
+        <span className="text-[11px] text-gray-500">{alerts.length} events · newest first · repeats per ticker are the audit trail</span>
       </div>
       <div className="flex-1 overflow-y-auto">
         {alerts.length === 0 && <div className="text-center text-gray-600 text-sm py-16">No signals yet.</div>}
