@@ -229,8 +229,19 @@ export interface PaperTrade {
   realizedPnl: number | null
   /** Realized return on the filled entry notional, comparable to BuySignalRecord.pnlPct. */
   realizedPnlPct: number | null
-  /** False when shares were still held at the flatten (marked out, not a clean exit). */
+  /** True once local openQty has reached 0 — i.e. the position is locally FLAT.
+   *  (Whether the exit was clean vs marked-out at the close is recoverable from the
+   *  exit-leg reasons; broker-verified flatness is tracked separately in
+   *  reconciliationStatus/brokerVerifiedQty.) */
   fullyClosed: boolean
+  /** Idempotency guard: set true the first time terminal accounting (realized P&L +
+   *  `trade_closed`) is booked, so repeated close/reconcile paths never double-emit or
+   *  double-count. Reset only when a trade is genuinely reopened by a late broker fill. */
+  terminalBooked: boolean
+  /** How many distinct terminal close episodes this trade has had. 1 for a normal close;
+   *  >1 only when a late broker fill reopened it and it closed again — stamped into
+   *  `trade_closed` so a re-close is never an indistinguishable duplicate. */
+  closeCount: number
 
   createdAt: number
   updatedAt: number
@@ -295,6 +306,8 @@ export function newPaperTrade(
     realizedPnl: null,
     realizedPnlPct: null,
     fullyClosed: false,
+    terminalBooked: false,
+    closeCount: 0,
     createdAt: now,
     updatedAt: now,
     notes: [],

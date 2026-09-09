@@ -18,7 +18,7 @@
 import type { BuySignalRecord } from '@/types'
 import { getSessionType, etMinutesOfDay } from '@/lib/market-hours'
 
-import type { Broker, PaperTrade, ExitReason, ExitLeg, BrokerPosition } from './types'
+import type { Broker, PaperTrade, ExitReason, ExitLeg, BrokerPosition, BrokerOrderStatus } from './types'
 import { newPaperTrade, computeRealized } from './types'
 import { sizePosition, entryLimitPrice, exitLimitPrice, DEFAULT_SIZING, type SizingConfig } from './sizing'
 import { canOpenPosition, DEFAULT_RISK, type RiskConfig } from './risk'
@@ -60,6 +60,11 @@ export interface ExitDecision {
   qty: number
   /** The level that triggered the exit — what the backtest would book. */
   intendedPrice: number
+}
+
+/** A broker order in one of these states will never fill further — safe to stop polling. */
+function isTerminalOrder(status: BrokerOrderStatus): boolean {
+  return status === 'filled' || status === 'canceled' || status === 'rejected' || status === 'expired'
 }
 
 /**
@@ -435,7 +440,7 @@ export class PaperExecutor {
     // trade still pending verification — needs post-close reconciliation even on an
     // otherwise-flat book, because a cancelled entry can fill late at the broker (the
     // 2971c26 residual race). So don't short-circuit the tick when only such trades remain.
-    const needsPostClose = this.trades.some(t => t.state === 'closed' && (t.reconciliationStatus === 'pending' || !(t.plannedRisk > 0)))
+    const needsPostClose = this.trades.some(t => t.state === 'closed' && (t.reconciliationStatus === 'pending' || t.reconciliationStatus === 'discrepancy' || !(t.plannedRisk > 0)))
     if (live.length === 0 && !needsPostClose) return
 
     for (const trade of live) {
@@ -494,7 +499,10 @@ export class PaperExecutor {
       // late fill promotes it back to open (reconcile), and a broker that stays flat is
       // a harmless no-op. Narrow: only invalid trades poll, and they are rare.
       const invalidResidualWatch = !(trade.plannedRisk > 0)
-      if (trade.state === 'closed' && (trade.reconciliationStatus === 'pending' || invalidResidualWatch)) {
+      // A `discrepancy` is retried too, so a temporary local/broker mismatch that later
+      // agrees resolves to verified instead of staying stuck (defect E/F). manual_review
+      // is intentionally NOT retried — it needs human resolution.
+      if (trade.state === 'closed' && (trade.reconciliationStatus === 'pending' || trade.reconciliationStatus === 'discrepancy' || invalidResidualWatch)) {
         try { await this.reconcile(trade, now) } catch { /* leave pending; retried next tick */ }
       }
     }
@@ -636,15 +644,22 @@ export class PaperExecutor {
   /** Settle working exit legs and the protective stop against the broker. */
   private async reconcileExits(trade: PaperTrade): Promise<void> {
     for (const leg of trade.exits) {
-      if (leg.fillPrice != null || !leg.orderId) continue
+      // Keep polling a leg while its order is still live — NOT only until the first
+      // partial. A stop that fills 88 then 532 (cumulative) must have all 532 booked;
+      // stopping at the first partial (the ZETA/BIAF defect) stranded the residual
+      // (it belonged to the same order, so bookExternalClose excluded it as "ours").
+      if (!leg.orderId) continue
       const order = await this.broker.getOrder(leg.orderId)
       if (!order) continue
       if (order.filledQty > 0 && order.filledAvgPrice != null) {
+        // filledQty is CUMULATIVE — bookExitFill books only the increment.
         this.bookExitFill(trade, leg, order.filledQty, order.filledAvgPrice)
-      } else if (order.status === 'canceled' || order.status === 'rejected' || order.status === 'expired') {
-        // The leg died without filling — drop it so the level can re-trigger.
+      }
+      if (isTerminalOrder(order.status)) {
+        // No further fills possible — stop polling this leg. A leg that never filled
+        // is dropped below so the level can re-trigger.
         leg.orderId = null
-        this.touch(trade, `exit leg ${leg.reason} ${order.status}, will retry`)
+        if (order.filledQty <= 0) this.touch(trade, `exit leg ${leg.reason} ${order.status}, will retry`)
       }
     }
 
@@ -654,14 +669,17 @@ export class PaperExecutor {
         const leg: ExitLeg = {
           // A broker-side stop fires without us observing a price, so there is no
           // decision price — the gap/concession split doesn't apply to this path.
-          qty: stopOrder.filledQty, reason: 'stop', intendedPrice: trade.currentStop,
+          qty: 0, reason: 'stop', intendedPrice: trade.currentStop,
           decisionPrice: null,
           orderId: stopOrder.id, fillPrice: null, filledAt: null, slippagePct: null,
         }
         trade.exits.push(leg)
+        // Hand the stop leg to the main loop for any further cumulative fills; clear the
+        // protective handle so it is not double-counted by both paths.
         trade.protectiveStopOrderId = null
         this.bookExitFill(trade, leg, stopOrder.filledQty, stopOrder.filledAvgPrice)
-      } else if (stopOrder && (stopOrder.status === 'canceled' || stopOrder.status === 'expired' || stopOrder.status === 'rejected')) {
+        if (isTerminalOrder(stopOrder.status)) leg.orderId = null
+      } else if (stopOrder && isTerminalOrder(stopOrder.status)) {
         trade.protectiveStopOrderId = null
       }
     }
@@ -670,30 +688,44 @@ export class PaperExecutor {
     if (trade.openQty <= 0) this.closeTrade(trade)
   }
 
-  private bookExitFill(trade: PaperTrade, leg: ExitLeg, qty: number, price: number): void {
-    leg.qty = qty
-    leg.fillPrice = price
+  /**
+   * Book a broker order's fill into an exit leg. `cumQty`/`cumAvgPrice` are the order's
+   * CUMULATIVE filled quantity and average price. Only the INCREMENT over what this leg
+   * already recorded is applied to openQty and emitted, so repeated polls of a cumulative
+   * `filledQty` (88 → 200 → 532 means 532 total, not 88+200+532) never double-count, and a
+   * flat cumulative (88, 88, 88) books nothing new.
+   */
+  private bookExitFill(trade: PaperTrade, leg: ExitLeg, cumQty: number, cumAvgPrice: number): void {
+    const prevQty = leg.fillPrice != null ? leg.qty : 0
+    const increment = cumQty - prevQty
+    // Ignore a flat or (out-of-order) lower cumulative — never let leg.qty regress, and
+    // never book negative shares. Only a genuine increase updates the leg.
+    if (increment <= 0) return
+    // The leg reflects the broker's latest cumulative (qty, average price), so
+    // computeRealized (Σ (fillPrice−entry)·qty) stays exact as the order fills.
+    leg.qty = cumQty
+    leg.fillPrice = cumAvgPrice
     leg.filledAt = Date.now()
-    leg.slippagePct = slippagePct(leg.intendedPrice, price)
-    trade.openQty = Math.max(0, trade.openQty - qty)
-    if (leg.reason === 't1') {
+    leg.slippagePct = slippagePct(leg.intendedPrice, cumAvgPrice)
+    trade.openQty = Math.max(0, trade.openQty - increment)
+    if (leg.reason === 't1' && !trade.t1Done) {
       trade.t1Done = true
       // Breakeven stop on the remainder — matches the resolver's ladder exactly.
       if (trade.entryFillPrice != null) trade.currentStop = trade.entryFillPrice
     }
     this.touch(trade)
     this.log(
-      `EXIT ${trade.symbol} ${qty} sh @ ${price.toFixed(4)} (${leg.reason}, ` +
+      `EXIT ${trade.symbol} ${increment} sh @ ${cumAvgPrice.toFixed(4)} (${leg.reason}, ` +
       `level ${leg.intendedPrice.toFixed(4)}, slip ${leg.slippagePct == null ? '—' : `${leg.slippagePct.toFixed(2)}%`}) ` +
       `· ${trade.openQty} left`,
     )
     appendEvent({
       event: 'exit_filled', symbol: trade.symbol, tradeId: trade.id, reason: leg.reason,
-      qty, fillPrice: price, intendedPrice: leg.intendedPrice, slippagePct: leg.slippagePct,
+      qty: increment, cumulativeQty: cumQty, fillPrice: cumAvgPrice, intendedPrice: leg.intendedPrice, slippagePct: leg.slippagePct,
       decisionPrice: leg.decisionPrice,
       // The actionable split: gap is latency (poll faster), concession is the limit tolerance.
       gapPct: leg.decisionPrice != null ? slippagePct(leg.intendedPrice, leg.decisionPrice) : null,
-      concessionPct: leg.decisionPrice != null ? slippagePct(leg.decisionPrice, price) : null,
+      concessionPct: leg.decisionPrice != null ? slippagePct(leg.decisionPrice, cumAvgPrice) : null,
       openQtyAfter: trade.openQty,
     })
     if (trade.openQty <= 0) this.closeTrade(trade)
@@ -737,20 +769,30 @@ export class PaperExecutor {
   }
 
   private closeTrade(trade: PaperTrade): void {
+    // fullyClosed means LOCALLY FLAT (openQty 0), regardless of which leg did it.
     trade.state = 'closed'
-    trade.fullyClosed = trade.exits.every(l => l.reason !== 'time')
+    trade.fullyClosed = trade.openQty <= 0
+    // IDEMPOTENT TERMINAL ACCOUNTING. Repeated close/reconcile/tick paths must not
+    // emit a second `trade_closed` nor re-book P&L. computeRealized is always run so
+    // the trade object stays exact if more legs were incorporated before this call,
+    // but the terminal EVENT fires exactly once per close episode.
     const realized = computeRealized(trade)
     trade.realizedPnl = realized?.pnl ?? null
     trade.realizedPnlPct = realized?.pnlPct ?? null
+    if (trade.terminalBooked) { this.touch(trade); return }
+    trade.terminalBooked = true
+    trade.closeCount = (trade.closeCount ?? 0) + 1
     this.touch(trade)
     this.log(
       `CLOSED ${trade.symbol} · P&L ${trade.realizedPnl == null ? '—' : `$${trade.realizedPnl.toFixed(2)}`} ` +
       `(${trade.realizedPnlPct == null ? '—' : `${trade.realizedPnlPct.toFixed(2)}%`})`,
     )
     appendEvent({
-      event: 'trade_closed', symbol: trade.symbol, tradeId: trade.id,
+      event: 'trade_closed', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id,
       realizedPnl: trade.realizedPnl, realizedPnlPct: trade.realizedPnlPct,
       entrySlippagePct: trade.entrySlippagePct, fullyClosed: trade.fullyClosed,
+      // >1 marks a re-close after a late-fill reopen — never a silent duplicate.
+      closeCount: trade.closeCount,
       legs: trade.exits.map(l => ({ reason: l.reason, qty: l.qty, fill: l.fillPrice, slip: l.slippagePct })),
     })
   }
@@ -790,6 +832,9 @@ export class PaperExecutor {
       trade.openQty = brokerQty
       trade.state = 'open'
       trade.reconciliationStatus = 'discrepancy'
+      // Genuinely reopened by a late broker fill → this is a new close episode; allow
+      // terminal accounting to book again when it is re-flattened.
+      trade.terminalBooked = false
       const warn = `invalid-geometry residual: broker holds ${brokerQty} on a closed trade (plannedRisk ${trade.plannedRisk}) — reopening to flatten`
       trade.executionWarnings.push(warn)
       this.touch(trade, warn)
@@ -803,8 +848,11 @@ export class PaperExecutor {
 
     if (brokerQty === localQty) {
       // Broker agrees. Promote a finished trade to verified — the only path into
-      // the research/learning dataset (see verifiedClosedTrades).
-      if (trade.state === 'closed' && trade.reconciliationStatus === 'pending') {
+      // the research/learning dataset (see verifiedClosedTrades). A prior `discrepancy`
+      // is NOT sticky: once broker truth agrees with the (now fully-accounted) local
+      // ledger, it resolves to verified. `manual_review` stays put — its P&L is flagged
+      // unreconstructable and needs a human, not an automatic promotion.
+      if (trade.state === 'closed' && (trade.reconciliationStatus === 'pending' || trade.reconciliationStatus === 'discrepancy')) {
         trade.reconciliationStatus = 'verified'
       }
       return brokerQty
