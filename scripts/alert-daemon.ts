@@ -28,10 +28,17 @@ import { getSessionType } from '@/lib/market-hours'
 import { loadEnvLocal } from '@/lib/execution/env'
 import { AlpacaBroker } from '@/lib/execution/alpaca'
 import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
+import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
 import { isHalted, haltFile, etDayKey, decisionsFile } from '@/lib/execution/store'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
+
+// Capture the dirty-producer override from the INHERITED launch environment, BEFORE
+// loadEnvLocal() runs — otherwise a stale `ALLOW_DIRTY_PRODUCER=1` left in .env.local
+// would silently turn an emergency override into a persistent default. The override
+// must be an explicit launch-time act (e.g. `ALLOW_DIRTY_PRODUCER=1 npx tsx ...`).
+const LAUNCH_ALLOW_DIRTY_PRODUCER = overrideEnabled(process.env)
 
 loadEnvLocal()   // ALPACA_* live here; the daemon has no Next runtime to load them
 
@@ -211,12 +218,12 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   return state
 }
 
-async function buildExecutor(): Promise<PaperExecutor | null> {
+async function buildExecutor(provenance: ProducerProvenance): Promise<PaperExecutor | null> {
   if (!PAPER_TRADE) return null
   const executor = new PaperExecutor(
     new AlpacaBroker(),
     fetchPrices,
-    { ...DEFAULT_EXECUTOR, dryRun: DRY_RUN },
+    { ...DEFAULT_EXECUTOR, dryRun: DRY_RUN, provenance },
     (...a: unknown[]) => log('paper:', ...a),
   )
   await executor.init()
@@ -228,9 +235,15 @@ async function main() {
   log(`alert-daemon starting → ${BASE}${DRY_RUN ? ' [DRY_RUN]' : ''}${ONCE ? ' [ONCE]' : ''}${PAPER_TRADE ? ' [PAPER_TRADE]' : ''}`)
   log(`decisions → ${decisionsFile(etDayKey())} (rotates by ET day at append time)`)
 
+  // PRODUCER PROVENANCE GUARD — runs BEFORE any execution authority is taken
+  // (before buildExecutor → executor.init() reconciliation / order path). Fails
+  // closed and exits non-zero on a dirty/unverifiable producer when paper trading,
+  // unless ALLOW_DIRTY_PRODUCER=1. Records provenance for the init event.
+  const provenance = enforceProducerProvenance({ requireAuthority: PAPER_TRADE, override: LAUNCH_ALLOW_DIRTY_PRODUCER, log })
+
   let executor: PaperExecutor | null = null
   try {
-    executor = await buildExecutor()
+    executor = await buildExecutor(provenance)
   } catch (e) {
     // Missing/invalid Alpaca credentials must not silently degrade to alerts-only:
     // you'd spend a session believing you were paper trading when you weren't.

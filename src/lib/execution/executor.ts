@@ -23,6 +23,7 @@ import { newPaperTrade, computeRealized } from './types'
 import { sizePosition, entryLimitPrice, exitLimitPrice, DEFAULT_SIZING, type SizingConfig } from './sizing'
 import { canOpenPosition, DEFAULT_RISK, type RiskConfig } from './risk'
 import { loadTrades, saveTrades, appendEvent, isHalted, etDayKey } from './store'
+import type { ProducerProvenance } from './provenance'
 
 export interface ExecutorConfig {
   sizing: SizingConfig
@@ -37,6 +38,8 @@ export interface ExecutorConfig {
   flattenEtMinute: number
   /** Log intent, place nothing. */
   dryRun: boolean
+  /** Producer provenance resolved at daemon startup, stamped into the init event for audit. Optional; no trading effect. */
+  provenance?: ProducerProvenance
 }
 
 export const DEFAULT_EXECUTOR: ExecutorConfig = {
@@ -167,7 +170,19 @@ export class PaperExecutor {
       (this.reconciliationUnresolved ? ' · RECONCILIATION_UNRESOLVED (new entries blocked)' : '') +
       (this.config.dryRun ? ' · DRY_RUN' : ''),
     )
-    appendEvent({ event: 'init', broker: this.broker.name, equity: account.equity, restored: this.trades.length, reconciliationUnresolved: this.reconciliationUnresolved })
+    const prov = this.config.provenance
+    appendEvent({
+      event: 'init', broker: this.broker.name, equity: account.equity, restored: this.trades.length,
+      reconciliationUnresolved: this.reconciliationUnresolved,
+      ...(prov ? {
+        producerHead: prov.producerHead,
+        producerBranch: prov.producerBranch,
+        producerDirtyTracked: prov.producerDirtyTracked,
+        producerDirtyOverride: prov.producerDirtyOverride,
+        producerProvenanceResolved: prov.provenanceResolved,
+        producerStartedAtUtc: prov.startedAtUtc,
+      } : {}),
+    })
   }
 
   /** True while startup exposure is unresolved (positive broker position with no unique
