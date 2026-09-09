@@ -10,7 +10,11 @@
     "test": "node node_modules/vitest/vitest.mjs run",
     "test:watch": "node node_modules/vitest/vitest.mjs",
     "mcp": "npx tsx mcp-server/server.ts",
-    "typecheck": "node node_modules/typescript/bin/tsc --noEmit"
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "session:freeze": "npx tsx scripts/session-freeze.ts",
+    "session:verify": "npx tsx scripts/session-verify.ts",
+    "broker:ledger": "npx tsx scripts/broker-ledger.ts",
+    "session:reconcile": "npx tsx scripts/session-reconcile.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.109.0",
