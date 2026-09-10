@@ -29,7 +29,7 @@ import { loadEnvLocal } from '@/lib/execution/env'
 import { AlpacaBroker } from '@/lib/execution/alpaca'
 import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
-import { isHalted, haltFile, etDayKey, decisionsFile } from '@/lib/execution/store'
+import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -105,6 +105,59 @@ function recordDecision(row: Record<string, unknown>, now: number = Date.now()) 
   try { appendFileSync(decisionsFile(etDayKey(now)), JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
 }
 
+/**
+ * Signal-time attributes for a triggered setup, drawn ENTIRELY from values already
+ * present on the DetectedSetup + MonitorResult at decision time. Pure projection —
+ * reads only, computes nothing new, and is shared by the decision log and the
+ * arbitration snapshot so the two can never disagree. Fields not available on a
+ * given build surface as explicit null (never fabricated). `float`/`spaceR` are the
+ * additive observational fields (see monitor.ts / setup-detectors.ts); older results
+ * lacking them read null.
+ */
+function signalAttrs(setup: DetectedSetup, r: MonitorResult): Record<string, unknown> {
+  return {
+    symbol: setup.symbol,
+    setupId: setup.id,
+    setupType: setup.type,
+    state: setup.state,
+    score: setup.score,
+    grade: setup.grade,
+    levelQuality: setup.breakdown?.levelQuality ?? null,
+    levelStrength: setup.levelStrength ?? null,
+    rewardRisk: setup.rewardRisk ?? null,
+    distanceToZonePct: setup.distanceToZonePct ?? null,
+    distanceFromVwapPct: setup.distanceFromVwapPct ?? null,
+    distanceFromEma9Pct: setup.distanceFromEma9Pct ?? null,
+    distanceFromEma21Pct: setup.distanceFromEma21Pct ?? null,
+    distanceFromDayHighPct: r.technicals?.distanceFromDayHighPct ?? null,
+    offHighPct: r.technicals?.distanceFromDayHighPct ?? null,
+    rvol: r.relativeVolume ?? null,
+    changePct: r.changePct ?? null,
+    confidence: setup.confidence ?? null,
+    testCount: setup.testCount ?? null,
+    catalyst: r.catalyst ?? null,
+    float: r.float ?? null,
+    spaceR: setup.spaceR ?? null,
+    keyRisks: setup.keyRisks ?? [],
+    session: r.integrity.session,
+    fill: setup.entryFill ?? setup.zoneUpper,
+    stop: setup.stopReference,
+    targets: setup.targets.map(t => t.price),
+    entryRef: setup.entryFill ?? setup.zoneUpper,
+  }
+}
+
+/**
+ * Per-sweep arbitration snapshot — one JSONL record per sweep that had ≥1 Stage-1-
+ * eligible long. OBSERVATIONAL ONLY: written AFTER the (unchanged) candidate loop,
+ * from data passively accumulated during it. It reorders nothing, ranks nothing,
+ * delays nothing, and is never read back into a decision. No per-sweep dedup — the
+ * competition set is a genuine per-sweep fact.
+ */
+function recordArbitration(row: Record<string, unknown>, now: number): void {
+  try { appendFileSync(arbitrationFile(etDayKey(now)), JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
+}
+
 async function fetchUniverse(): Promise<string[]> {
   const params = new URLSearchParams({
     minChangePct: '3', minPrice: '0.1', maxPrice: '300', minVolume: '500000', minRvol: '1.5', maxResults: '30',
@@ -164,6 +217,14 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   let state = buys.filter(b => now - b.timestamp < SYMBOL_LOG_WINDOW_MS)
   let triggered = 0, sent = 0
 
+  // ── Arbitration snapshot (OBSERVATIONAL) ──────────────────────────────────
+  // Free-capacity reading captured NOW, before any order is submitted this sweep,
+  // so the record reflects the slots each eligible candidate was actually competing
+  // for. Read-only; null when running alerts-only (no executor). Candidates are
+  // accumulated below and written once, after the unchanged loop.
+  const capacityAtSweepStart = executor ? executor.observeCapacity(getSessionType(now)) : null
+  const eligibleCandidates: Record<string, unknown>[] = []
+
   for (const r of results) {
     for (const setup of r.setups as DetectedSetup[]) {
       if (!(setup.direction === 'long' && setup.triggeredRaw)) continue
@@ -173,25 +234,30 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       // bounce stand-down no-op on empty logs/states; dedup + the
       // strong-continuation override still apply, which is the alerting core.
       const { verdict, buy } = classifyBuy(setup, r, { now, priorBuys: state, priorLogs: [], priorStates: [] })
+      const attrs = signalAttrs(setup, r)
       // Audit trail: every trigger + verdict, so end-of-session "did we miss X?"
-      // is answerable from data — near-misses included.
+      // is answerable from data — near-misses included. `attrs` is a read-only
+      // projection of already-computed detection values; extending it adds fields
+      // for research and changes no decision. The fields the Shadow Journal reads
+      // (ts/etTime/verdict/price + those in attrs) are all preserved.
       recordDecision({
         ts: new Date(now).toISOString(),
         etTime: new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(now),
-        symbol: setup.symbol, setupId: setup.id, setupType: setup.type,
-        grade: setup.grade, score: setup.score, verdict,
-        fill: setup.entryFill ?? setup.zoneUpper,
-        rvol: r.relativeVolume, offHighPct: r.technicals?.distanceFromDayHighPct ?? null,
-        session: r.integrity.session, price: r.price,
-        // Additive signal-time geometry for the Shadow Journal (src/lib/research/shadow-journal.ts).
-        // Logging only — every field is already known at detection; nothing here changes a decision.
-        stop: setup.stopReference, targets: setup.targets.map(t => t.price), entryRef: setup.entryFill ?? setup.zoneUpper,
+        ...attrs,
+        verdict,
+        price: r.price,
       }, now)
       if (verdict === 'logged' && buy) {
         state = [...state, buy]
         const tag = `${buy.symbol} ${buy.setupType} @ ${buy.entryHigh} (grade ${buy.grade}, rvol ${buy.ctxRelVol?.toFixed(0) ?? '—'}×)`
         if (DRY_RUN) { sent++; log(`[dry-run] would alert ${tag}`) }
         else if (await sendAlert(buy)) { sent++; log(`ALERT ${tag}`) }
+
+        // Submission outcome for the arbitration snapshot only. Declared here so it
+        // is captured whether or not an executor is attached; the executor call and
+        // its behaviour below are entirely unchanged.
+        let submitted: boolean | null = null
+        let blockReason: string | null = null
 
         if (executor) {
           try {
@@ -202,12 +268,37 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
               : r.volume || null
             const res = await executor.onSignal(buy, { sessionVolume })
             if (!res.taken) log(`  paper: skipped ${buy.symbol} — ${res.reason}`)
+            submitted = res.taken
+            blockReason = res.taken ? null : (res.reason ?? null)
           } catch (e) {
             log(`  paper: executor failed on ${buy.symbol}:`, (e as Error).message)
+            submitted = false
+            blockReason = `executor_error: ${(e as Error).message}`
           }
         }
+
+        // Observational: record this eligible candidate + its submission outcome.
+        // Pushed AFTER the (unchanged) submit call, preserving iteration order.
+        eligibleCandidates.push({ ...attrs, verdict, submitted, blockReason })
       }
     }
+  }
+
+  // ── Write the per-sweep arbitration snapshot (OBSERVATIONAL) ───────────────
+  // One record per sweep that had ≥1 Stage-1-eligible long. Written here, after the
+  // loop, from passively accumulated data — it reorders/ranks/delays nothing.
+  if (eligibleCandidates.length >= 1) {
+    recordArbitration({
+      ts: new Date(now).toISOString(),
+      etTime: new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(now),
+      session: getSessionType(now),
+      universeSize: universe.length,
+      capacity: capacityAtSweepStart,
+      eligibleCount: eligibleCandidates.length,
+      submittedCount: eligibleCandidates.filter(c => c.submitted === true).length,
+      capacityBlockedCount: eligibleCandidates.filter(c => c.submitted === false).length,
+      candidates: eligibleCandidates,
+    }, now)
   }
   // Log on activity, or periodically so a quiet stretch is visibly alive (not hung).
   if (triggered) log(`swept ${universe.length} names · ${triggered} triggers · ${sent} new alerts`)

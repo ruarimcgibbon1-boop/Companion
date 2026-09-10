@@ -21,7 +21,8 @@ import { getSessionType, etMinutesOfDay } from '@/lib/market-hours'
 import type { Broker, PaperTrade, ExitReason, ExitLeg, BrokerPosition, BrokerOrderStatus } from './types'
 import { newPaperTrade, computeRealized } from './types'
 import { sizePosition, entryLimitPrice, exitLimitPrice, DEFAULT_SIZING, type SizingConfig } from './sizing'
-import { canOpenPosition, DEFAULT_RISK, type RiskConfig } from './risk'
+import { canOpenPosition, DEFAULT_RISK, realizedPnlToday, openRisk, premarketTrades, type RiskConfig } from './risk'
+import type { SessionType } from '@/lib/market-hours'
 import { loadTrades, saveTrades, appendEvent, isHalted, etDayKey } from './store'
 import type { ProducerProvenance } from './provenance'
 
@@ -307,6 +308,65 @@ export class PaperExecutor {
 
   allTrades(): PaperTrade[] {
     return this.trades
+  }
+
+  /**
+   * READ-ONLY capacity snapshot for observational telemetry (the per-sweep
+   * arbitration audit). Pure: it computes from already-loaded local state using the
+   * SAME helpers canOpenPosition uses, calls no broker, mutates nothing, and is
+   * never consulted by any entry/exit/ordering decision. `equity` is the last value
+   * cached at init/onSignal (no fresh broker read here, by design). It exists only
+   * so an audit record can explain why a candidate would/would not have fit.
+   */
+  observeCapacity(session: SessionType, config: RiskConfig = this.config.risk): {
+    session: SessionType
+    halted: boolean
+    brokerBlocked: boolean
+    reconciliationUnresolved: boolean
+    haltedForDay: string | null
+    equity: number
+    startingEquity: number
+    openCount: number
+    maxConcurrentPositions: number
+    freeConcurrentSlots: number
+    tradesToday: number
+    maxTradesPerDay: number
+    openPlannedRisk: number
+    maxOpenRiskFraction: number
+    openRiskCeiling: number
+    realizedPnlToday: number
+    dailyLossLimit: number
+    premarketTradeCount: number | null
+    maxPremarketTrades: number | null
+    premarketRealizedPnl: number | null
+    premarketLossLimit: number | null
+  } {
+    const open = this.openTrades()
+    const closed = this.closedToday()
+    const inPremarket = session === 'premarket'
+    return {
+      session,
+      halted: isHalted(),
+      brokerBlocked: this.brokerBlocked,
+      reconciliationUnresolved: this.reconciliationUnresolved,
+      haltedForDay: this.haltedForDay,
+      equity: this.equity,
+      startingEquity: this.startingEquity,
+      openCount: open.length,
+      maxConcurrentPositions: config.maxConcurrentPositions,
+      freeConcurrentSlots: Math.max(0, config.maxConcurrentPositions - open.length),
+      tradesToday: closed.length + open.length,
+      maxTradesPerDay: config.maxTradesPerDay,
+      openPlannedRisk: openRisk(open),
+      maxOpenRiskFraction: config.maxOpenRiskFraction,
+      openRiskCeiling: this.equity * config.maxOpenRiskFraction,
+      realizedPnlToday: realizedPnlToday(closed),
+      dailyLossLimit: -Math.abs(this.startingEquity * config.dailyLossLimitFraction),
+      premarketTradeCount: inPremarket ? premarketTrades(closed).length + premarketTrades(open).length : null,
+      maxPremarketTrades: inPremarket ? config.maxPremarketTrades : null,
+      premarketRealizedPnl: inPremarket ? realizedPnlToday(premarketTrades(closed)) : null,
+      premarketLossLimit: inPremarket ? -Math.abs(this.startingEquity * config.premarketLossLimitFraction) : null,
+    }
   }
 
   private persist(): void {

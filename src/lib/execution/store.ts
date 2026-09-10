@@ -41,6 +41,16 @@ export function decisionsFile(day = etDayKey()): string {
   return join(homedir(), `.companion-decisions-${day}.jsonl`)
 }
 
+/**
+ * Per-sweep arbitration-snapshot audit file (one JSONL record per sweep that had
+ * ≥1 Stage-1-eligible long). OBSERVATIONAL ONLY — nothing reads it back into a
+ * decision. Same ET-trading-day rotation rule as decisionsFile: pass the sweep's
+ * own timestamp at append time so a continuously-running daemon rolls at ET midnight.
+ */
+export function arbitrationFile(day = etDayKey()): string {
+  return join(homedir(), `.companion-arbitration-${day}.jsonl`)
+}
+
 /** Operator kill switch: `touch ~/.companion-halt` stops all new entries. */
 export function haltFile(): string {
   return join(homedir(), '.companion-halt')
