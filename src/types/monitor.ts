@@ -183,6 +183,17 @@ export interface DetectedSetup {
   nextIfHolds: number | null
   nextIfFails: number | null
 
+  /**
+   * OBSERVATIONAL TELEMETRY — additive, never read by any decision/gate/ordering.
+   * Surfaced from values already computed inside buildSetup and otherwise discarded,
+   * so downstream research (decision log, arbitration snapshot) can record them.
+   * `levelStrength`: strength of the nearest key level to the zone (0-100, null if none).
+   * `spaceR`: room to next meaningful supply in units of risk (the SPACE gate's own
+   * reading — the gate still recomputes/uses it identically; this only exposes it).
+   */
+  levelStrength?: number | null
+  spaceR?: number | null
+
   /** Decisive buy/sell directive derived from state + geometry. */
   signal: TradeSignal
 }
@@ -268,6 +279,12 @@ export interface MonitorResult {
   relativeVolume: number | null
   spreadPct: number | null
   catalyst: string
+  /**
+   * OBSERVATIONAL TELEMETRY — additive, never read by any decision/gate/ordering.
+   * Shares float, already fetched for the in-play gate's DetectionContext and
+   * otherwise dropped from the result. Null when unknown. Exposed for research only.
+   */
+  float?: number | null
   levels: KeyLevel[]
   setups: DetectedSetup[]
   roadmap: PriceRoadmap

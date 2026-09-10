@@ -177,6 +177,9 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       premarketVolume: premarket?.measured ? premarket.todayVolume : null,
       spreadPct: null,
       catalyst: hasCatalyst ? (cache.get<NewsItem[]>(`news:${sym}`)?.[0]?.quality ?? 'Catalyst') : 'No catalyst data',
+      // Observational telemetry only (additive; not read by any gate/decision). Already
+      // fetched above for the in-play gate's DetectionContext; previously dropped here.
+      float,
       levels,
       setups,
       patterns,

@@ -999,6 +999,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     notes: args.notes,
     nextIfHolds: nextForward,
     nextIfFails: nextBackward,
+    // Observational telemetry (additive; not read by any gate/decision/ordering).
+    // Both values are already computed above — `level` for scoring, `space` for the
+    // SPACE gate — and were previously discarded. Exposing them changes nothing.
+    levelStrength: level?.strength ?? null,
+    spaceR: space.r,
   }
 
   return { ...built, signal: deriveSignal(built as DetectedSetup) }
