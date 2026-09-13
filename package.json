@@ -14,7 +14,8 @@
     "session:freeze": "npx tsx scripts/session-freeze.ts",
     "session:verify": "npx tsx scripts/session-verify.ts",
     "broker:ledger": "npx tsx scripts/broker-ledger.ts",
-    "session:reconcile": "npx tsx scripts/session-reconcile.ts"
+    "session:reconcile": "npx tsx scripts/session-reconcile.ts",
+    "fmp:usage": "npx tsx scripts/fmp-usage.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.109.0",

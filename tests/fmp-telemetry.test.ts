@@ -7,6 +7,9 @@
  * string. Telemetry keys derive from the `path` argument only.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import {
   fmpFamily, recordFmpCall, getFmpUsage, resetFmpUsage,
   formatFmpUsageLines, bytesShare, formatBytes, etDay,
@@ -19,13 +22,21 @@ function resp(body: string, ok = true, status = 200) {
   return { ok, status, async text() { return body } } as unknown as Response
 }
 
+// Isolate persistence to a fresh empty temp dir so lazy load-on-first-use is a no-op
+// and these byte assertions never pick up real persisted usage on any machine.
+let usageDir: string
 beforeEach(() => {
   process.env.FMP_API_KEY = SECRET
   delete process.env.FMP_SOFT_DAILY_GB
+  delete process.env.FMP_ROLLING_LIMIT_GB
+  usageDir = mkdtempSync(join(tmpdir(), 'fmp-usage-step1-'))
+  process.env.COMPANION_FMP_USAGE_DIR = usageDir
   resetFmpUsage()
 })
 afterEach(() => {
   vi.unstubAllGlobals()
+  delete process.env.COMPANION_FMP_USAGE_DIR
+  try { rmSync(usageDir, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 
 // ── Pure telemetry helpers ──────────────────────────────────────────────────
