@@ -197,7 +197,7 @@ describe('display-only rolling limit', () => {
 })
 
 describe('failure isolation — telemetry can never throw into fmpGet()', () => {
-  it('persist returns false (no throw) when the usage dir cannot be created', () => {
+  it('persist returns false (no throw) when the usage dir cannot be created', async () => {
     // Point the dir at an existing FILE so mkdirSync fails.
     const badFile = join(dir, 'not-a-dir')
     writeFileSync(badFile, 'x')
@@ -207,6 +207,7 @@ describe('failure isolation — telemetry can never throw into fmpGet()', () => 
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     expect(persistFmpUsage(DAY, BASE)).toBe(false)
     expect(() => maybeEmitFmpUsage(() => {}, BASE)).not.toThrow()
+    await new Promise(r => setImmediate(r))   // let the deferred (failing) write run
     warn.mockRestore()
   })
 
@@ -216,11 +217,52 @@ describe('failure isolation — telemetry can never throw into fmpGet()', () => 
     process.env.COMPANION_FMP_USAGE_DIR = badFile
     process.env.FMP_API_KEY = 'k_secret_value'
     resetFmpUsage(BASE)
-    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const body = JSON.stringify([{ symbol: 'AAA', price: 1, previousClose: 1 }])
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, async text() { return body } } as unknown as Response))
 
     await expect(getQuote('AAA')).resolves.toMatchObject({ symbol: 'AAA' })
+    await new Promise(r => setImmediate(r))   // flush any deferred (failing) write
+    warn.mockRestore()
+  })
+})
+
+describe('write cadence — batched, off-path, dirty-gated', () => {
+  it('recordFmpCall performs no filesystem write', () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)
+    // Nothing persisted by recording alone — accounting is in-memory.
+    expect(readdirSync(dir).filter(f => f.endsWith('.json'))).toEqual([])
+  })
+
+  it('periodic persistence is deferred off the synchronous return path', async () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)
+    maybeEmitFmpUsage(() => {}, BASE)                        // passes the 60s gate (lastEmit reset to 0)
+    expect(existsSync(join(dir, `${DAY}.json`))).toBe(false) // NOT written synchronously on the path
+    await new Promise(r => setImmediate(r))
+    expect(existsSync(join(dir, `${DAY}.json`))).toBe(true)  // written on the next event-loop turn
+  })
+
+  it('does not rewrite when nothing changed since the last persist (dirty flag)', async () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)
+    maybeEmitFmpUsage(() => {}, BASE)
+    await new Promise(r => setImmediate(r))
+    const first = JSON.parse(readFileSync(join(dir, `${DAY}.json`), 'utf8')) as FmpUsageDayFile
+    expect(first.updatedAt).toBe(BASE)
+
+    // A later tick with NO new record must not rewrite (dirty is false).
+    maybeEmitFmpUsage(() => {}, BASE + 61_000)
+    await new Promise(r => setImmediate(r))
+    const second = JSON.parse(readFileSync(join(dir, `${DAY}.json`), 'utf8')) as FmpUsageDayFile
+    expect(second.updatedAt).toBe(BASE)                      // unchanged → no pointless write
+
+    // A new record re-arms dirty; the next tick DOES persist.
+    recordFmpCall({ path: '/quote', ok: true, bytes: 50, latencyMs: 1 }, BASE + 61_000)
+    maybeEmitFmpUsage(() => {}, BASE + 122_000)
+    await new Promise(r => setImmediate(r))
+    const third = JSON.parse(readFileSync(join(dir, `${DAY}.json`), 'utf8')) as FmpUsageDayFile
+    expect(third.updatedAt).toBe(BASE + 122_000)
+    expect(third.totals.bytes).toBe(150)
   })
 })
 

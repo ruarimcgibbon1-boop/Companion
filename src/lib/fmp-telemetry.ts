@@ -80,6 +80,12 @@ let since = Date.now()
 // Which ET day the in-memory counters have been seeded from disk for. Null arms a
 // lazy load on the next telemetry use (fresh process, or after a day roll/reset).
 let loadedDay: string | null = null
+// Persistence scheduling. `dirty` gates pointless writes (nothing changed since the
+// last persist). `persistScheduled` coalesces the off-hot-path deferred write. `lastEmit`
+// throttles the periodic emit+persist to at most once per EMIT_INTERVAL_MS.
+let dirty = false
+let persistScheduled = false
+let lastEmit = 0
 
 function emptyStat(): FmpFamilyStat {
   return { requests: 0, successful: 0, failed: 0, bytes: 0, latencyTotalMs: 0, latencyMaxMs: 0 }
@@ -110,11 +116,18 @@ function usageFile(day: string): string {
 function rollDayIfNeeded(now: number): void {
   const d = etDay(now)
   if (d !== currentDay) {
-    persistFmpUsage(currentDay, now)   // flush the CLOSING day before clearing (best-effort)
+    // Flush the CLOSING day synchronously before clearing (best-effort). This is the
+    // ONE synchronous write on the call path, and it happens at most once per ET day,
+    // at the ET-midnight boundary when the market is closed and the sweep is idle — so
+    // it is not on a live market-data return path in practice. Guarded by `dirty` so a
+    // day with no unpersisted change writes nothing.
+    if (dirty) persistFmpUsage(currentDay, now)
     families.clear()
     currentDay = d
     since = now
     loadedDay = null                   // arm a load for the new day
+    dirty = false
+    persistScheduled = false
   }
 }
 
@@ -189,6 +202,7 @@ export function recordFmpCall(rec: FmpCallRecord, now: number = Date.now()): voi
   s.latencyTotalMs += rec.latencyMs
   if (rec.latencyMs > s.latencyMaxMs) s.latencyMaxMs = rec.latencyMs
   families.set(family, s)
+  dirty = true   // in-memory accounting changed; a future persist has something to write
 }
 
 // ── Read-only snapshot ───────────────────────────────────────────────────────
@@ -222,22 +236,27 @@ export function resetFmpUsage(now: number = Date.now()): void {
   currentDay = etDay(now)
   since = now
   loadedDay = null
+  dirty = false
+  persistScheduled = false
+  lastEmit = 0
 }
 
 // ── Persistence (atomic; best-effort; never throws into the caller) ────────────
 
-/**
- * Atomically persist the current in-memory aggregate for `day` (temp file → rename).
- * No-op (returns false) when there is nothing to persist, so a bare reset/empty state
- * can never clobber an existing day's file with zeros. Never throws.
- */
-export function persistFmpUsage(day: string = currentDay, now: number = Date.now()): boolean {
+/** Build the on-disk aggregate for `day` from the current counters, or null when there
+ *  is nothing to persist (so a bare reset/empty state can never clobber a day's file). */
+function buildDayFile(day: string, now: number): FmpUsageDayFile | null {
   const { totals, families: fam } = currentSnapshot()
-  if (totals.requests === 0) return false   // nothing to write; don't overwrite prior data
+  if (totals.requests === 0) return null
+  return { day, updatedAt: now, totals, families: fam }
+}
+
+/** Atomic write (temp file → rename). Best-effort: warns and returns false on failure,
+ *  never throws. This is the ONLY function that touches the disk for writes. */
+function writeDayFileAtomic(day: string, file: FmpUsageDayFile): boolean {
   try {
     const dir = fmpUsageDir()
     mkdirSync(dir, { recursive: true })
-    const file: FmpUsageDayFile = { day, updatedAt: now, totals, families: fam }
     const tmp = join(dir, `.${day}.json.tmp.${process.pid}`)
     writeFileSync(tmp, JSON.stringify(file))
     renameSync(tmp, usageFile(day))
@@ -246,6 +265,47 @@ export function persistFmpUsage(day: string = currentDay, now: number = Date.now
     console.warn(`[FMP] usage persist failed for ${day}:`, (e as Error).message)
     return false
   }
+}
+
+/**
+ * SYNCHRONOUS persist of the current day's aggregate. Used for the ET-day rollover
+ * flush, explicit flush (graceful shutdown, `flushFmpUsage`), and tests. No-op
+ * (returns false) when there is nothing to persist. Never throws.
+ */
+export function persistFmpUsage(day: string = currentDay, now: number = Date.now()): boolean {
+  const file = buildDayFile(day, now)
+  if (!file) return false
+  const ok = writeDayFileAtomic(day, file)
+  if (ok) dirty = false
+  return ok
+}
+
+/**
+ * Flush the current day synchronously — intended for graceful shutdown (SIGINT/SIGTERM).
+ * Best-effort; returns false when there is nothing to persist. Not wired into the daemon
+ * here (that lands with the daemon integration step); exported so a shutdown handler can
+ * call it. Never throws.
+ */
+export function flushFmpUsage(now: number = Date.now()): boolean {
+  return persistFmpUsage(currentDay, now)
+}
+
+/**
+ * Schedule an OFF-HOT-PATH persist. Captures the current aggregate SYNCHRONOUSLY (cheap
+ * object build) and performs the disk write on the next event-loop turn via setImmediate,
+ * so the write latency NEVER sits on the fmpGet() return path. Coalesced by
+ * `persistScheduled`, and a no-op when there is nothing to persist. Never throws.
+ */
+function schedulePersist(day: string, now: number): void {
+  if (persistScheduled) return
+  const file = buildDayFile(day, now)
+  if (!file) return
+  persistScheduled = true
+  dirty = false   // captured into `file`; any new record re-arms `dirty`
+  setImmediate(() => {
+    persistScheduled = false
+    writeDayFileAtomic(day, file)   // best-effort; failure warned inside, never thrown
+  })
 }
 
 // ── Formatting / reporting ─────────────────────────────────────────────────────
@@ -392,10 +452,10 @@ export function formatRollingLine(r: RollingUsage): string {
 
 // ── Periodic aggregated emission + persistence + soft budget (informational) ────
 
-// Emit + persist at most once per interval, from the call path — so there is one
-// aggregated heartbeat (and one disk write) rather than one per market-data call.
+// Emit + schedule a persist at most once per interval, from the call path — so there is
+// one aggregated heartbeat (and at most one disk write) rather than one per market-data
+// call. `lastEmit` lives in the state block above.
 const EMIT_INTERVAL_MS = 60_000
-let lastEmit = 0
 const budgetWarned = new Set<number>()   // dedupe 80/90/100% warnings per day+level
 
 /**
@@ -411,10 +471,12 @@ export function softBudgetBytes(): number | null {
 }
 
 /**
- * Called after each recorded call. At most once per EMIT_INTERVAL_MS it (a) persists
- * the day's aggregate to disk and (b) logs an aggregated usage line; plus a one-shot
- * soft-budget warning at 80/90/100% of the day's byte budget. Pure side-effects
- * (logging + best-effort disk) — no control-flow effect on the caller, never throws.
+ * Called after each recorded call. At most once per EMIT_INTERVAL_MS it (a) SCHEDULES an
+ * off-hot-path persist of the day's aggregate (only when `dirty`) and (b) logs an
+ * aggregated usage line; plus a one-shot soft-budget warning at 80/90/100% of the day's
+ * byte budget. The disk write is deferred (setImmediate) so its latency NEVER sits on the
+ * fmpGet() return path. Pure side-effects — no control-flow effect on the caller, never
+ * throws.
  */
 export function maybeEmitFmpUsage(
   log: (...a: unknown[]) => void = console.log,
@@ -439,6 +501,6 @@ export function maybeEmitFmpUsage(
   if (now - lastEmit < EMIT_INTERVAL_MS) return
   lastEmit = now
   if (snap.totals.requests === 0) return
-  persistFmpUsage(currentDay, now)   // best-effort; failure is logged, never thrown
+  if (dirty) schedulePersist(currentDay, now)   // deferred off the return path; skipped when unchanged
   for (const line of formatFmpUsageLines(snap)) log(line)
 }
