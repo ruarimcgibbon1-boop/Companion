@@ -12,6 +12,8 @@
 
 import { z } from 'zod'
 
+import { recordFmpCall, maybeEmitFmpUsage } from './fmp-telemetry'
+
 const BASE = 'https://financialmodelingprep.com/stable'
 
 function getApiKey(): string {
@@ -36,19 +38,36 @@ async function fmpGet<T>(
     url.searchParams.set(k, String(v))
   }
 
-  const res = await fetch(url.toString(), {
-    next: { revalidate: 0 },
-    headers: { Accept: 'application/json' },
-  })
-  if (!res.ok) throw new Error(`FMP ${path} → HTTP ${res.status}`)
+  // Telemetry (bytes/requests/latency) is recorded around the fetch + body read. The
+  // telemetry layer receives ONLY `path` (the family source) — never `url`, which
+  // carries the apikey in its query string. See fmp-telemetry.ts security invariant.
+  const startedAt = Date.now()
+  let bytes = 0
+  let ok = false
+  try {
+    const res = await fetch(url.toString(), {
+      next: { revalidate: 0 },
+      headers: { Accept: 'application/json' },
+    })
+    // Read the body EXACTLY ONCE, as text, both to measure actual response bytes and
+    // to parse it. `res.json()` would consume the stream and leave nothing to size;
+    // JSON.parse(text) is byte-for-byte equivalent to what res.json() would return.
+    const text = await res.text()
+    bytes = Buffer.byteLength(text, 'utf8')
+    if (!res.ok) throw new Error(`FMP ${path} → HTTP ${res.status}`)
 
-  const json = await res.json()
-  const parsed = schema.safeParse(json)
-  if (!parsed.success) {
-    console.warn(`FMP schema mismatch ${path}:`, parsed.error.issues.slice(0, 2))
-    return json as T
+    const json = JSON.parse(text)
+    ok = true
+    const parsed = schema.safeParse(json)
+    if (!parsed.success) {
+      console.warn(`FMP schema mismatch ${path}:`, parsed.error.issues.slice(0, 2))
+      return json as T
+    }
+    return parsed.data
+  } finally {
+    recordFmpCall({ path, ok, bytes, latencyMs: Date.now() - startedAt })
+    maybeEmitFmpUsage()
   }
-  return parsed.data
 }
 
 // ── Schemas ────────────────────────────────────────────────────────────────
