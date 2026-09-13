@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSy
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  recordFmpCall, getFmpUsage, resetFmpUsage, persistFmpUsage,
+  recordFmpCall, getFmpUsage, resetFmpUsage, persistFmpUsage, flushFmpUsage,
   getRollingUsage, formatRollingLine, rollingLimitBytes, maybeEmitFmpUsage,
   etDay, fmpUsageDir, type FmpUsageDayFile, type FmpFamilyStat,
 } from '../src/lib/fmp-telemetry'
@@ -263,6 +263,56 @@ describe('write cadence — batched, off-path, dirty-gated', () => {
     const third = JSON.parse(readFileSync(join(dir, `${DAY}.json`), 'utf8')) as FmpUsageDayFile
     expect(third.updatedAt).toBe(BASE + 122_000)
     expect(third.totals.bytes).toBe(150)
+  })
+})
+
+describe('deferred-write race safety', () => {
+  const file = () => JSON.parse(readFileSync(join(dir, `${DAY}.json`), 'utf8')) as FmpUsageDayFile
+
+  it('a completed OLDER deferred write does not mark a NEWER mutation clean', async () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)   // A
+    maybeEmitFmpUsage(() => {}, BASE)                                              // schedule snapshot A
+    recordFmpCall({ path: '/quote', ok: true, bytes: 20, latencyMs: 1 }, BASE)    // B (before A writes)
+    await new Promise(r => setImmediate(r))                                        // A write completes
+    expect(file().totals.bytes).toBe(100)                                          // disk holds A only
+
+    // Telemetry must still be dirty (B unpersisted): the next tick persists A+B.
+    maybeEmitFmpUsage(() => {}, BASE + 61_000)
+    await new Promise(r => setImmediate(r))
+    expect(file().totals.bytes).toBe(120)
+  })
+
+  it('B: a pending deferred write cannot clobber the synchronous ROLLOVER flush', async () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)   // A
+    maybeEmitFmpUsage(() => {}, BASE)                                              // schedule snapshot A (pending)
+    recordFmpCall({ path: '/quote', ok: true, bytes: 20, latencyMs: 1 }, BASE)    // B (same day)
+    // Force ET-day rollover synchronously BEFORE the deferred A write runs.
+    getFmpUsage(BASE + 26 * 3600_000)                                             // sync-flushes DAY with A+B
+    await new Promise(r => setImmediate(r))                                        // stale deferred A now fires
+    expect(file().totals.bytes).toBe(120)                                          // A+B preserved, not clobbered to 100
+  })
+
+  it('C: a pending deferred write cannot clobber an explicit FLUSH', async () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)   // A
+    maybeEmitFmpUsage(() => {}, BASE)                                              // schedule snapshot A (pending)
+    recordFmpCall({ path: '/quote', ok: true, bytes: 20, latencyMs: 1 }, BASE)    // B
+    flushFmpUsage(BASE)                                                            // sync flush A+B
+    await new Promise(r => setImmediate(r))                                        // stale deferred A fires
+    expect(file().totals.bytes).toBe(120)
+  })
+
+  it('A: many records while a write is pending are coalesced and fully persisted', async () => {
+    recordFmpCall({ path: '/quote', ok: true, bytes: 100, latencyMs: 1 }, BASE)
+    maybeEmitFmpUsage(() => {}, BASE)                                              // schedule snapshot #1
+    recordFmpCall({ path: '/quote', ok: true, bytes: 20, latencyMs: 1 }, BASE)
+    recordFmpCall({ path: '/news/stock', ok: true, bytes: 5, latencyMs: 1 }, BASE)
+    maybeEmitFmpUsage(() => {}, BASE)                                              // persistScheduled → no 2nd schedule
+    await new Promise(r => setImmediate(r))                                        // first write lands (partial)
+
+    maybeEmitFmpUsage(() => {}, BASE + 61_000)                                     // next tick persists the cumulative total
+    await new Promise(r => setImmediate(r))
+    expect(file().totals.bytes).toBe(125)
+    expect(file().totals.requests).toBe(3)
   })
 })
 

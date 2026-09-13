@@ -80,10 +80,18 @@ let since = Date.now()
 // Which ET day the in-memory counters have been seeded from disk for. Null arms a
 // lazy load on the next telemetry use (fresh process, or after a day roll/reset).
 let loadedDay: string | null = null
-// Persistence scheduling. `dirty` gates pointless writes (nothing changed since the
-// last persist). `persistScheduled` coalesces the off-hot-path deferred write. `lastEmit`
-// throttles the periodic emit+persist to at most once per EMIT_INTERVAL_MS.
+// Persistence scheduling.
+//   `dirty`            — there are counter mutations not yet durably written.
+//   `mutationVersion`  — bumped on every record; a write captures the version it snapshots
+//                        so completion can clear `dirty` ONLY when nothing changed since.
+//   `persistGen`       — bumped by every SYNCHRONOUS write / day-roll / reset; a deferred
+//                        write captures it and refuses to run if it changed, so a stale
+//                        older snapshot can never clobber a newer synchronous write.
+//   `persistScheduled` — coalesces the off-hot-path deferred write.
+//   `lastEmit`         — throttles the periodic emit+persist to once per EMIT_INTERVAL_MS.
 let dirty = false
+let mutationVersion = 0
+let persistGen = 0
 let persistScheduled = false
 let lastEmit = 0
 
@@ -120,13 +128,17 @@ function rollDayIfNeeded(now: number): void {
     // ONE synchronous write on the call path, and it happens at most once per ET day,
     // at the ET-midnight boundary when the market is closed and the sweep is idle — so
     // it is not on a live market-data return path in practice. Guarded by `dirty` so a
-    // day with no unpersisted change writes nothing.
+    // day with no unpersisted change writes nothing. `persistFmpUsage` bumps `persistGen`;
+    // the extra bump below guarantees any pending deferred write for the OLD day is
+    // invalidated even when there was nothing to flush.
     if (dirty) persistFmpUsage(currentDay, now)
+    persistGen++                       // cancel any still-pending deferred write for the closing day
     families.clear()
     currentDay = d
     since = now
     loadedDay = null                   // arm a load for the new day
     dirty = false
+    mutationVersion = 0
     persistScheduled = false
   }
 }
@@ -202,7 +214,8 @@ export function recordFmpCall(rec: FmpCallRecord, now: number = Date.now()): voi
   s.latencyTotalMs += rec.latencyMs
   if (rec.latencyMs > s.latencyMaxMs) s.latencyMaxMs = rec.latencyMs
   families.set(family, s)
-  dirty = true   // in-memory accounting changed; a future persist has something to write
+  dirty = true          // in-memory accounting changed; a future persist has something to write
+  mutationVersion++     // stamps this change so a write's completion can tell if it's stale
 }
 
 // ── Read-only snapshot ───────────────────────────────────────────────────────
@@ -237,6 +250,8 @@ export function resetFmpUsage(now: number = Date.now()): void {
   since = now
   loadedDay = null
   dirty = false
+  mutationVersion = 0
+  persistGen++            // invalidate any still-pending deferred write (monotonic; never reset)
   persistScheduled = false
   lastEmit = 0
 }
@@ -268,16 +283,34 @@ function writeDayFileAtomic(day: string, file: FmpUsageDayFile): boolean {
 }
 
 /**
+ * Perform one write of a captured snapshot, honouring the two race invariants:
+ *   • GENERATION guard — refuse to write if `persistGen` moved since the snapshot was
+ *     captured. A later synchronous write / day-roll / reset bumps `persistGen`, so a
+ *     stale deferred snapshot can never clobber newer on-disk data.
+ *   • VERSION guard — clear `dirty` ONLY when no mutation occurred after the snapshot
+ *     (`mutationVersion === capturedVersion`); otherwise the newer mutation stays dirty
+ *     and a later tick persists it.
+ * Returns false (no write) when superseded. Never throws.
+ */
+function commitWrite(day: string, file: FmpUsageDayFile, capturedVersion: number, capturedGen: number): boolean {
+  if (capturedGen !== persistGen) return false   // superseded by a newer write / roll / reset
+  const ok = writeDayFileAtomic(day, file)
+  if (ok && mutationVersion === capturedVersion) dirty = false
+  return ok
+}
+
+/**
  * SYNCHRONOUS persist of the current day's aggregate. Used for the ET-day rollover
- * flush, explicit flush (graceful shutdown, `flushFmpUsage`), and tests. No-op
- * (returns false) when there is nothing to persist. Never throws.
+ * flush, explicit flush (graceful shutdown, `flushFmpUsage`), and tests. Bumps
+ * `persistGen` so it supersedes any pending deferred write. No-op (false) when there is
+ * nothing to persist. Never throws.
  */
 export function persistFmpUsage(day: string = currentDay, now: number = Date.now()): boolean {
+  persistGen++                              // this synchronous write supersedes any pending deferred one
+  const capturedVersion = mutationVersion
   const file = buildDayFile(day, now)
   if (!file) return false
-  const ok = writeDayFileAtomic(day, file)
-  if (ok) dirty = false
-  return ok
+  return commitWrite(day, file, capturedVersion, persistGen)
 }
 
 /**
@@ -291,20 +324,23 @@ export function flushFmpUsage(now: number = Date.now()): boolean {
 }
 
 /**
- * Schedule an OFF-HOT-PATH persist. Captures the current aggregate SYNCHRONOUSLY (cheap
- * object build) and performs the disk write on the next event-loop turn via setImmediate,
- * so the write latency NEVER sits on the fmpGet() return path. Coalesced by
- * `persistScheduled`, and a no-op when there is nothing to persist. Never throws.
+ * Schedule an OFF-HOT-PATH persist. Captures the current aggregate + version + generation
+ * SYNCHRONOUSLY (cheap), then writes on the next event-loop turn via setImmediate, so the
+ * write latency NEVER sits on the fmpGet() return path. Coalesced by `persistScheduled`,
+ * a no-op when nothing changed, and — via `commitWrite` — self-cancelling if a newer
+ * synchronous write / day-roll / reset superseded it. Never throws.
  */
 function schedulePersist(day: string, now: number): void {
   if (persistScheduled) return
+  if (!dirty) return
+  const capturedVersion = mutationVersion
+  const capturedGen = persistGen
   const file = buildDayFile(day, now)
   if (!file) return
   persistScheduled = true
-  dirty = false   // captured into `file`; any new record re-arms `dirty`
   setImmediate(() => {
     persistScheduled = false
-    writeDayFileAtomic(day, file)   // best-effort; failure warned inside, never thrown
+    commitWrite(day, file, capturedVersion, capturedGen)   // gen/version guarded; best-effort
   })
 }
 
