@@ -108,7 +108,7 @@ describe('PaperExecutor daily report is ET-session-scoped', () => {
     // Import lazily so the mock above is applied.
     const { PaperExecutor, DEFAULT_EXECUTOR } = await import('@/lib/execution/executor')
     injected = trades
-    const ex = new PaperExecutor(new StubBroker(), async () => new Map(), { ...DEFAULT_EXECUTOR }, () => {})
+    const ex = new PaperExecutor(new StubBroker(), async () => new Map(), { ...DEFAULT_EXECUTOR, authorityMode: 'disabled_for_test' }, () => {})
     await ex.init()
     return ex
   }

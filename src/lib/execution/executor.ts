@@ -18,13 +18,21 @@
 import type { BuySignalRecord } from '@/types'
 import { getSessionType, etMinutesOfDay } from '@/lib/market-hours'
 
-import type { Broker, PaperTrade, ExitReason, ExitLeg, BrokerPosition, BrokerOrderStatus } from './types'
+import type { Broker, PaperTrade, ExitReason, ExitLeg, BrokerPosition, BrokerOrder, BrokerOrderStatus } from './types'
 import { newPaperTrade, computeRealized } from './types'
 import { sizePosition, entryLimitPrice, exitLimitPrice, DEFAULT_SIZING, type SizingConfig } from './sizing'
 import { canOpenPosition, DEFAULT_RISK, realizedPnlToday, openRisk, premarketTrades, type RiskConfig } from './risk'
 import type { SessionType } from '@/lib/market-hours'
 import { loadTrades, saveTrades, appendEvent, isHalted, etDayKey } from './store'
 import type { ProducerProvenance } from './provenance'
+import { acquireExecutionAuthority, makeAuthorityMetadata, type ExecutionAuthority, type AuthorityMetadata } from './authority'
+
+/**
+ * How many times a graceful shutdown re-reads broker truth for a pending entry after
+ * requesting its cancel, before giving up and declaring the shutdown UNRESOLVED. Bounded
+ * so shutdown always terminates; fail-closed on exhaustion (never a silent abort).
+ */
+const SHUTDOWN_SETTLEMENT_POLLS = 5
 
 export interface ExecutorConfig {
   sizing: SizingConfig
@@ -41,6 +49,26 @@ export interface ExecutorConfig {
   dryRun: boolean
   /** Producer provenance resolved at daemon startup, stamped into the init event for audit. Optional; no trading effect. */
   provenance?: ProducerProvenance
+  /**
+   * Whether a process-exclusive execution-authority lease is required.
+   *   'required'           — (DEFAULT) init() MUST acquire the marker before the executor
+   *                          becomes execution-capable. If `authorityLockPath` is missing, or
+   *                          the marker is already held, init fails CLOSED: never authorized,
+   *                          onSignal can never submit an order. This is the safe default so
+   *                          the invariant is enforced by PaperExecutor itself, not merely by
+   *                          the current caller.
+   *   'disabled_for_test'  — no lease required; the executor is execution-capable without a
+   *                          marker. EXPLICIT test-only configuration — it is NEVER inferred
+   *                          from NODE_ENV or any ambient signal; a caller must opt in.
+   * Undefined is treated as 'required' (fail-closed default).
+   */
+  authorityMode?: 'required' | 'disabled_for_test'
+  /**
+   * Path to the process-exclusive execution-authority marker. Required in 'required' mode
+   * (production sets it to authorityLockPath()). Injected as a path so tests use a temp
+   * marker instead of the real home file. Ignored in 'disabled_for_test'.
+   */
+  authorityLockPath?: string
 }
 
 export const DEFAULT_EXECUTOR: ExecutorConfig = {
@@ -51,6 +79,9 @@ export const DEFAULT_EXECUTOR: ExecutorConfig = {
   entryTimeoutMs: 90_000,
   flattenEtMinute: 15 * 60 + 55,
   dryRun: false,
+  // Authority is REQUIRED BY DEFAULT: an executor built from these defaults is not
+  // execution-capable until it acquires the process-exclusive marker.
+  authorityMode: 'required',
 }
 
 /** Fetches last prices for the symbols we hold. Injected so the executor stays feed-agnostic and testable. */
@@ -147,6 +178,14 @@ export class PaperExecutor {
   private reconciliationUnresolved = false
   /** Set when the governor returns a terminal verdict — no more entries today. */
   private haltedForDay: string | null = null
+  /** The process-exclusive execution-authority lease, held while this producer is authoritative. */
+  private executionLease: ExecutionAuthority | null = null
+  /** True once authority is confirmed (or not enforced). Gate for reconcile + order submission. */
+  private executionAuthorized = false
+  /** When authority was refused, the current holder's metadata (for a loud, actionable diagnostic). */
+  private deniedAuthority: AuthorityMetadata | null = null
+  /** True once a shutdown has begun — new execution admission fails closed from here on. */
+  private shuttingDown = false
 
   constructor(
     private readonly broker: Broker,
@@ -156,6 +195,31 @@ export class PaperExecutor {
   ) {}
 
   async init(): Promise<void> {
+    // EXECUTION AUTHORITY LEASE — acquired BEFORE the executor becomes execution-capable.
+    // A second producer that finds the marker held fails closed here: it never reads the
+    // account, never reconciles broker positions, and never submits an order.
+    if (!this.acquireAuthority()) {
+      appendEvent({
+        event: 'execution_authority_refused',
+        broker: this.broker.name,
+        existingPid: this.deniedAuthority?.pid ?? null,
+        existingHost: this.deniedAuthority?.hostname ?? null,
+        existingStartedAtUtc: this.deniedAuthority?.startedAtUtc ?? null,
+        existingProducerHead: this.deniedAuthority?.producerHead ?? null,
+        existingBranch: this.deniedAuthority?.branch ?? null,
+        existingMode: this.deniedAuthority?.mode ?? null,
+      })
+      this.log(
+        'EXECUTION AUTHORITY REFUSED — this process is NON-AUTHORITATIVE (no reconciliation, no orders). ' +
+        (this.deniedAuthority
+          ? `another producer holds the marker: pid=${this.deniedAuthority.pid} host=${this.deniedAuthority.hostname} ` +
+            `started=${this.deniedAuthority.startedAtUtc} head=${this.deniedAuthority.producerHead} ` +
+            `branch=${this.deniedAuthority.branch} mode=${this.deniedAuthority.mode}`
+          : 'authority is required but no lease was acquired (missing authorityLockPath, or acquisition failed)'),
+      )
+      return
+    }
+
     this.trades = loadTrades()
     const account = await this.broker.getAccount()
     this.equity = account.equity
@@ -195,6 +259,78 @@ export class PaperExecutor {
    *  active local owner, or a failed position query) — all new entries are blocked. */
   isReconciliationUnresolved(): boolean {
     return this.reconciliationUnresolved
+  }
+
+  /** True when this process holds (or does not need) execution authority — i.e. is order-capable. */
+  isExecutionAuthorized(): boolean {
+    return this.executionAuthorized
+  }
+
+  /** When authority was refused, the current holder's non-secret metadata; else null. */
+  deniedAuthorityInfo(): AuthorityMetadata | null {
+    return this.deniedAuthority
+  }
+
+  /** True once a graceful shutdown has begun — admission is closed. */
+  isShuttingDown(): boolean {
+    return this.shuttingDown
+  }
+
+  /**
+   * Acquire the process-exclusive execution-authority lease. Returns true when the process
+   * is execution-capable: either the marker was created by us, or enforcement is disabled
+   * (no lock path configured). Returns false — fail closed — when the marker is already
+   * held or acquisition errored. NEVER steals an existing marker (see authority.ts).
+   */
+  private acquireAuthority(): boolean {
+    const mode = this.config.authorityMode ?? 'required'
+    if (mode === 'disabled_for_test') {
+      // EXPLICIT test-only bypass — opted into by construction, NEVER inferred from NODE_ENV
+      // or any ambient signal. Execution-capable without a lease.
+      this.executionAuthorized = true
+      return true
+    }
+    // mode === 'required'
+    const lockPath = this.config.authorityLockPath
+    if (!lockPath) {
+      // FAIL CLOSED: authority is required but no marker path is configured, so no
+      // process-exclusive lease can be taken. Never silently become order-capable.
+      this.executionAuthorized = false
+      this.deniedAuthority = null
+      return false
+    }
+    const prov = this.config.provenance
+    const meta = makeAuthorityMetadata({
+      producerHead: prov?.producerHead ?? null,
+      branch: prov?.producerBranch ?? null,
+      mode: this.config.dryRun ? 'DRY_RUN' : 'PAPER_TRADE',
+    })
+    const lease = acquireExecutionAuthority(meta, { lockPath })
+    if (!lease.acquired) {
+      this.executionAuthorized = false
+      this.deniedAuthority = lease.existing
+      return false
+    }
+    this.executionLease = lease
+    this.executionAuthorized = true
+    appendEvent({
+      event: 'execution_authority_acquired',
+      broker: this.broker.name,
+      pid: meta.pid, hostname: meta.hostname, startedAtUtc: meta.startedAtUtc,
+      producerHead: meta.producerHead, branch: meta.branch, mode: meta.mode,
+      markerPath: lease.path,
+    })
+    return true
+  }
+
+  /** Release the authority lease. Only ever called after a shutdown is proven SAFE. */
+  private releaseAuthority(): void {
+    if (!this.executionLease) return
+    const path = this.executionLease.path
+    this.executionLease.release()
+    this.executionLease = null
+    this.executionAuthorized = false
+    appendEvent({ event: 'execution_authority_released', broker: this.broker.name, markerPath: path })
   }
 
   /**
@@ -389,6 +525,16 @@ export class PaperExecutor {
     signal: BuySignalRecord,
     ctx: { sessionVolume?: number | null } = {},
   ): Promise<{ taken: boolean; reason?: string }> {
+    // FAIL CLOSED — a shutdown in progress must never admit a new entry (no race between
+    // "flatten everything" and "one more BUY slips in"). Admission closes the instant
+    // shutdown begins and never reopens for this process.
+    if (this.shuttingDown) {
+      return { taken: false, reason: 'shutting down — execution admission closed' }
+    }
+    // FAIL CLOSED — never submit an order without process-exclusive execution authority.
+    if (!this.executionAuthorized) {
+      return { taken: false, reason: 'no execution authority (another producer holds the lease)' }
+    }
     // One trade per setup per day — classifyBuy can re-fire the same setup across sweeps.
     if (this.trades.some(t => t.setupId === signal.setupId)) {
       return { taken: false, reason: 'already traded this setup' }
@@ -623,18 +769,72 @@ export class PaperExecutor {
     }
 
     if (timedOut) {
-      // Unfilled at the limit means price moved away without us. That is a clean,
-      // countable outcome — and a much better one than paying up to chase.
-      await this.broker.cancelOrder(trade.entryOrderId)
-      if (order.filledQty > 0) {
-        await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
-      } else {
+      // Unfilled at the limit means price moved away without us — a clean, countable
+      // outcome, better than chasing. BUT the cancel can lose the race: the broker may fill
+      // the entry WHILE we cancel it. So we NEVER decide abort from the pre-cancel snapshot
+      // (`order`) above — that stale read is exactly the P0-002 defect. Settle from FRESH
+      // broker truth read AFTER the cancel (the same broker-truth-after-cancel pattern
+      // invalidatePendingEntry already uses).
+      const outcome = await this.settleCanceledEntry(trade, now, 1)
+      if (outcome === 'terminal_unfilled') {
         trade.state = 'aborted'
         this.touch(trade, `entry timed out unfilled after ${Math.round(this.config.entryTimeoutMs / 1000)}s`)
         this.log(`NO FILL ${trade.symbol} — limit ${trade.limitPrice.toFixed(4)} never traded`)
         appendEvent({ event: 'entry_timeout', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id, limitPrice: trade.limitPrice })
       }
+      // 'filled'      → the raced fill was booked + is now managed (never disowned).
+      // 'unresolved'  → broker truth not yet terminal; stays pending_entry and is retried on
+      //                 the next tick. We do NOT silently abort a still-live order.
     }
+  }
+
+  /**
+   * BROKER-TRUTH-AFTER-CANCEL settlement for a working entry order. Request cancellation,
+   * then decide ONLY from a FRESH broker read — never a pre-cancel snapshot. This is the one
+   * settlement path shared by the entry-timeout tick and graceful shutdown, so there is a
+   * single, tested implementation of the cancel/fill race rather than two slightly different
+   * ones (invalidatePendingEntry already applies the same pattern for geometry cancels).
+   *
+   *   'filled'           — fresh cumulative filledQty > 0: the fill is booked (and any
+   *                        unfilled remainder cancelled). bookEntryFill manages/flattens it.
+   *   'terminal_unfilled'— broker reports a genuinely terminal order with zero fill: safe to abort.
+   *   'unresolved'       — broker truth could not be reduced to terminal within `polls`
+   *                        (still working, e.g. pending_cancel, or getOrder failing). The
+   *                        CALLER must NOT treat this as aborted — fail closed / retry.
+   *
+   * `polls` bounds the re-reads: 1 for the tick (retry next tick), several for shutdown
+   * (which has no next tick and must reach a decision or declare itself unresolved).
+   */
+  private async settleCanceledEntry(
+    trade: PaperTrade,
+    now: number,
+    polls: number,
+  ): Promise<'filled' | 'terminal_unfilled' | 'unresolved'> {
+    if (!trade.entryOrderId) return 'terminal_unfilled'
+    // Best-effort cancel: the fresh getOrder below, not this call, is authoritative.
+    try { await this.broker.cancelOrder(trade.entryOrderId) } catch { /* broker truth decides */ }
+
+    for (let i = 0; i < Math.max(1, polls); i++) {
+      let order: BrokerOrder | null
+      try {
+        order = await this.broker.getOrder(trade.entryOrderId)
+      } catch {
+        continue // transient read failure — retry within the bound; never abort on a guess
+      }
+      if (!order) continue // couldn't resolve this pass
+      if (order.filledQty > 0) {
+        // A fill raced (or completed) — book the ACTUAL cumulative fill, never disown it.
+        await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
+        if (order.status !== 'filled') {
+          // Cancel any unfilled remainder of a partial. Idempotent, best-effort.
+          try { await this.broker.cancelOpenOrders(trade.symbol) } catch { /* best-effort */ }
+        }
+        return 'filled'
+      }
+      if (isTerminalOrder(order.status)) return 'terminal_unfilled' // genuinely canceled/rejected/expired, zero fill
+      // Still non-terminal (e.g. pending_cancel mapped to open) — poll again within the bound.
+    }
+    return 'unresolved'
   }
 
   /**
@@ -1171,8 +1371,42 @@ export class PaperExecutor {
     })
   }
 
-  /** Cancel everything and flatten — the kill switch and the shutdown path. */
+  /**
+   * Cancel everything and flatten — the kill switch and the flatten primitive used by
+   * graceful shutdown. Handles PENDING ENTRIES FIRST (P0-003): a working entry order is
+   * cancelled and settled against FRESH broker truth before any confirmed open exposure is
+   * flattened, so a still-working entry is never left live and a fill that races the cancel
+   * is booked (then flattened as open exposure), never disowned. A pending entry that cannot
+   * be reduced to terminal broker truth sets reconciliationUnresolved — shutdown() reads
+   * that to refuse a clean/authority-releasing exit.
+   */
   async flattenAll(reason: ExitReason = 'risk_halt'): Promise<void> {
+    // 1–5. Pending entries: cancel the working order, settle broker truth, book any raced fill.
+    const pending = this.trades.filter(t => t.state === 'pending_entry')
+    for (const trade of pending) {
+      try {
+        const outcome = await this.settleCanceledEntry(trade, Date.now(), SHUTDOWN_SETTLEMENT_POLLS)
+        if (outcome === 'terminal_unfilled') {
+          // Broker confirmed the entry terminal with zero fill — clean abort of the pending entry.
+          trade.state = 'aborted'
+          this.touch(trade, 'flatten: pending entry aborted (broker confirms no fill)')
+          appendEvent({ event: 'entry_aborted', symbol: trade.symbol, tradeId: trade.id, status: 'canceled', reason: 'shutdown_flatten' })
+        } else if (outcome === 'unresolved') {
+          // Could not reduce to terminal broker truth — fail closed so shutdown() won't release authority.
+          this.reconciliationUnresolved = true
+          this.touch(trade, 'flatten: pending entry unresolved — broker truth not terminal')
+          appendEvent({ event: 'flatten_pending_unresolved', symbol: trade.symbol, tradeId: trade.id })
+        }
+        // 'filled' → bookEntryFill already promoted it to open/managed; flattened below.
+      } catch (e) {
+        this.reconciliationUnresolved = true
+        this.log(`flatten pending failed ${trade.symbol}: ${(e as Error).message}`)
+      }
+      // Stamp broker truth on the settled trade (aborted → confirm flat; filled → confirm qty).
+      try { await this.reconcile(trade, Date.now()) } catch { this.reconciliationUnresolved = true }
+    }
+
+    // 6–7. Flatten confirmed open exposure (including anything a raced fill just promoted to open).
     const holding = this.trades.filter(t => t.state === 'open' && t.openQty > 0)
     for (const trade of holding) {
       try {
@@ -1208,6 +1442,71 @@ export class PaperExecutor {
       }
     }
     this.persist()
+  }
+
+  /**
+   * GRACEFUL SHUTDOWN — the explicit, ordered exit sequence (P0-003 / F).
+   *
+   *   1. close execution admission (no new entries can be admitted from here on)
+   *   2–5. cancel + settle every pending entry against fresh broker truth (book any raced fill)
+   *   6–7. flatten confirmed open exposure and reconcile
+   *   8. classify the result SAFE or UNRESOLVED
+   *   9. release execution authority ONLY on SAFE
+   *
+   * SAFE requires all of: no pending entries left, no local open exposure left, the broker
+   * confirmed flat for every symbol we touched, and no reconciliation left unresolved. If
+   * ANY of those fail, the shutdown is UNRESOLVED: the authority marker is retained, the
+   * caller must NOT report a clean shutdown, and the process must NOT exit 0.
+   */
+  async shutdown(): Promise<{ safe: boolean; reason: string | null }> {
+    this.shuttingDown = true // 1. admission closed (fail-closed for any concurrent onSignal)
+
+    // 2–7. Pending entries first, then confirmed open exposure (flattenAll enforces that order).
+    await this.flattenAll('risk_halt')
+
+    // 8. Classify. Local truth first…
+    const stillPending = this.trades.some(t => t.state === 'pending_entry')
+    const stillOpen = this.trades.some(t => t.state === 'open' && t.openQty > 0)
+
+    // …then BROKER truth: confirm flat for every symbol this session touched. A position we
+    // still see, or a broker we cannot query, is unresolved — never assume broker-flat.
+    let brokerResidual = false
+    const symbols = [...new Set(this.trades.map(t => t.symbol))]
+    for (const sym of symbols) {
+      try {
+        const pos = await this.broker.getPosition(sym)
+        if (pos && pos.qty > 0) brokerResidual = true
+      } catch {
+        brokerResidual = true // cannot confirm flat → fail closed
+      }
+    }
+
+    const safe = !this.reconciliationUnresolved && !stillPending && !stillOpen && !brokerResidual
+    if (safe) {
+      // 9. Release authority only now that exposure is proven resolved.
+      this.releaseAuthority()
+      appendEvent({ event: 'shutdown_complete', broker: this.broker.name, safe: true })
+      this.log('SHUTDOWN SAFE — exposure reconciled, execution authority released')
+      this.persist()
+      return { safe: true, reason: null }
+    }
+
+    const reason =
+      `shutdown UNRESOLVED — ` +
+      `reconciliationUnresolved=${this.reconciliationUnresolved} pendingLeft=${stillPending} ` +
+      `openLeft=${stillOpen} brokerResidual=${brokerResidual}`
+    appendEvent({
+      event: 'shutdown_unresolved', broker: this.broker.name, safe: false,
+      reconciliationUnresolved: this.reconciliationUnresolved, stillPending, stillOpen, brokerResidual,
+    })
+    this.log('╔════════════════════════════════════════════════════════════════════╗')
+    this.log('  SHUTDOWN UNRESOLVED — authority marker RETAINED (not released)')
+    this.log(`  ${reason}`)
+    this.log('  A working entry or unreconciled exposure may remain at the broker.')
+    this.log('  Do NOT start another paper daemon until this is reconciled by hand.')
+    this.log('╚════════════════════════════════════════════════════════════════════╝')
+    this.persist()
+    return { safe: false, reason }
   }
 
   /** One-line end-of-session summary — the numbers paper trading exists to produce. */

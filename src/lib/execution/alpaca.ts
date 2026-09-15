@@ -53,7 +53,12 @@ export function mapStatus(raw: string): BrokerOrderStatus {
       return 'open'
     case 'partially_filled': return 'partially_filled'
     case 'filled': return 'filled'
-    case 'canceled': case 'pending_cancel': return 'canceled'
+    // `pending_cancel` is a REQUEST, not a settled cancellation — Alpaca can still fill the
+    // order while it is in this state. It MUST stay non-terminal (map to the still-working
+    // 'open' bucket) so callers keep reading broker truth instead of treating it as dead.
+    // Only a settled `canceled` is terminal. (P0-002)
+    case 'pending_cancel': return 'open'
+    case 'canceled': return 'canceled'
     case 'expired': case 'done_for_day': return 'expired'
     case 'rejected': case 'suspended': case 'stopped': return 'rejected'
     default: return 'unknown'

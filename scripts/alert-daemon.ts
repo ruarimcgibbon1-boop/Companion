@@ -29,6 +29,7 @@ import { loadEnvLocal } from '@/lib/execution/env'
 import { AlpacaBroker } from '@/lib/execution/alpaca'
 import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
+import { authorityLockPath } from '@/lib/execution/authority'
 import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
@@ -314,10 +315,23 @@ async function buildExecutor(provenance: ProducerProvenance): Promise<PaperExecu
   const executor = new PaperExecutor(
     new AlpacaBroker(),
     fetchPrices,
-    { ...DEFAULT_EXECUTOR, dryRun: DRY_RUN, provenance },
+    // Execution authority is REQUIRED (explicit): the process-exclusive lease at
+    // authorityLockPath must be acquired before this daemon can submit any order. A second
+    // paper daemon that finds the marker held fails closed below.
+    { ...DEFAULT_EXECUTOR, dryRun: DRY_RUN, provenance, authorityMode: 'required', authorityLockPath: authorityLockPath() },
     (...a: unknown[]) => log('paper:', ...a),
   )
   await executor.init()
+  if (!executor.isExecutionAuthorized()) {
+    const info = executor.deniedAuthorityInfo()
+    log('FATAL: execution authority is held by another producer — refusing to start a second paper daemon.')
+    if (info) {
+      log(`  existing holder: pid=${info.pid} host=${info.hostname} started=${info.startedAtUtc}`)
+      log(`  head=${info.producerHead} branch=${info.branch} mode=${info.mode}`)
+    }
+    log(`  If that producer is gone, reconcile broker exposure and remove ${authorityLockPath()} by hand before restarting.`)
+    process.exit(1)
+  }
   if (isHalted()) log(`NOTE: kill switch is engaged (${haltFile()} exists or HALT=1) — no new entries`)
   return executor
 }
@@ -368,8 +382,18 @@ async function main() {
     log(`${signal} — shutting down`)
     observerLoop?.stop()   // clear its interval + abort in-flight reads before we exit
     if (executor) {
-      await executor.flattenAll('risk_halt').catch(e => log('flatten failed:', (e as Error).message))
+      // Explicit ordered shutdown: cancel/settle pending entries, flatten open exposure,
+      // reconcile, and release execution authority ONLY if the result is SAFE.
+      const result = await executor.shutdown().catch(e => {
+        log('shutdown failed:', (e as Error).message)
+        return { safe: false, reason: 'shutdown threw' as string | null }
+      })
       log('paper session summary:\n' + executor.summary())
+      if (!result.safe) {
+        // Do NOT report a clean shutdown and do NOT exit 0: authority marker was retained.
+        log(`EXIT 1 — ${result.reason ?? 'shutdown unresolved'}; execution authority marker retained for manual reconciliation`)
+        process.exit(1)
+      }
     }
     process.exit(0)
   }

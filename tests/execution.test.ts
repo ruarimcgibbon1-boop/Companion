@@ -500,7 +500,7 @@ describe('PaperExecutor', () => {
   const build = () => new PaperExecutor(
     broker,
     async (symbols: string[]) => new Map(symbols.map(s => [s, price])),
-    { ...DEFAULT_EXECUTOR },
+    { ...DEFAULT_EXECUTOR, authorityMode: 'disabled_for_test' },   // unit test: no lease required
     () => {},
   )
 
