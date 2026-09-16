@@ -26,6 +26,7 @@ import type {
   AssetInfo, LimitOrderRequest, StopOrderRequest, BrokerFill,
 } from '@/lib/execution/types'
 import type { BuySignalRecord } from '@/types'
+import { BrokerDataError } from '@/lib/execution/alpaca'
 
 export interface RaceFill {
   qty?: number
@@ -69,6 +70,12 @@ export class DeterministicBroker implements Broker {
   /** Order ids for which cancelOrder throws (models a failed cancel request). */
   readonly failCancel = new Set<string>()
   /**
+   * Symbols for which getPosition / getPositions throws a BrokerDataError — models the real
+   * AlpacaBroker adapter rejecting malformed/missing broker numerics, or an unreadable
+   * position snapshot, mid-lifecycle. Callers must fail closed (never treat it as flat).
+   */
+  readonly failGetPosition = new Set<string>()
+  /**
    * One-shot: the NEXT sell order to be read via getOrder fills only this many shares
    * (cumulative) and STAYS working (partially_filled), reserving the unfilled remainder.
    * Models a partial exit whose remainder is still held_for_orders at the broker. Consumed
@@ -97,12 +104,14 @@ export class DeterministicBroker implements Broker {
   }
 
   async getPositions(): Promise<BrokerPosition[]> {
+    if (this.failGetPosition.size) throw new BrokerDataError('position snapshot unavailable/malformed')
     return [...this.positions.entries()]
       .filter(([, q]) => q !== 0)
       .map(([symbol, qty]) => ({ symbol, qty, qtyAvailable: qty, avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0 }))
   }
 
   async getPosition(symbol: string): Promise<BrokerPosition | null> {
+    if (this.failGetPosition.has(symbol)) throw new BrokerDataError(`position for ${symbol} unavailable/malformed`)
     const qty = this.truthQty(symbol)
     if (qty <= 0) return null
     return { symbol, qty, qtyAvailable: qty, avgEntryPrice: 0, currentPrice: null, unrealizedPl: 0 }
