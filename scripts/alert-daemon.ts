@@ -318,6 +318,8 @@ async function buildExecutor(provenance: ProducerProvenance): Promise<PaperExecu
     // Execution authority is REQUIRED (explicit): the process-exclusive lease at
     // authorityLockPath must be acquired before this daemon can submit any order. A second
     // paper daemon that finds the marker held fails closed below.
+    // The bounded shutdown-settlement window is on by default in DEFAULT_EXECUTOR (safe by
+    // default), so no explicit override is needed here.
     { ...DEFAULT_EXECUTOR, dryRun: DRY_RUN, provenance, authorityMode: 'required', authorityLockPath: authorityLockPath() },
     (...a: unknown[]) => log('paper:', ...a),
   )

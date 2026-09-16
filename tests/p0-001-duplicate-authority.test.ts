@@ -65,7 +65,7 @@ describe('P0-001 duplicate execution authority (remediated)', () => {
   const build = () => new PaperExecutor(
     new DeterministicBroker(),
     async (symbols: string[]) => new Map(symbols.map(s => [s, 10])),
-    { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath },
+    { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath, settlementPollDelayMs: 0 },  // deterministic: no wall-clock wait
     () => {},
   )
 
@@ -106,7 +106,7 @@ describe('P0-001 duplicate execution authority (remediated)', () => {
     const brokerB = new DeterministicBroker()
     const mk = (b: DeterministicBroker) => new PaperExecutor(
       b, async (s: string[]) => new Map(s.map(x => [x, 10])),
-      { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath }, () => {},
+      { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath, settlementPollDelayMs: 0 }, () => {},
     )
     const producerA = mk(brokerA)
     const producerB = mk(brokerB)

@@ -25,7 +25,7 @@ describe('CHAOS · restart + authority recovery', () => {
   const build = (over: Partial<import('@/lib/execution/executor').ExecutorConfig> = {}) => new PaperExecutor(
     broker,
     async (symbols: string[]) => new Map(symbols.map(s => [s, price])),
-    { ...DEFAULT_EXECUTOR, authorityMode: 'disabled_for_test', ...over },
+    { ...DEFAULT_EXECUTOR, authorityMode: 'disabled_for_test', settlementPollDelayMs: 0, ...over },  // deterministic: no wall-clock wait
     () => {},
   )
 

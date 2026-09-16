@@ -34,7 +34,7 @@ describe('CHAOS · shutdown + authority', () => {
   const build = () => new PaperExecutor(
     broker,
     async (symbols: string[]) => new Map(symbols.map(s => [s, price])),
-    { ...DEFAULT_EXECUTOR, authorityMode: 'required', authorityLockPath: lockPath },
+    { ...DEFAULT_EXECUTOR, authorityMode: 'required', authorityLockPath: lockPath, settlementPollDelayMs: 0 },  // deterministic: no wall-clock wait
     () => {},
   )
   const armPending = async () => {

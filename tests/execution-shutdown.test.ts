@@ -35,7 +35,7 @@ describe('graceful shutdown sequence', () => {
   const build = () => new PaperExecutor(
     broker,
     async (symbols: string[]) => new Map(symbols.map(s => [s, price])),
-    { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath },
+    { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath, settlementPollDelayMs: 0 },  // deterministic: no wall-clock wait
     () => {},
   )
 

@@ -111,7 +111,7 @@ describe('execution authority lease', () => {
     const ex = new PaperExecutor(
       broker,
       async (s: string[]) => new Map(s.map(x => [x, 10])),
-      { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath },
+      { ...DEFAULT_EXECUTOR, authorityLockPath: lockPath, settlementPollDelayMs: 0 },  // deterministic: no wall-clock wait
       () => {},
     )
     await ex.init()
@@ -158,7 +158,7 @@ describe('authority required by default (executor-enforced)', () => {
     new PaperExecutor(
       new DeterministicBroker(),
       async (s: string[]) => new Map(s.map(x => [x, 10])),
-      { ...DEFAULT_EXECUTOR, ...over },
+      { ...DEFAULT_EXECUTOR, settlementPollDelayMs: 0, ...over },  // deterministic default; a test may still override
       () => {},
     )
 
