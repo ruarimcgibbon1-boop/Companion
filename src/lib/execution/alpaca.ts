@@ -29,15 +29,58 @@ export function roundToTick(price: number): number {
     : Math.round(price * 10_000) / 10_000
 }
 
-function num(v: unknown): number {
-  const n = typeof v === 'string' ? Number(v) : typeof v === 'number' ? v : NaN
-  return Number.isFinite(n) ? n : 0
+/**
+ * Raised when a broker numeric field cannot be trusted. Fail closed: the adapter throws
+ * rather than return a partially fabricated object (a false broker-flat / zero-equity /
+ * zero-risk reading). Callers already treat a broker read that throws as "unknown truth".
+ */
+export class BrokerDataError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BrokerDataError'
+  }
 }
 
-function numOrNull(v: unknown): number | null {
-  if (v == null) return null
-  const n = typeof v === 'string' ? Number(v) : typeof v === 'number' ? v : NaN
-  return Number.isFinite(n) ? n : null
+const ABSENT = Symbol('absent')
+
+/**
+ * Classify a raw broker numeric. ZERO is valid data; UNKNOWN/INVALID is NOT zero and must
+ * never be coerced to one (P1-001). Distinguishes three outcomes so required and optional
+ * fields can each fail in the right way:
+ *   - a finite number (incl. 0 / '0' / '0.0')      → that number
+ *   - ABSENT (null/undefined/empty/whitespace)      → the field is missing
+ *   - 'INVALID' (non-numeric string, NaN, ±Infinity, non-string/number) → the field is corrupt
+ * Whitespace is treated as ABSENT rather than passed to Number() (which turns '' / '   ' into 0).
+ */
+function classifyNumeric(v: unknown): number | typeof ABSENT | 'INVALID' {
+  if (v == null) return ABSENT
+  if (typeof v === 'string') {
+    const t = v.trim()
+    if (t === '') return ABSENT
+    const n = Number(t)
+    return Number.isFinite(n) ? n : 'INVALID'
+  }
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 'INVALID'
+  return 'INVALID'
+}
+
+/** REQUIRED broker numeric: a finite number, else fail closed (missing or invalid both throw). */
+function reqNum(v: unknown, field: string): number {
+  const r = classifyNumeric(v)
+  if (typeof r === 'number') return r
+  throw new BrokerDataError(`required broker numeric "${field}" is ${r === ABSENT ? 'missing' : 'invalid'}: ${JSON.stringify(v)}`)
+}
+
+/**
+ * OPTIONAL broker numeric: absent (null/undefined/empty/whitespace) → null; a finite number →
+ * that number; a non-empty MALFORMED value ('abc', NaN, ±Infinity) → throw. The distinction
+ * matters for evidence integrity — a corrupt price must not silently read as "no price".
+ */
+function optNum(v: unknown, field: string): number | null {
+  const r = classifyNumeric(v)
+  if (r === ABSENT) return null
+  if (typeof r === 'number') return r
+  throw new BrokerDataError(`optional broker numeric "${field}" is invalid: ${JSON.stringify(v)}`)
 }
 
 /**
@@ -85,26 +128,26 @@ function toOrder(raw: RawOrder): BrokerOrder {
     symbol: raw.symbol,
     side: raw.side === 'sell' ? 'sell' : 'buy',
     status: mapStatus(raw.status),
-    qty: num(raw.qty),
-    filledQty: num(raw.filled_qty),
-    filledAvgPrice: numOrNull(raw.filled_avg_price),
-    limitPrice: numOrNull(raw.limit_price),
+    qty: reqNum(raw.qty, 'order.qty'),
+    filledQty: reqNum(raw.filled_qty, 'order.filledQty'),
+    filledAvgPrice: optNum(raw.filled_avg_price, 'order.filledAvgPrice'),
+    limitPrice: optNum(raw.limit_price, 'order.limitPrice'),
     submittedAt: raw.submitted_at ? new Date(raw.submitted_at).getTime() : Date.now(),
     rejectReason: null,
   }
 }
 
 function toPosition(p: Record<string, unknown>): BrokerPosition {
-  const qty = num(p.qty)
+  const qty = reqNum(p.qty, 'position.qty')
   return {
     symbol: String(p.symbol),
     qty,
     // Older payloads omit qty_available; assume nothing is held rather than
     // reporting zero free shares and stalling every sell behind the wait loop.
-    qtyAvailable: p.qty_available == null ? qty : num(p.qty_available),
-    avgEntryPrice: num(p.avg_entry_price),
-    currentPrice: numOrNull(p.current_price),
-    unrealizedPl: num(p.unrealized_pl),
+    qtyAvailable: p.qty_available == null ? qty : reqNum(p.qty_available, 'position.qtyAvailable'),
+    avgEntryPrice: reqNum(p.avg_entry_price, 'position.avgEntryPrice'),
+    currentPrice: optNum(p.current_price, 'position.currentPrice'),
+    unrealizedPl: reqNum(p.unrealized_pl, 'position.unrealizedPl'),
   }
 }
 
@@ -151,10 +194,10 @@ export class AlpacaBroker implements Broker {
   async getAccount(): Promise<BrokerAccount> {
     const a = await this.req<Record<string, unknown>>('/v2/account')
     return {
-      equity: num(a.equity),
-      cash: num(a.cash),
-      buyingPower: num(a.buying_power),
-      daytradeCount: num(a.daytrade_count),
+      equity: reqNum(a.equity, 'account.equity'),
+      cash: reqNum(a.cash, 'account.cash'),
+      buyingPower: reqNum(a.buying_power, 'account.buyingPower'),
+      daytradeCount: reqNum(a.daytrade_count, 'account.daytradeCount'),
       blocked: a.trading_blocked === true || a.account_blocked === true,
     }
   }
@@ -267,8 +310,9 @@ export class AlpacaBroker implements Broker {
       .map(a => ({
         symbol: String(a.symbol),
         side: a.side === 'sell' ? 'sell' as const : 'buy' as const,
-        qty: num(a.qty),
-        price: num(a.price),
+        // A malformed fill qty/price must never become a trusted 0 — fail closed.
+        qty: reqNum(a.qty, 'fill.qty'),
+        price: reqNum(a.price, 'fill.price'),
         filledAt: a.transaction_time ? new Date(String(a.transaction_time)).getTime() : sinceMs,
         orderId: (a.order_id as string) ?? null,
       }))

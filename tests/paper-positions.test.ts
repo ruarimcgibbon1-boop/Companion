@@ -167,7 +167,7 @@ describe('target progress and reconciliation', () => {
   it('marks T2 hit once the ledger records a filled T2 leg', () => {
     const t = trade({
       t1Done: true,
-      exits: [{ qty: 700, reason: 't2', intendedPrice: 5.8, decisionPrice: 5.8, orderId: 'o', fillPrice: 5.8, filledAt: 1, slippagePct: 0 }],
+      exits: [{ qty: 700, orderedQty: 700, reason: 't2', intendedPrice: 5.8, decisionPrice: 5.8, orderId: 'o', fillPrice: 5.8, filledAt: 1, slippagePct: 0 }],
     })
     expect(buildPositionView([brokerPos()], [t], ASOF).positions[0].targetState).toBe('t2_hit')
   })

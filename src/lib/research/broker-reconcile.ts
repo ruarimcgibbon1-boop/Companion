@@ -152,8 +152,18 @@ export function reconcile(
       classification = 'MANUAL_REVIEW'
       notes.push('broker fill retrieval incomplete — nothing can be VERIFIED')
     } else if (t.aborted && !bl) {
-      classification = 'VERIFIED'
-      notes.push('aborted/unfilled locally and no broker fills — agree (no trade)')
+      // Aborted locally with no broker fills. "No trade" can only be VERIFIED with
+      // authoritative POSITION evidence proving the broker is flat — never on absence alone.
+      if (!positionSnapshotAvailable) {
+        classification = 'MANUAL_REVIEW'
+        notes.push('aborted/unfilled locally, no broker fills, but NO position snapshot — flatness unconfirmed, cannot VERIFY')
+      } else if (posQty !== 0) {
+        classification = 'LOCAL_FLAT_BROKER_NONFLAT'
+        notes.push(`aborted/unfilled locally but broker holds ${posQty}`)
+      } else {
+        classification = 'VERIFIED'
+        notes.push('aborted/unfilled locally, no broker fills, broker position flat — agree (no trade)')
+      }
     } else if (!bl) {
       classification = 'UNMATCHED_LOCAL_TRADE'
       notes.push('local trade has no broker fills mapped by client_order_id')
@@ -189,10 +199,26 @@ export function reconcile(
     } else if (!brokerPnlComputable) {
       classification = 'PNL_UNRESOLVED'
       notes.push('broker P&L not reconstructable from available fills')
-    } else if (delta.pnl != null && Math.abs(delta.pnl) > USD_TOL) {
+    } else if (brokerPnl == null || !Number.isFinite(brokerPnl)) {
+      // A non-finite broker P&L (e.g. from a malformed fill reaching ledger arithmetic) is
+      // INVALID EVIDENCE. It must NOT reach the tolerance comparison, where Math.abs(NaN) > tol
+      // silently evaluates false and falls through to VERIFIED (P1-008-C).
+      classification = 'MANUAL_REVIEW'
+      notes.push('broker P&L is non-finite (invalid evidence) — cannot VERIFY')
+    } else if (lView.realizedPnl == null || !Number.isFinite(lView.realizedPnl)) {
+      // A filled, closed trade cannot be VERIFIED while local realized P&L is missing/non-finite:
+      // there is no finite input to compare (P1-008-B). delta.pnl would be null and skip the guard.
+      classification = 'PNL_UNRESOLVED'
+      notes.push('local realized P&L missing/non-finite — P&L comparison input unavailable, cannot VERIFY')
+    } else if (delta.pnl == null || !Number.isFinite(delta.pnl)) {
+      classification = 'MANUAL_REVIEW'
+      notes.push('P&L delta is null/non-finite — invalid evidence, cannot VERIFY')
+    } else if (Math.abs(delta.pnl) > USD_TOL) {
       classification = 'MANUAL_REVIEW'
       notes.push(`P&L delta ${delta.pnl.toFixed(4)} exceeds tolerance with matched quantities`)
     } else {
+      // VERIFIED only after every prerequisite is proven: complete retrieval, matched fills,
+      // position evidence, finite local & broker P&L, quantities reconcile, P&L within tolerance.
       classification = 'VERIFIED'
     }
 

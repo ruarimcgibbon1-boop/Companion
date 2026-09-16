@@ -147,7 +147,10 @@ export function decideExit(
  * stop. They are not unprotected: a resting limit is already working them.
  */
 export function workingExitQty(trade: PaperTrade): number {
-  return trade.exits.reduce((n, l) => (l.orderId && l.fillPrice == null ? n + l.qty : n), 0)
+  // A leg reserves its still-WORKING remainder while its order is non-terminal (orderId set),
+  // NOT zero once a first partial books a fillPrice (the P1-003 defect). Reserved =
+  // orderedQty − cumulativeFilled, floored at 0.
+  return trade.exits.reduce((n, l) => (l.orderId ? n + Math.max(0, l.orderedQty - l.qty) : n), 0)
 }
 
 /** Signed slippage in %, positive = worse for a buy, negative = worse for a sell. */
@@ -651,7 +654,10 @@ export class PaperExecutor {
 
     for (const trade of live) {
       try {
-        if (trade.state === 'pending_entry') await this.reconcileEntry(trade, now)
+        // Track the entry order until it is TERMINAL — for pending_entry AND for an open
+        // trade whose entry order is still filling (P1-002). Folds cumulative entry fills
+        // into entry basis; a trade being `open` does not end the entry lifecycle.
+        if (trade.entryOrderId && !trade.entryOrderTerminal) await this.reconcileEntry(trade, now)
       } catch (e) {
         this.log(`entry reconcile failed ${trade.symbol}: ${(e as Error).message}`)
       }
@@ -748,44 +754,57 @@ export class PaperExecutor {
     this.persist()
   }
 
+  /**
+   * Reconcile the ENTRY ORDER against fresh broker truth. Called every tick while the entry
+   * order is non-terminal (pending_entry, AND open trades whose entry order is still working)
+   * — a trade being `open` does NOT end the entry lifecycle (P1-002). It folds cumulative
+   * entry fills idempotently (order-authoritative basis/VWAP), transitions pending→open on the
+   * first partial, and marks `entryOrderTerminal` once the broker order is terminal.
+   */
   private async reconcileEntry(trade: PaperTrade, now: number): Promise<void> {
-    if (!trade.entryOrderId) { trade.state = 'aborted'; return }
-    const order = await this.broker.getOrder(trade.entryOrderId)
+    if (!trade.entryOrderId) { trade.state = 'aborted'; trade.entryOrderTerminal = true; return }
+    let order
+    try {
+      order = await this.broker.getOrder(trade.entryOrderId)
+    } catch (e) {
+      this.log(`entry order read failed ${trade.symbol}: ${(e as Error).message}`)
+      return // transient — retry next tick, never decide from a guess
+    }
     if (!order) return
+
+    // Fold any NEW cumulative entry fill (idempotent; never decreases). The broker order's
+    // cumulative filled qty and average price are the entry basis — position qty is NOT.
+    if (order.filledQty > trade.entryFillQty) {
+      await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
+    }
 
     const timedOut = trade.entrySubmittedAt != null && now - trade.entrySubmittedAt > this.config.entryTimeoutMs
 
-    if (order.status === 'filled' || (order.filledQty > 0 && (timedOut || order.status === 'canceled'))) {
-      await this.bookEntryFill(trade, order.filledQty, order.filledAvgPrice ?? trade.limitPrice, now)
-      if (order.status !== 'filled') await this.broker.cancelOrder(trade.entryOrderId)
-      return
-    }
-
-    if (order.status === 'rejected' || order.status === 'canceled' || order.status === 'expired') {
-      trade.state = 'aborted'
-      this.touch(trade, `entry ${order.status} unfilled`)
-      appendEvent({ event: 'entry_aborted', symbol: trade.symbol, tradeId: trade.id, status: order.status })
+    if (isTerminalOrder(order.status)) {
+      // Entry order will fill no further — stop tracking it.
+      trade.entryOrderTerminal = true
+      if (trade.entryFillQty <= 0) {
+        trade.state = 'aborted'
+        this.touch(trade, `entry ${order.status} unfilled`)
+        appendEvent({ event: 'entry_aborted', symbol: trade.symbol, tradeId: trade.id, status: order.status })
+      }
       return
     }
 
     if (timedOut) {
-      // Unfilled at the limit means price moved away without us — a clean, countable
-      // outcome, better than chasing. BUT the cancel can lose the race: the broker may fill
-      // the entry WHILE we cancel it. So we NEVER decide abort from the pre-cancel snapshot
-      // (`order`) above — that stale read is exactly the P0-002 defect. Settle from FRESH
-      // broker truth read AFTER the cancel (the same broker-truth-after-cancel pattern
-      // invalidatePendingEntry already uses).
+      // The move left without us. Cancel the (remaining) entry and settle from FRESH broker
+      // truth read AFTER the cancel — never from the pre-cancel snapshot (the P0-002 race).
       const outcome = await this.settleCanceledEntry(trade, now, 1)
-      if (outcome === 'terminal_unfilled') {
+      if (outcome !== 'unresolved') trade.entryOrderTerminal = true
+      if (outcome === 'terminal_unfilled' && trade.entryFillQty <= 0) {
         trade.state = 'aborted'
         this.touch(trade, `entry timed out unfilled after ${Math.round(this.config.entryTimeoutMs / 1000)}s`)
         this.log(`NO FILL ${trade.symbol} — limit ${trade.limitPrice.toFixed(4)} never traded`)
         appendEvent({ event: 'entry_timeout', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id, limitPrice: trade.limitPrice })
       }
-      // 'filled'      → the raced fill was booked + is now managed (never disowned).
-      // 'unresolved'  → broker truth not yet terminal; stays pending_entry and is retried on
-      //                 the next tick. We do NOT silently abort a still-live order.
+      // 'filled' → partial/full booked + managed; 'unresolved' → stays live, retried next tick.
     }
+    // Non-terminal, not timed out: any partial is booked; keep polling until terminal.
   }
 
   /**
@@ -896,15 +915,27 @@ export class PaperExecutor {
     // next tick re-checks broker truth without re-issuing the cancel or the audit event.
   }
 
-  private async bookEntryFill(trade: PaperTrade, qty: number, price: number, now: number): Promise<void> {
-    // Provenance is recorded regardless of validity, so a malformed fill is fully auditable.
-    // Which session we got filled in decides which risk budget this trade spends.
-    trade.entrySession = getSessionType(now)
-    trade.entryFillQty = qty
-    trade.entryFillPrice = price
+  /**
+   * Fold a CUMULATIVE entry-order observation into entry accounting. `cumQty`/`cumAvgPrice`
+   * are the broker ENTRY ORDER's cumulative filled quantity and average price — order truth,
+   * the authority for entry basis (never position qty). Idempotent and monotonic: a repeat or
+   * out-of-order LOWER cumulative books nothing and never reduces already-booked accounting
+   * (P1-002). Each new increment adds to the open position and re-derives planned risk from
+   * the corrected cumulative basis.
+   */
+  private async bookEntryFill(trade: PaperTrade, cumQty: number, cumAvgPrice: number, now: number): Promise<void> {
+    // Never decrease: ignore a flat/lower/out-of-order cumulative observation.
+    if (!(cumQty > trade.entryFillQty)) return
+    const increment = cumQty - trade.entryFillQty
+    const firstFill = trade.entryFillQty === 0
+
+    // Which session the entry FIRST filled in decides which risk budget this trade spends.
+    if (firstFill) trade.entrySession = getSessionType(now)
+    trade.entryFillQty = cumQty
+    trade.entryFillPrice = cumAvgPrice   // broker cumulative VWAP — reconstructed from ORDER truth
     trade.entryFilledAt = now
-    trade.openQty = qty
-    trade.entrySlippagePct = slippagePct(trade.intendedEntry, price)
+    trade.openQty += increment           // fold the newly-filled entry shares into the position
+    trade.entrySlippagePct = slippagePct(trade.intendedEntry, cumAvgPrice)
 
     // FAIL CLOSED on post-fill stop inversion. This book is long-only (every exit is a
     // sell), so a valid long fill MUST be strictly above its stop. A favorable fill that
@@ -912,26 +943,25 @@ export class PaperExecutor {
     // position already through its invalidation. The old `Math.max(price - stop, 0)`
     // silently clamped planned risk to 0 and admitted it; instead we detect it, cancel
     // any remainder, and flatten the filled shares — never a zero/negative-risk position.
-    const riskPerShare = price - trade.initialStop
+    const riskPerShare = cumAvgPrice - trade.initialStop
     if (!(riskPerShare > 0)) {
-      await this.handleInvalidPostFillGeometry(trade, qty, price, riskPerShare, now)
+      await this.handleInvalidPostFillGeometry(trade, cumQty, cumAvgPrice, riskPerShare, now)
       return
     }
 
     trade.state = 'open'
-    // Risk is re-derived from the real fill: a worse fill on the same stop is strictly
-    // more dollars at risk, and the governor should see the true number. No clamp — the
-    // non-positive (inverted) case is handled above.
-    trade.plannedRisk = qty * riskPerShare
+    // Risk is re-derived from the real cumulative fill: a worse fill on the same stop is
+    // strictly more dollars at risk, and the governor should see the true number.
+    trade.plannedRisk = cumQty * riskPerShare
     this.touch(trade)
     const slip = trade.entrySlippagePct
     this.log(
-      `FILL ${trade.symbol} ${qty} sh @ ${price.toFixed(4)} ` +
+      `FILL ${trade.symbol} +${increment} sh (cum ${cumQty}) @ ${cumAvgPrice.toFixed(4)} ` +
       `(intended ${trade.intendedEntry.toFixed(4)}, slip ${slip == null ? '—' : `${slip >= 0 ? '+' : ''}${slip.toFixed(2)}%`})`,
     )
     appendEvent({
       event: 'entry_filled', symbol: trade.symbol, tradeId: trade.id,
-      qty, fillPrice: price, intendedEntry: trade.intendedEntry, slippagePct: slip,
+      qty: increment, cumulativeQty: cumQty, fillPrice: cumAvgPrice, intendedEntry: trade.intendedEntry, slippagePct: slip,
     })
   }
 
@@ -958,8 +988,17 @@ export class PaperExecutor {
       fillPrice: price, initialStop: trade.initialStop, filledQty: qty,
       intendedEntry: trade.intendedEntry, originalPlannedRisk,
     })
-    // Cancel any unfilled remainder of the entry order (idempotent — cancels the symbol's working orders).
-    if (trade.entryOrderId) { try { await this.broker.cancelOpenOrders(trade.symbol) } catch { /* best-effort */ } }
+    // Cancel any unfilled remainder of the entry order, then flatten the filled shares. Cancel
+    // BY ID (kills a partially_filled remainder that cancelOpenOrders — which only cancels
+    // 'open' orders — would miss) UNLESS the geometry-invalidation path already issued the
+    // cancel (avoid double-cancel spam); then sweep the symbol's other working orders. The
+    // entry order is done once we flatten, so mark its lifecycle terminal.
+    if (trade.entryOrderId) {
+      const alreadyCancelledByGeometry = trade.executionWarnings.some(w => w.startsWith('ENTRY_GEOMETRY_INVALIDATED'))
+      if (!alreadyCancelledByGeometry) { try { await this.broker.cancelOrder(trade.entryOrderId) } catch { /* best-effort */ } }
+      try { await this.broker.cancelOpenOrders(trade.symbol) } catch { /* best-effort */ }
+      trade.entryOrderTerminal = true
+    }
     await this.flattenFilledQty(trade, now)
   }
 
@@ -978,7 +1017,7 @@ export class PaperExecutor {
     const prices = await this.getPrices([trade.symbol]).catch(() => new Map<string, number>())
     const price = prices.get(trade.symbol) ?? trade.entryFillPrice ?? trade.initialStop
     const leg: ExitLeg = {
-      qty: trade.openQty, reason: 'invalid_geometry', intendedPrice: price, decisionPrice: price,
+      qty: 0, orderedQty: trade.openQty, reason: 'invalid_geometry', intendedPrice: price, decisionPrice: price,
       orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
     }
     const order = await this.broker.submitLimit({
@@ -1003,6 +1042,10 @@ export class PaperExecutor {
       if (!leg.orderId) continue
       const order = await this.broker.getOrder(leg.orderId)
       if (!order) continue
+      // Broker is authoritative for the ordered quantity too — keep orderedQty in sync so the
+      // still-working reservation (orderedQty − filled) is correct, incl. for legacy legs
+      // loaded without it. `order.qty` is a required broker numeric (fails closed if malformed).
+      if (order.qty > 0) leg.orderedQty = order.qty
       if (order.filledQty > 0 && order.filledAvgPrice != null) {
         // filledQty is CUMULATIVE — bookExitFill books only the increment.
         this.bookExitFill(trade, leg, order.filledQty, order.filledAvgPrice)
@@ -1021,7 +1064,7 @@ export class PaperExecutor {
         const leg: ExitLeg = {
           // A broker-side stop fires without us observing a price, so there is no
           // decision price — the gap/concession split doesn't apply to this path.
-          qty: 0, reason: 'stop', intendedPrice: trade.currentStop,
+          qty: 0, orderedQty: stopOrder.qty, reason: 'stop', intendedPrice: trade.currentStop,
           decisionPrice: null,
           orderId: stopOrder.id, fillPrice: null, filledAt: null, slippagePct: null,
         }
@@ -1107,7 +1150,7 @@ export class PaperExecutor {
     const qty = Math.min(remainder, extQty)
     const vwap = external.reduce((s, f) => s + f.price * f.qty, 0) / extQty
     const leg: ExitLeg = {
-      qty, reason: 'external', intendedPrice: trade.currentStop, decisionPrice: null,
+      qty, orderedQty: qty, reason: 'external', intendedPrice: trade.currentStop, decisionPrice: null,
       orderId: null, fillPrice: vwap, filledAt: external[external.length - 1]?.filledAt ?? Date.now(),
       slippagePct: null,
     }
@@ -1198,6 +1241,29 @@ export class PaperExecutor {
       return brokerQty
     }
 
+    // FAIL CLOSED on an ENTRY-BASIS GAP (P1-002). The broker position holds MORE shares than
+    // the ENTRY ORDER ever accounted for, and that order is terminal — so there is no order
+    // truth left to reconstruct the cost basis of the extra shares. NEVER fabricate a basis
+    // from position quantity: record the exposure for the risk backstop, quarantine the trade
+    // (manual_review), and block new entries until a human reconciles it. If the entry order
+    // is NOT yet terminal, this is deferred — reconcileEntry folds the order's cumulative fills
+    // first, so a transient position>entry lag never trips this.
+    if (brokerQty > trade.entryFillQty && trade.entryOrderTerminal) {
+      const warn = `entry basis gap: broker holds ${brokerQty} but entry order accounted only ${trade.entryFillQty} — cost basis unreconstructable`
+      if (!trade.executionWarnings.includes(warn)) {
+        trade.executionWarnings.push(warn)
+        this.touch(trade, warn)
+        appendEvent({
+          event: 'entry_basis_unreconstructable', symbol: trade.symbol, setupId: trade.setupId, tradeId: trade.id,
+          brokerQty, entryFillQty: trade.entryFillQty,
+        })
+      }
+      trade.openQty = brokerQty            // exposure is known — surface it to the risk backstop
+      trade.reconciliationStatus = 'manual_review'
+      this.reconciliationUnresolved = true // fail closed: no new entries until reconciled
+      return brokerQty
+    }
+
     if (brokerQty === localQty) {
       // Broker agrees. Promote a finished trade to verified — the only path into
       // the research/learning dataset (see verifiedClosedTrades). A prior `discrepancy`
@@ -1281,7 +1347,7 @@ export class PaperExecutor {
     const session = getSessionType(now)
     const limit = exitLimitPrice(Math.min(price, decision.intendedPrice), this.config.exitSlipTolerancePct)
     const leg: ExitLeg = {
-      qty: sellQty, reason: decision.reason, intendedPrice: decision.intendedPrice,
+      qty: 0, orderedQty: sellQty, reason: decision.reason, intendedPrice: decision.intendedPrice,
       decisionPrice: price,
       orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
     }
@@ -1420,7 +1486,7 @@ export class PaperExecutor {
         if (price == null) { this.touch(trade, 'flatten: no price'); continue }
         const flatQty = Math.min(trade.openQty, brokerQty)
         const leg: ExitLeg = {
-          qty: flatQty, reason, intendedPrice: price, decisionPrice: price,
+          qty: 0, orderedQty: flatQty, reason, intendedPrice: price, decisionPrice: price,
           orderId: null, fillPrice: null, filledAt: null, slippagePct: null,
         }
         const order = await this.broker.submitLimit({

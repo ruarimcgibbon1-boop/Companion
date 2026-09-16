@@ -68,6 +68,13 @@ export class DeterministicBroker implements Broker {
   readonly failGetOrder = new Set<string>()
   /** Order ids for which cancelOrder throws (models a failed cancel request). */
   readonly failCancel = new Set<string>()
+  /**
+   * One-shot: the NEXT sell order to be read via getOrder fills only this many shares
+   * (cumulative) and STAYS working (partially_filled), reserving the unfilled remainder.
+   * Models a partial exit whose remainder is still held_for_orders at the broker. Consumed
+   * when first applied; re-reads keep the order at the same partial (it does not complete).
+   */
+  partialSellOnce: number | null = null
 
   private seq = 0
 
@@ -155,16 +162,30 @@ export class DeterministicBroker implements Broker {
       const inc = step.filledQty - o.filledQty
       o.status = step.status
       o.filledQty = step.filledQty
-      if (inc > 0 && o.side === 'buy') {
+      if (inc > 0) {
         o.filledAvgPrice = step.price ?? o.limitPrice
-        this.moveTruth(o.symbol, inc)
-        this.fills.push({ symbol: o.symbol, side: 'buy', qty: inc, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
+        this.moveTruth(o.symbol, o.side === 'buy' ? inc : -inc)
+        this.fills.push({ symbol: o.symbol, side: o.side, qty: inc, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
       }
       return { ...o }
     }
 
     // A working order the broker has not filled stays exactly as it is (filledQty 0, open).
+    // Checked BEFORE partialSellOnce so a resting protective stop (added to holdWorking by
+    // submitStop) is never consumed by the one-shot partial — only a genuine working exit is.
     if (this.holdWorking.has(id)) return { ...o }
+
+    // One-shot partial SELL that stays working (partially_filled), reserving the remainder.
+    if (o.side === 'sell' && this.partialSellOnce != null && this.partialSellOnce < o.qty && o.filledQty < this.partialSellOnce) {
+      const target = this.partialSellOnce
+      const inc = target - o.filledQty
+      o.filledQty = target
+      o.filledAvgPrice = o.limitPrice
+      o.status = 'partially_filled'
+      this.moveTruth(o.symbol, -inc)
+      this.fills.push({ symbol: o.symbol, side: 'sell', qty: inc, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
+      return { ...o }   // stays working at `target`; re-reads keep it partial (does not complete)
+    }
 
     // Default: an open order fills in full and moves broker truth (persisted on the stored order).
     if (o.status === 'open') {
@@ -200,13 +221,20 @@ export class DeterministicBroker implements Broker {
       this.fills.push({ symbol: o.symbol, side: 'buy', qty: fq, price: o.filledAvgPrice ?? 0, filledAt: Date.now(), orderId: o.id })
       return
     }
-    if (o.status === 'open') o.status = 'canceled'
+    // A working order goes terminal on cancel; a partially_filled order becomes `canceled`
+    // while KEEPING its already-filled quantity (Alpaca semantics).
+    if (o.status === 'open' || o.status === 'partially_filled') o.status = 'canceled'
   }
 
   async cancelOpenOrders(symbol: string): Promise<number> {
     let n = 0
     for (const o of this.orders.values()) {
-      if (o.symbol === symbol && o.status === 'open') { await this.cancelOrder(o.id); n++ }
+      // Alpaca's `GET /v2/orders?status=open` returns ALL non-terminal working orders,
+      // including partially_filled — so a partially-filled entry/exit remainder is cancelled
+      // too. Model that faithfully (was only 'open').
+      if (o.symbol === symbol && (o.status === 'open' || o.status === 'partially_filled')) {
+        await this.cancelOrder(o.id); n++
+      }
     }
     return n
   }

@@ -1447,8 +1447,8 @@ describe('computeRealized', () => {
     const t = trade({
       entryFillPrice: 10.05, entryFillQty: 100,
       exits: [
-        { qty: 50, reason: 't1', intendedPrice: 11, decisionPrice: 11, orderId: 'a', fillPrice: 11, filledAt: 1, slippagePct: 0 },
-        { qty: 50, reason: 't2', intendedPrice: 12, decisionPrice: 12, orderId: 'b', fillPrice: 12, filledAt: 2, slippagePct: 0 },
+        { qty: 50, orderedQty: 50, reason: 't1', intendedPrice: 11, decisionPrice: 11, orderId: 'a', fillPrice: 11, filledAt: 1, slippagePct: 0 },
+        { qty: 50, orderedQty: 50, reason: 't2', intendedPrice: 12, decisionPrice: 12, orderId: 'b', fillPrice: 12, filledAt: 2, slippagePct: 0 },
       ],
     })
     const r = computeRealized(t)!

@@ -13,7 +13,7 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
-import type { PaperTrade } from './types'
+import type { PaperTrade, ExitLeg } from './types'
 
 /** ET day key — the trading day, not the local calendar day. */
 export function etDayKey(ts: number = Date.now()): string {
@@ -69,7 +69,17 @@ export function isHalted(): boolean {
 function normalizeTrade(t: PaperTrade): PaperTrade {
   return {
     ...t,
-    exits: t.exits ?? [],
+    // Legacy ExitLeg records predate `orderedQty` (P1-003). Migrate WITHOUT fabricating an
+    // unsafe quantity: for an unfilled leg the legacy `qty` was the ORDERED amount, so map it
+    // to orderedQty and set filled `qty` to 0 (fully reserved). For a leg with a fill booked
+    // we cannot know the original order size, so seed orderedQty from the booked qty; any
+    // still-working leg has its orderedQty corrected from broker truth (order.qty) on the next
+    // reconcileExits — never inferred unsafely here.
+    exits: (t.exits ?? []).map(l => {
+      if (typeof (l as Partial<ExitLeg>).orderedQty === 'number') return l
+      const filled = l.fillPrice != null ? l.qty : 0
+      return { ...l, orderedQty: l.qty, qty: filled }
+    }),
     notes: t.notes ?? [],
     executionWarnings: t.executionWarnings ?? [],
     targets: t.targets ?? [],
@@ -77,6 +87,9 @@ function normalizeTrade(t: PaperTrade): PaperTrade {
     // loop actually picks them up (FIGR hydrated with a null status and would
     // otherwise never promote to verified or force-flat).
     reconciliationStatus: t.reconciliationStatus ?? 'pending',
+    // Legacy records predate entry-order lifecycle tracking (P1-002). A terminal trade's
+    // entry order is done; an active trade re-establishes truth from the broker on next tick.
+    entryOrderTerminal: t.entryOrderTerminal ?? (t.state === 'closed' || t.state === 'aborted'),
   }
 }
 

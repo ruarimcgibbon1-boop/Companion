@@ -154,7 +154,19 @@ export type ExitReason =
                       //   P&L reconciles, but kept out of learning (manual_review)
 
 export interface ExitLeg {
+  /**
+   * Cumulative FILLED shares for this leg — 0 at submit, updated by bookExitFill as the order
+   * fills. This is what realized-P&L accounting sums. Distinct from `orderedQty` (P1-003):
+   * the still-working reserved remainder is `orderedQty − qty` while the order is non-terminal.
+   */
   qty: number
+  /**
+   * Shares this exit order was SUBMITTED for (immutable intent), refreshed from broker truth
+   * (order.qty) on reconcile. For synthetic legs (external close, a fired protective stop) it
+   * equals the accounted quantity. Used to size the still-working reservation and the
+   * protective-stop free-share coverage — never conflated with filled `qty`.
+   */
+  orderedQty: number
   reason: ExitReason
   /** The level whose break triggered this leg — what the backtest would book. */
   intendedPrice: number
@@ -202,6 +214,13 @@ export interface PaperTrade {
   // ── Reality (what the broker did) ─────────────────────────────────────────
   entryOrderId: string | null
   entrySubmittedAt: number | null
+  /**
+   * True once the ENTRY ORDER has reached a terminal broker state (filled / canceled /
+   * rejected / expired). Until then the entry order stays broker-authoritative and its
+   * cumulative fills are folded into entry accounting EVEN AFTER the position is open — a
+   * trade being `open` does NOT mean the entry lifecycle is finished (P1-002).
+   */
+  entryOrderTerminal: boolean
   /**
    * Session the ENTRY filled in. Stored rather than derived so the premarket risk
    * budget survives a restart, and so a day's stats can be split by session.
@@ -294,6 +313,7 @@ export function newPaperTrade(
     plannedRisk: qty * Math.max(intendedEntry - signal.stop, 0),
     entryOrderId: null,
     entrySubmittedAt: null,
+    entryOrderTerminal: false,
     entrySession: null,
     entryFilledAt: null,
     entryFillPrice: null,
