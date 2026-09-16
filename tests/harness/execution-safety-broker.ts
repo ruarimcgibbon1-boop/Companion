@@ -82,6 +82,14 @@ export class DeterministicBroker implements Broker {
    * when first applied; re-reads keep the order at the same partial (it does not complete).
    */
   partialSellOnce: number | null = null
+  /**
+   * Steps assigned to the NEXT submitted SELL order's stepQueue at submit time — models a
+   * flatten/exit that settles ACROSS reads (working/unfilled on the first read, then filled
+   * on a later one, exactly like the real FPS flatten that filled ~0.5s after submit). The
+   * flatten order's id is only known at submit time, so this one-shot seeds it then; the
+   * existing stepQueue consumption in getOrder drives the rest. Consumed by the next sell.
+   */
+  sellStepsOnce: Array<{ status: BrokerOrderStatus; filledQty: number; price?: number }> | null = null
 
   private seq = 0
 
@@ -127,6 +135,11 @@ export class DeterministicBroker implements Broker {
       limitPrice: req.limitPrice, submittedAt: Date.now(), rejectReason: null,
     }
     this.orders.set(id, order)
+    // One-shot: script the NEXT sell's evolving broker view (a flatten that settles late).
+    if (req.side === 'sell' && this.sellStepsOnce) {
+      this.stepQueue.set(id, this.sellStepsOnce)
+      this.sellStepsOnce = null
+    }
     return order
   }
 

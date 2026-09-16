@@ -34,6 +34,19 @@ import { acquireExecutionAuthority, makeAuthorityMetadata, type ExecutionAuthori
  */
 const SHUTDOWN_SETTLEMENT_POLLS = 5
 
+/**
+ * Short bounded interval WAITED BETWEEN two unsuccessful shutdown settlement observations, so
+ * the loop is not five back-to-back API calls that can all complete inside the broker's own
+ * settlement latency (the real FPS flatten filled ~0.5s after submit; five instant reads on a
+ * fast link could miss it). Generic broker-jitter tolerance — NOT tuned to any specific fill
+ * time. Applied only between failed polls: never before the first observation, never after a
+ * success, never after the final allowed poll. Max added wait = (SHUTDOWN_SETTLEMENT_POLLS − 1)
+ * × this = 4 × 200ms = 800ms — short, bounded, fail-closed on exhaustion. This is the DEFAULT
+ * settlementPollDelayMs (SAFE BY DEFAULT — every production caller gets the window without opting
+ * in); the offline test harness overrides it to 0 for deterministic, wall-clock-free runs.
+ */
+export const SHUTDOWN_SETTLEMENT_POLL_DELAY_MS = 200
+
 export interface ExecutorConfig {
   sizing: SizingConfig
   risk: RiskConfig
@@ -69,6 +82,15 @@ export interface ExecutorConfig {
    * marker instead of the real home file. Ignored in 'disabled_for_test'.
    */
   authorityLockPath?: string
+  /**
+   * Wait, in ms, BETWEEN two unsuccessful shutdown settlement observations (see
+   * SHUTDOWN_SETTLEMENT_POLL_DELAY_MS). DEFAULTS to SHUTDOWN_SETTLEMENT_POLL_DELAY_MS so the
+   * broker-settlement window is a property of PaperExecutor itself — SAFE BY DEFAULT — and a
+   * production caller cannot silently lose it by omitting an override. The offline test harness
+   * sets it to 0 for determinism (no wall-clock wait under fake timers); 0 preserves the previous
+   * back-to-back polling exactly.
+   */
+  settlementPollDelayMs?: number
 }
 
 export const DEFAULT_EXECUTOR: ExecutorConfig = {
@@ -82,6 +104,9 @@ export const DEFAULT_EXECUTOR: ExecutorConfig = {
   // Authority is REQUIRED BY DEFAULT: an executor built from these defaults is not
   // execution-capable until it acquires the process-exclusive marker.
   authorityMode: 'required',
+  // SAFE BY DEFAULT: the broker-settlement window belongs to PaperExecutor, so any production
+  // caller gets it without opting in. Tests override to 0 for deterministic, wall-clock-free runs.
+  settlementPollDelayMs: SHUTDOWN_SETTLEMENT_POLL_DELAY_MS,
 }
 
 /** Fetches last prices for the symbols we hold. Injected so the executor stays feed-agnostic and testable. */
@@ -195,6 +220,11 @@ export class PaperExecutor {
     private readonly getPrices: PriceFetcher,
     private readonly config: ExecutorConfig = DEFAULT_EXECUTOR,
     private readonly log: (...a: unknown[]) => void = console.log,
+    // Injectable so tests observe the settlement pacing without waiting on the wall clock. The
+    // default is a real timer sleep; a 0/negative ms is a no-op (never schedules a timer), so a
+    // zero-delay config never touches fake timers.
+    private readonly sleep: (ms: number) => Promise<void> =
+      (ms) => ms > 0 ? new Promise(resolve => setTimeout(resolve, ms)) : Promise.resolve(),
   ) {}
 
   async init(): Promise<void> {
@@ -1530,24 +1560,56 @@ export class PaperExecutor {
     // 2–7. Pending entries first, then confirmed open exposure (flattenAll enforces that order).
     await this.flattenAll('risk_halt')
 
-    // 8. Classify. Local truth first…
-    const stillPending = this.trades.some(t => t.state === 'pending_entry')
-    const stillOpen = this.trades.some(t => t.state === 'open' && t.openQty > 0)
-
-    // …then BROKER truth: confirm flat for every symbol this session touched. A position we
-    // still see, or a broker we cannot query, is unresolved — never assume broker-flat.
-    let brokerResidual = false
+    // 8. BOUNDED FLATTEN SETTLEMENT + classification (C2-S). flattenAll submitted the flatten
+    //    sells; a freshly-submitted flatten can take a beat to settle at the broker — the real
+    //    FPS flatten filled ~0.5s AFTER submit. A single post-flatten read then saw the pre-fill
+    //    snapshot (position still held, order not yet terminal) and fail-closed to UNRESOLVED,
+    //    stranding a fill that completed moments later. So take up to SHUTDOWN_SETTLEMENT_POLLS
+    //    FRESH broker observations: each pass books any newly-settled exit fill idempotently
+    //    (reconcileExits — ORDER truth, never position qty), then re-reads LOCAL and BROKER
+    //    position, and we declare flat ONLY when both agree with nothing left unresolved. This is
+    //    the same bounded-poll discipline settleCanceledEntry already uses for a cancelled entry
+    //    (symmetric lifecycle). Between two UNSUCCESSFUL observations it waits a short bounded
+    //    interval (settlementPollDelayMs) so five reads cannot all land inside the broker's own
+    //    settlement latency; the wait is never taken before the first observation, after a success,
+    //    or after the final poll, so the max added wait is (POLLS−1) × the delay. It NEVER infers
+    //    flat from local state, NEVER loops unbounded, and fails closed on unreadable truth or an
+    //    exhausted budget (authority stays retained). A partial that settles leaves its unfilled
+    //    residual explicit (openQty>0), which blocks SAFE.
     const symbols = [...new Set(this.trades.map(t => t.symbol))]
-    for (const sym of symbols) {
-      try {
-        const pos = await this.broker.getPosition(sym)
-        if (pos && pos.qty > 0) brokerResidual = true
-      } catch {
-        brokerResidual = true // cannot confirm flat → fail closed
+    let stillPending = false
+    let stillOpen = false
+    let brokerResidual = false
+    let brokerUnreadable = false
+    for (let poll = 0; poll < SHUTDOWN_SETTLEMENT_POLLS; poll++) {
+      // Book any exit fill that has since settled on a still-open flattened trade (fresh order truth).
+      for (const trade of this.trades.filter(t => t.state === 'open' && t.openQty > 0)) {
+        try { await this.reconcileExits(trade) } catch { /* transient read — retry within the bound */ }
       }
+      // Local truth AFTER booking this pass.
+      stillPending = this.trades.some(t => t.state === 'pending_entry')
+      stillOpen = this.trades.some(t => t.state === 'open' && t.openQty > 0)
+      // Fresh BROKER position for every symbol this session touched. A position we still see, or a
+      // broker we cannot query, is unresolved — never assume broker-flat.
+      brokerResidual = false
+      brokerUnreadable = false
+      for (const sym of symbols) {
+        try {
+          const pos = await this.broker.getPosition(sym)
+          if (pos && pos.qty > 0) brokerResidual = true
+        } catch {
+          brokerUnreadable = true // cannot confirm flat → fail closed
+        }
+      }
+      // Settled: local flat AND broker flat AND nothing unresolved. Stop early — no needless polls.
+      if (!this.reconciliationUnresolved && !stillPending && !stillOpen && !brokerResidual && !brokerUnreadable) break
+      // Not settled: give the broker a short bounded interval to complete a just-submitted flatten
+      // before the NEXT fresh observation. Only BETWEEN failed polls — never before the first
+      // observation, never after a success (we broke above), never after the final allowed poll.
+      if (poll < SHUTDOWN_SETTLEMENT_POLLS - 1) await this.sleep(this.config.settlementPollDelayMs ?? 0)
     }
 
-    const safe = !this.reconciliationUnresolved && !stillPending && !stillOpen && !brokerResidual
+    const safe = !this.reconciliationUnresolved && !stillPending && !stillOpen && !brokerResidual && !brokerUnreadable
     if (safe) {
       // 9. Release authority only now that exposure is proven resolved.
       this.releaseAuthority()
@@ -1560,10 +1622,10 @@ export class PaperExecutor {
     const reason =
       `shutdown UNRESOLVED — ` +
       `reconciliationUnresolved=${this.reconciliationUnresolved} pendingLeft=${stillPending} ` +
-      `openLeft=${stillOpen} brokerResidual=${brokerResidual}`
+      `openLeft=${stillOpen} brokerResidual=${brokerResidual} brokerUnreadable=${brokerUnreadable}`
     appendEvent({
       event: 'shutdown_unresolved', broker: this.broker.name, safe: false,
-      reconciliationUnresolved: this.reconciliationUnresolved, stillPending, stillOpen, brokerResidual,
+      reconciliationUnresolved: this.reconciliationUnresolved, stillPending, stillOpen, brokerResidual, brokerUnreadable,
     })
     this.log('╔════════════════════════════════════════════════════════════════════╗')
     this.log('  SHUTDOWN UNRESOLVED — authority marker RETAINED (not released)')
