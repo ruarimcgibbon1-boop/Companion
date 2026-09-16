@@ -28,8 +28,13 @@ export interface BrokerAccount {
   equity: number
   cash: number
   buyingPower: number
-  /** Day trades in the trailing 5 sessions — irrelevant on a $100k paper account, fatal under $25k live. */
-  daytradeCount: number
+  /**
+   * Day trades in the trailing 5 sessions — informational today, but PDT-relevant on a small
+   * (<$25k) account. Some real Alpaca account payloads OMIT `daytrade_count` entirely, so this
+   * is `number | null`: null means the broker did not report it (UNKNOWN), NEVER a fabricated 0.
+   * A future PDT gate must treat null as unknown (fail closed), not as "no day trades".
+   */
+  daytradeCount: number | null
   /** Broker-side halt. Any of these true means we place nothing. */
   blocked: boolean
 }

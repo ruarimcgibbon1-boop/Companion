@@ -53,7 +53,9 @@ async function main() {
       process.exit(1)
     }
     console.log(ok('account is tradable'))
-    if (account.daytradeCount > 0) {
+    if (account.daytradeCount == null) {
+      console.log('  · day-trade count: not reported by the broker (unknown)')
+    } else if (account.daytradeCount > 0) {
       console.log(`  · ${account.daytradeCount} day trades in the trailing 5 sessions (irrelevant at paper equity)`)
     }
 

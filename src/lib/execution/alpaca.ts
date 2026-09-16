@@ -197,7 +197,11 @@ export class AlpacaBroker implements Broker {
       equity: reqNum(a.equity, 'account.equity'),
       cash: reqNum(a.cash, 'account.cash'),
       buyingPower: reqNum(a.buying_power, 'account.buyingPower'),
-      daytradeCount: reqNum(a.daytrade_count, 'account.daytradeCount'),
+      // Real Alpaca account payloads may legitimately OMIT daytrade_count (verified on a live
+      // paper account). It is not decision-critical today, so it is OPTIONAL: absent → null
+      // (UNKNOWN, never a fabricated 0), a valid number (incl. 0) is kept, and a present-but-
+      // malformed value still fails closed. Required decision-critical numerics stay reqNum.
+      daytradeCount: optNum(a.daytrade_count, 'account.daytradeCount'),
       blocked: a.trading_blocked === true || a.account_blocked === true,
     }
   }

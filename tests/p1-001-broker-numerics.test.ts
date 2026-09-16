@@ -122,3 +122,46 @@ describe('P1-001 broker numerics — genuine zero is preserved', () => {
     expect(order?.filledQty).toBe(0)
   })
 })
+
+// C2-R: real Alpaca paper /v2/account payloads legitimately OMIT daytrade_count. It is optional
+// (absent → null/UNKNOWN, never a fabricated 0), while the REQUIRED fields stay fail-closed.
+describe('P1-001 / C2-R — account.daytrade_count is optional (real Alpaca shape)', () => {
+  it('daytrade_count ABSENT → getAccount succeeds, daytradeCount = null (unknown, not 0)', async () => {
+    // The exact real-world shape found in Smoke A: equity/cash/buying_power present, no daytrade_count.
+    stubFetchJson({ equity: '83601.66', cash: '83601.66', buying_power: '334406.64' })
+    const acct = await broker().getAccount()
+    expect(acct.equity).toBeCloseTo(83601.66)
+    expect(acct.buyingPower).toBeCloseTo(334406.64)
+    expect(acct.daytradeCount).toBeNull()               // UNKNOWN, NOT fabricated 0
+  })
+
+  it("daytrade_count '0' → 0 (valid zero), positive '3' → 3", async () => {
+    stubFetchJson({ equity: '1', cash: '1', buying_power: '1', daytrade_count: '0' })
+    expect((await broker().getAccount()).daytradeCount).toBe(0)
+    vi.unstubAllGlobals()
+    stubFetchJson({ equity: '1', cash: '1', buying_power: '1', daytrade_count: '3' })
+    expect((await broker().getAccount()).daytradeCount).toBe(3)
+  })
+
+  it("daytrade_count '' → null (absent), NOT numeric zero via Number('')", async () => {
+    stubFetchJson({ equity: '1', cash: '1', buying_power: '1', daytrade_count: '' })
+    expect((await broker().getAccount()).daytradeCount).toBeNull()
+  })
+
+  it("daytrade_count present-but-malformed ('abc'/'NaN'/'Infinity') → BrokerDataError (fail closed)", async () => {
+    for (const v of ['abc', 'NaN', 'Infinity']) {
+      stubFetchJson({ equity: '1', cash: '1', buying_power: '1', daytrade_count: v })
+      await expect(broker().getAccount()).rejects.toBeInstanceOf(BrokerDataError)
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('REQUIRED account fields still fail closed even when daytrade_count is absent', async () => {
+    // Missing equity → throw; malformed equity → throw — daytrade_count optionality does not leak.
+    stubFetchJson({ cash: '1', buying_power: '1' })                                   // equity missing
+    await expect(broker().getAccount()).rejects.toBeInstanceOf(BrokerDataError)
+    vi.unstubAllGlobals()
+    stubFetchJson({ equity: 'abc', cash: '1', buying_power: '1' })                    // equity malformed
+    await expect(broker().getAccount()).rejects.toBeInstanceOf(BrokerDataError)
+  })
+})
