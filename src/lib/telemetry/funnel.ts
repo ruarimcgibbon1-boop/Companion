@@ -278,17 +278,45 @@ export function emitSessionSummary(producerHead: string | null, now: number = Da
 export type FunnelCompleteness = 'COMPLETE' | 'DEGRADED_COMPLETE' | 'INCOMPLETE'
 
 /**
- * PURE research/telemetry helper. Classify a funnel event stream's completeness:
- *   INCOMPLETE        — no terminal session_observability_summary (or cleanClose !== true).
+ * PURE research/telemetry helper. Classify ONE session/segment's completeness:
+ *   INCOMPLETE        — no terminal session_observability_summary (or cleanClose !== true), OR non-summary
+ *                       events trail AFTER the last summary (an un-closed run at the file tail).
  *                       Absence NEVER means "zero drops" — completeness is UNKNOWN, treated as incomplete.
  *   DEGRADED_COMPLETE — terminal summary present AND (droppedTotal>0 || degradedEver || a telemetry_gap exists).
  *   COMPLETE          — terminal summary present, no drops, never degraded, no gap markers.
+ * For a per-day file that may hold MULTIPLE daemon runs, split first (splitFunnelSessions) and map this over
+ * each segment — a whole-file call is conservative (a trailing un-closed run makes the whole call INCOMPLETE).
  */
 export function assessFunnelCompleteness(events: Array<Record<string, unknown>>): FunnelCompleteness {
-  const summary = [...events].reverse().find(e => e.eventType === 'session_observability_summary')
-  if (!summary || summary.cleanClose !== true) return 'INCOMPLETE'
+  let lastSummaryIdx = -1
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].eventType === 'session_observability_summary') { lastSummaryIdx = i; break }
+  }
+  if (lastSummaryIdx === -1) return 'INCOMPLETE'
+  // Non-summary events after the last summary = an un-certified trailing run (e.g. a crash after a prior clean run).
+  const trailing = events.slice(lastSummaryIdx + 1).some(e => e.eventType !== 'session_observability_summary')
+  if (trailing) return 'INCOMPLETE'
+  const summary = events[lastSummaryIdx]
+  if (summary.cleanClose !== true) return 'INCOMPLETE'
   const hadGap = events.some(e => e.eventType === 'telemetry_gap')
   const dropped = typeof summary.droppedTotal === 'number' ? summary.droppedTotal : 0
   if (dropped > 0 || summary.degradedEver === true || hadGap) return 'DEGRADED_COMPLETE'
   return 'COMPLETE'
+}
+
+/**
+ * Split a per-day funnel file (which may hold SEVERAL daemon runs — restarts append to the same ET-day file)
+ * into per-run segments. Each segment ends at its terminal session_observability_summary; a trailing segment
+ * with no summary is an in-progress or aborted run. Map assessFunnelCompleteness over the result to certify
+ * each run independently. PURE; research/telemetry-only.
+ */
+export function splitFunnelSessions(events: Array<Record<string, unknown>>): Array<Array<Record<string, unknown>>> {
+  const sessions: Array<Array<Record<string, unknown>>> = []
+  let cur: Array<Record<string, unknown>> = []
+  for (const e of events) {
+    cur.push(e)
+    if (e.eventType === 'session_observability_summary') { sessions.push(cur); cur = [] }
+  }
+  if (cur.length > 0) sessions.push(cur)   // trailing un-summarized (aborted/in-progress) run
+  return sessions
 }

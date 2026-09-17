@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  emitFunnel, emitSessionSummary, newSweepId, assessFunnelCompleteness,
+  emitFunnel, emitSessionSummary, newSweepId, assessFunnelCompleteness, splitFunnelSessions,
   __resetFunnelCountersForTest, type SweepContext,
 } from '../src/lib/telemetry/funnel'
 
@@ -99,5 +99,38 @@ describe('H3A session summary + completeness', () => {
     process.env.COMPANION_FUNNEL_DIR = join(dir, 'nope')
     expect(() => emitFunnel(s, 'sweep_started', {})).not.toThrow()
     expect(() => { const ok = emitSessionSummary('h'); expect(typeof ok).toBe('boolean') }).not.toThrow()
+  })
+
+  // F. SAME-DAY MULTI-RUN: a per-day file can hold several daemon runs (restarts append
+  // to the same ET-day file). Split first, then certify each run independently.
+  it('F. same-day multi-run: two clean runs → [COMPLETE, COMPLETE]', () => {
+    // run 1
+    emitFunnel({ sweepId: 'r1s1', producerHead: 'h' }, 'sweep_started', {})
+    emitSessionSummary('h')
+    // run 2 (process restarted → counters reset)
+    __resetFunnelCountersForTest()
+    emitFunnel({ sweepId: 'r2s1', producerHead: 'h' }, 'sweep_started', {})
+    emitSessionSummary('h')
+    const recs = readAll()
+    const sessions = splitFunnelSessions(recs)
+    expect(sessions).toHaveLength(2)
+    expect(sessions.map(assessFunnelCompleteness)).toEqual(['COMPLETE', 'COMPLETE'])
+    // whole-file call is also COMPLETE here (last run closed cleanly, no trailing events)
+    expect(assessFunnelCompleteness(recs)).toBe('COMPLETE')
+  })
+
+  it('F2. same-day multi-run: clean run then crashed run → [COMPLETE, INCOMPLETE]; whole-file INCOMPLETE', () => {
+    emitFunnel({ sweepId: 'r1s1', producerHead: 'h' }, 'sweep_started', {})
+    emitSessionSummary('h')                                 // run 1 closed
+    __resetFunnelCountersForTest()
+    emitFunnel({ sweepId: 'r2s1', producerHead: 'h' }, 'sweep_started', {})
+    emitFunnel({ sweepId: 'r2s1', producerHead: 'h' }, 'gate_evaluation', {})
+    // run 2 crashed — no terminal summary
+    const recs = readAll()
+    const sessions = splitFunnelSessions(recs)
+    expect(sessions).toHaveLength(2)
+    expect(sessions.map(assessFunnelCompleteness)).toEqual(['COMPLETE', 'INCOMPLETE'])
+    // whole-file: a trailing un-closed run makes the file not certifiable
+    expect(assessFunnelCompleteness(recs)).toBe('INCOMPLETE')
   })
 })
