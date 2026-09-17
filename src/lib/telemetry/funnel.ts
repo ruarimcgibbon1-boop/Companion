@@ -49,6 +49,12 @@ export type FunnelEventType =
   | 'execution_handoff'
   | 'telemetry_gap'       // durable marker: N events were lost to write failures then recovered
   | 'funnel_rotated'      // the run crossed ET midnight into the next day's file (links the two files by runId)
+  | 'leader_state_observed'    // H3C: compact per-sweep observation for a role-holder (CORE/CHALLENGER)
+  | 'leader_state_transition'  // H3C: lifecycle state change
+  | 'leader_role_changed'      // H3C: shadow role change (observational only)
+  | 'leader_state_persisted'   // H3C: leader state saved to disk
+  | 'leader_state_recovered'   // H3C: leader state loaded from disk on restart
+  | 'leader_state_degraded'    // H3C: corrupt/missing state -> started fresh; history INCOMPLETE
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 
