@@ -98,6 +98,11 @@ let leaderCheckpointSeq = 0
 let leaderWriterOwned = false
 let releaseLeaderLock: () => void = () => {}
 
+// H4A observational local-structure: last emitted (resetState|status|reExpansion) signature per symbol,
+// so we only emit local_structure_changed on a real transition. Recomputed from bars each sweep (no new
+// persistence layer — H3C stays the durable history); bounded to the monitored set each sweep.
+const h4aLastSig = new Map<string, string>()
+
 /** Persist leader state ONLY if we own the writer lease; stamps saveReason + config provenance. */
 function persistLeaderState(reason: SaveReason, now: number, lastSweepId: string | null): boolean {
   if (!leaderWriterOwned) return false
@@ -362,6 +367,39 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
 
   if (universe.length === 0) return buys
   const results = await fetchResults(universe)
+
+  // ── H4A: observational local-reset geometry telemetry ─────────────────────
+  // The features are computed at the data source (monitor pipeline, over the same 1m bars — zero new
+  // provider requests) and arrive on each MonitorResult. Here we only JOIN the H3C leaderEpisodeId and
+  // emit compact, bounded telemetry. SHADOW ONLY — never read by any gate/decision/execution.
+  try {
+    const seenH4a = new Set<string>()
+    for (const r of results) {
+      const ls = r.localStructure
+      if (!ls) continue
+      seenH4a.add(r.symbol)
+      const sig = `${ls.resetState}|${ls.status}|${ls.reExpansion.observed}|${ls.base.detected}`
+      const changed = h4aLastSig.get(r.symbol) !== sig
+      h4aLastSig.set(r.symbol, sig)
+      const leaderEpisodeId = leaderState[r.symbol]?.leaderEpisodeId ?? null
+      const payload = {
+        symbol: r.symbol, leaderEpisodeId, runId: ensureFunnelRunId(sweepStart),
+        resetState: ls.resetState, dataQualityStatus: ls.status, timeframe: ls.provenance.timeframe,
+        globalOffHighPct: ls.global.offHighPct, impulsePct: ls.impulse.pct, pullbackPct: ls.pullback.pctFromImpulsePeak,
+        baseDetected: ls.base.detected, baseRangePct: ls.base.rangePct, baseDurationBars: ls.base.durationBars,
+        volumeContraction: ls.base.volumeContraction, localExtensionPct: ls.localExtension.localExtensionPct,
+        baseRiskPct: ls.localExtension.baseRiskPct, globalVsLocalExtensionRatio: ls.localExtension.globalVsLocalExtensionRatio,
+        reExpansionObserved: ls.reExpansion.observed, discontinuity: ls.provenance.discontinuityInWindow,
+        localFeatureConfigVersion: ls.provenance.localFeatureConfigVersion, localFeatureConfigHash: ls.provenance.localFeatureConfigHash,
+      }
+      // Emit the snapshot only for symbols carrying real geometry (bounded); always emit a transition.
+      if (ls.impulse.detected || ls.status !== 'AVAILABLE') emitFunnel(sweepCtx, 'local_structure_observed', payload, sweepStart)
+      if (changed) emitFunnel(sweepCtx, 'local_structure_changed', payload, sweepStart)
+    }
+    for (const k of [...h4aLastSig.keys()]) if (!seenH4a.has(k)) h4aLastSig.delete(k)   // bounded to the monitored set
+  } catch (e) {
+    log('local-structure telemetry failed (research only; sweep continues):', (e as Error).message)
+  }
 
   const now = Date.now()
   // Prune history to the session window so cap/dedup stay bounded.

@@ -56,6 +56,8 @@ export type FunnelEventType =
   | 'leader_state_recovered'   // H3C: leader state loaded from disk on restart
   | 'leader_state_degraded'    // H3C: corrupt/crashed/secondary state -> history INCOMPLETE
   | 'leader_state_evicted'     // H3C: a non-expired record dropped under hard capacity pressure (auditable)
+  | 'local_structure_observed'  // H4A: compact local-reset geometry snapshot for a symbol (observational)
+  | 'local_structure_changed'   // H4A: the symbol's resetState / data-quality status changed since last sweep
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 
