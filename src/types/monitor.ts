@@ -315,6 +315,12 @@ export interface MonitorResult {
   technicals?: ContinuationTechnicals
   /** Bullish candlestick patterns detected on this symbol now (top-gainer scan). */
   patterns?: PatternHit[]
+  /**
+   * H4A OBSERVATIONAL local-reset geometry — additive, strategy-neutral, NEVER read by any
+   * decision/gate/ordering/execution. Computed at the data source from the canonical 1m bars already
+   * fetched here (zero new provider requests). Null when unset. Exposed for research only.
+   */
+  localStructure?: import('@/lib/leader/local-structure').LocalStructureFeatures | null
   error?: string
 }
 

@@ -18,6 +18,7 @@ import { calculateSessionLevels, calculateTechnical } from './technical'
 import { buildKeyLevels } from './levels-engine'
 import { detectSetups, type DetectionContext } from './setup-detectors'
 import { detectCandlePatterns } from './candlestick-patterns'
+import { computeLocalStructure, resolveLocalFeatureConfig } from './leader/local-structure'
 import { buildRoadmap } from './roadmap-engine'
 import { getSessionType, minutesSinceOpen } from './market-hours'
 import { premarketVolumeProfile, etDateNow, etHHMMNow } from './premarket-volume'
@@ -164,6 +165,27 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
     const prevClose = yfQuote?.previousClose ?? quote?.previousClose ?? price
     const changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : (quote?.changePercentage ?? 0)
 
+    // H4A — OBSERVATIONAL local-reset geometry over the SAME 1m bars already fetched above (zero new
+    // provider requests). Strategy-neutral; never read by any gate/decision/execution. Best-effort:
+    // a throw here must never break the monitor result.
+    let localStructure = null
+    try {
+      const sessionHigh = session === 'premarket'
+        ? (sessionLevels.premarketHigh ?? null)
+        : (sessionLevels.regularHigh ?? sessionLevels.premarketHigh ?? null)
+      localStructure = computeLocalStructure({
+        symbol: sym, candles: intraday, asOfMs: Date.now(), session,
+        globals: {
+          price, sessionHigh, dayChangePct: changePct,
+          vwap: technical.vwap, ema9: technical.ema9, ema21: technical.ema20,
+          atr: technical.atr, atrPct: technical.atr != null && price > 0 ? (technical.atr / price) * 100 : null,
+          relativeVolume: technical.relativeVolume, spreadPct: null,
+        },
+      }, resolveLocalFeatureConfig())
+    } catch (e) {
+      console.error(`localStructure(${sym}) failed (observational only):`, (e as Error).message)
+    }
+
     return {
       symbol: sym,
       price,
@@ -183,6 +205,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
       levels,
       setups,
       patterns,
+      localStructure,
       roadmap,
       integrity: {
         marketDataTimestamp: freshestMs,
