@@ -46,7 +46,8 @@ export type FunnelEventType =
   | 'gate_evaluation'
   | 'arbitration_decision'
   | 'execution_handoff'
-  | 'telemetry_gap'      // durable marker: N events were lost to write failures then recovered
+  | 'telemetry_gap'       // durable marker: N events were lost to write failures then recovered
+  | 'funnel_rotated'      // the run crossed ET midnight into the next day's file (links the two files by runId)
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 
@@ -103,12 +104,24 @@ let lastSweepId: string | null = null
 let firstFailureAt: string | null = null
 let lastFailureAt: string | null = null
 let degradedEver = false
+// CROSS-MIDNIGHT ROTATION: the sink rotates by ET day, but a run can span days (the daemon
+// idle-loops across midnight). `runId` is one stable id for the whole daemon run; it links
+// the per-day file segments so a validator can see a prior file was CONTINUED, not incomplete.
+let runId: string | null = null
+let lastWrittenDay: string | null = null   // ET day of the last successful write
+
+/** The stable per-run id (minted lazily). Same across every ET-day file this run writes. */
+function ensureRunId(now: number): string {
+  if (runId === null) runId = `run-${now}-${Math.random().toString(36).slice(2, 8)}`
+  return runId
+}
 
 /** TEST ONLY: reset session counters so per-test assertions are deterministic. */
 export function __resetFunnelCountersForTest(): void {
   consecutiveFailures = 0; escalated = false; droppedSinceLastOk = 0; droppedEverThisRun = 0
   eventsAttempted = 0; eventsWritten = 0; sweepStartedCount = 0
   firstSweepId = null; lastSweepId = null; firstFailureAt = null; lastFailureAt = null; degradedEver = false
+  runId = null; lastWrittenDay = null
 }
 
 function onWriteError(err: unknown): void {
@@ -174,6 +187,27 @@ export function emitFunnel(
   if (ctx.sweepId) lastSweepId = ctx.sweepId
   if (eventType === 'sweep_started') sweepStartedCount++
   try {
+    const day = etDayKey(now)
+    const file = funnelFile(day)
+    // CROSS-ET-MIDNIGHT ROTATION: this run has moved to a new day file. Link the two so a
+    // validator classifies the prior file as CONTINUED (not INCOMPLETE): a marker in the OLD
+    // file points forward, one in the NEW file points back, both stamped with the run id.
+    if (lastWrittenDay !== null && lastWrittenDay !== day) {
+      try {
+        const base = {
+          schemaVersion: FUNNEL_SCHEMA_VERSION, tsUtc: new Date(now).toISOString(),
+          sweepId: ctx.sweepId, producerHead: ctx.producerHead ?? null, runId: ensureRunId(now),
+          fromDay: lastWrittenDay, toDay: day,
+        }
+        appendFileSync(funnelFile(lastWrittenDay), JSON.stringify({
+          eventType: 'funnel_rotated', ...base, direction: 'continued_in_next_file',
+          note: 'daemon run continued across ET midnight into toDay; this file is CONTINUED, not incomplete — the run is certified in toDay by runId',
+        }) + '\n')
+        appendFileSync(file, JSON.stringify({
+          eventType: 'funnel_rotated', ...base, direction: 'continued_from_prev_file',
+        }) + '\n')
+      } catch { /* linking is best-effort; a failure just leaves the prior file classified INCOMPLETE (conservative) */ }
+    }
     const record = {
       eventType,
       schemaVersion: FUNNEL_SCHEMA_VERSION,
@@ -182,9 +216,9 @@ export function emitFunnel(
       producerHead: ctx.producerHead ?? null,
       ...(scrub(payload) as Record<string, unknown>),
     }
-    const file = funnelFile(etDayKey(now))
     appendFileSync(file, JSON.stringify(record) + '\n')
     eventsWritten++
+    lastWrittenDay = day
     // RESEARCH INTEGRITY: the write just succeeded. If events were lost during a prior
     // outage, persist a durable gap marker so the file self-documents the loss (a later
     // audit reading only the file can then exclude a telemetry-compromised session).
@@ -225,6 +259,7 @@ export function emitFunnelBatch(
 
 /** The terminal record's payload — a self-contained certificate of session completeness. */
 export interface SessionObservabilitySummary {
+  runId: string | null
   firstSweepId: string | null
   lastSweepId: string | null
   sweepsObserved: number
@@ -240,6 +275,7 @@ export interface SessionObservabilitySummary {
 /** Snapshot the live session tallies (does not write). */
 export function buildSessionSummary(): SessionObservabilitySummary {
   return {
+    runId,
     firstSweepId, lastSweepId,
     sweepsObserved: sweepStartedCount,
     eventsAttempted, eventsWritten,
@@ -275,33 +311,55 @@ export function emitSessionSummary(producerHead: string | null, now: number = Da
   }
 }
 
-export type FunnelCompleteness = 'COMPLETE' | 'DEGRADED_COMPLETE' | 'INCOMPLETE'
+export type FunnelCompleteness = 'COMPLETE' | 'DEGRADED_COMPLETE' | 'CONTINUED' | 'INCOMPLETE'
+
+const isContinuedOut = (e: Record<string, unknown>): boolean =>
+  e.eventType === 'funnel_rotated' && e.direction === 'continued_in_next_file'
 
 /**
  * PURE research/telemetry helper. Classify ONE session/segment's completeness:
- *   INCOMPLETE        — no terminal session_observability_summary (or cleanClose !== true), OR non-summary
- *                       events trail AFTER the last summary (an un-closed run at the file tail).
- *                       Absence NEVER means "zero drops" — completeness is UNKNOWN, treated as incomplete.
+ *   CONTINUED         — the run crossed ET midnight: this file's last closer is a `funnel_rotated`
+ *                       continued_in_next_file marker. The run is NOT incomplete — it is certified in the
+ *                       next ET-day file (join by `runId`). Use assessRun() to certify the whole run.
+ *   INCOMPLETE        — no terminal summary AND no continuation marker (or cleanClose !== true), OR a real
+ *                       un-closed run trails the last closer. Absence NEVER means "zero drops".
  *   DEGRADED_COMPLETE — terminal summary present AND (droppedTotal>0 || degradedEver || a telemetry_gap exists).
  *   COMPLETE          — terminal summary present, no drops, never degraded, no gap markers.
- * For a per-day file that may hold MULTIPLE daemon runs, split first (splitFunnelSessions) and map this over
- * each segment — a whole-file call is conservative (a trailing un-closed run makes the whole call INCOMPLETE).
+ * The LAST closer decides: scanning from the end, the first event that is a summary OR a continued_in_next_file
+ * marker. A per-day file with several runs should be split first (splitFunnelSessions).
  */
 export function assessFunnelCompleteness(events: Array<Record<string, unknown>>): FunnelCompleteness {
-  let lastSummaryIdx = -1
+  // Find the last "closer" (summary or continuation-out) and whether real events trail it.
+  let closerIdx = -1
+  let closerKind: 'summary' | 'continued' | null = null
   for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i].eventType === 'session_observability_summary') { lastSummaryIdx = i; break }
+    const e = events[i]
+    if (e.eventType === 'session_observability_summary') { closerIdx = i; closerKind = 'summary'; break }
+    if (isContinuedOut(e)) { closerIdx = i; closerKind = 'continued'; break }
   }
-  if (lastSummaryIdx === -1) return 'INCOMPLETE'
-  // Non-summary events after the last summary = an un-certified trailing run (e.g. a crash after a prior clean run).
-  const trailing = events.slice(lastSummaryIdx + 1).some(e => e.eventType !== 'session_observability_summary')
+  if (closerKind === null) return 'INCOMPLETE'
+  // A real (non-summary, non-rotation) event after the closer = an un-certified trailing run.
+  const trailing = events.slice(closerIdx + 1).some(
+    e => e.eventType !== 'session_observability_summary' && e.eventType !== 'funnel_rotated')
   if (trailing) return 'INCOMPLETE'
-  const summary = events[lastSummaryIdx]
+  if (closerKind === 'continued') return 'CONTINUED'
+  const summary = events[closerIdx]
   if (summary.cleanClose !== true) return 'INCOMPLETE'
   const hadGap = events.some(e => e.eventType === 'telemetry_gap')
   const dropped = typeof summary.droppedTotal === 'number' ? summary.droppedTotal : 0
   if (dropped > 0 || summary.degradedEver === true || hadGap) return 'DEGRADED_COMPLETE'
   return 'COMPLETE'
+}
+
+/**
+ * Certify a WHOLE daemon run that may span several ET-day files. Pass the concatenated event
+ * streams of every file that shares this run (chained by the `funnel_rotated`/`runId` markers,
+ * in day order). The interior continuation markers are ignored; the verdict is the run's real
+ * terminal state: COMPLETE / DEGRADED_COMPLETE, or INCOMPLETE/CONTINUED if it never closed.
+ * PURE; research/telemetry-only.
+ */
+export function assessRun(concatenatedEventsInDayOrder: Array<Record<string, unknown>>): FunnelCompleteness {
+  return assessFunnelCompleteness(concatenatedEventsInDayOrder)
 }
 
 /**
@@ -315,7 +373,9 @@ export function splitFunnelSessions(events: Array<Record<string, unknown>>): Arr
   let cur: Array<Record<string, unknown>> = []
   for (const e of events) {
     cur.push(e)
-    if (e.eventType === 'session_observability_summary') { sessions.push(cur); cur = [] }
+    // A segment closes at a terminal summary OR a continued_in_next_file marker (the run moved
+    // to the next ET-day file). Either way the segment in THIS file has ended.
+    if (e.eventType === 'session_observability_summary' || isContinuedOut(e)) { sessions.push(cur); cur = [] }
   }
   if (cur.length > 0) sessions.push(cur)   // trailing un-summarized (aborted/in-progress) run
   return sessions
