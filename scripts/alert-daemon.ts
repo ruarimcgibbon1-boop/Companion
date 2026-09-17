@@ -31,7 +31,7 @@ import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
 import { authorityLockPath } from '@/lib/execution/authority'
 import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
-import { emitFunnel, newSweepId, type SweepContext } from '@/lib/telemetry/funnel'
+import { emitFunnel, newSweepId, funnelDegraded, funnelDroppedTotal, type SweepContext } from '@/lib/telemetry/funnel'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -387,10 +387,13 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
     }, now)
   }
   // Log on activity, or periodically so a quiet stretch is visibly alive (not hung).
-  if (triggered) log(`swept ${universe.length} names · ${triggered} triggers · ${sent} new alerts`)
+  // A degraded-telemetry note rides the same lines so an operator sees observability loss
+  // live (execution is unaffected; this is a research-integrity signal only).
+  const telWarn = funnelDegraded() ? ` · ⚠ TELEMETRY DEGRADED (${funnelDroppedTotal()} funnel events dropped this run)` : ''
+  if (triggered) log(`swept ${universe.length} names · ${triggered} triggers · ${sent} new alerts${telWarn}`)
   else if (now - lastHeartbeat > HEARTBEAT_MS) {
     lastHeartbeat = now
-    log(`· alive — watching ${universe.length} names (${universe.slice(0, 5).join(' ')}${universe.length > 5 ? '…' : ''}), no triggers`)
+    log(`· alive — watching ${universe.length} names (${universe.slice(0, 5).join(' ')}${universe.length > 5 ? '…' : ''}), no triggers${telWarn}`)
   }
   return state
 }

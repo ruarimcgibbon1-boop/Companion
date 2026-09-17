@@ -183,8 +183,56 @@ describe('H3A funnel emit', () => {
     expect(funnelDegraded()).toBe(false)
   })
 
+  it('RESEARCH INTEGRITY: recovery writes a durable telemetry_gap marker recording the loss', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    process.env.COMPANION_FUNNEL_DIR = join(dir, 'nope')     // all writes fail
+    for (let i = 0; i < 3; i++) emitFunnel(sweep, 'sweep_started', { i })
+    process.env.COMPANION_FUNNEL_DIR = dir                    // recover
+    emitFunnel(sweep, 'gate_evaluation', { symbol: 'AAA' })
+    const recs = readAll()
+    const gap = recs.find(r => r.eventType === 'telemetry_gap')
+    expect(gap, 'a telemetry_gap marker is persisted on recovery').toBeTruthy()
+    expect(gap.droppedEvents).toBe(3)
+    expect(gap.sweepId).toBe('sweep-test-1')
+    // A later audit reading ONLY the file can now see the session dropped events.
+    expect(recs.some(r => r.eventType === 'gate_evaluation')).toBe(true)
+  })
+
   it('funnelFile honors the test dir override and defaults to a per-day name', () => {
     expect(funnelFile('2026-09-17')).toBe(join(dir, '.companion-funnel-2026-09-17.jsonl'))
     expect(existsSync(dir)).toBe(true)
+  })
+
+  it('END-TO-END JOIN: a full sweep is joinable by sweepId / symbol / setupId (§5)', () => {
+    const s: SweepContext = { sweepId: newSweepId(), producerHead: 'abc123' }
+    const sid = 'MEDS:breakout:6.00'
+    // one sweep, one symbol MEDS with one setup, through every stage
+    emitFunnel(s, 'sweep_started', { session: 'premarket', universeSize: 15 })
+    emitFunnel(s, 'discovery_observed', { symbols: [{ symbol: 'MEDS', source: 'webull', changePct: 300, mergedEligible: true }] })
+    emitFunnel(s, 'universe_decision', { symbol: 'MEDS', strategyId: 'BASE', monitored: true })
+    emitFunnel(s, 'strategy_trigger', { symbol: 'MEDS', strategyId: 'BASE', setupId: sid, setupType: 'breakout', verdict: 'veto' })
+    emitFunnel(s, 'gate_evaluation', { symbol: 'MEDS', strategyId: 'BASE', setupId: sid, setupType: 'breakout', verdict: 'veto', gates: [] })
+    emitFunnel(s, 'arbitration_decision', { eligibleSetupIds: [sid] })
+    emitFunnel(s, 'execution_handoff', { symbol: 'MEDS', strategyId: 'BASE', setupId: sid, submitted: false })
+    const recs = readAll().filter(r => r.sweepId === s.sweepId)
+
+    // sweepId threads every event of the sweep.
+    expect(recs).toHaveLength(7)
+    expect(recs.every(r => r.sweepId === s.sweepId)).toBe(true)
+    // symbol joins the per-symbol stages.
+    const bySymbol = recs.filter(r => r.symbol === 'MEDS')
+    expect(bySymbol.map(r => r.eventType).sort()).toEqual(
+      ['execution_handoff', 'gate_evaluation', 'strategy_trigger', 'universe_decision'])
+    // setupId gives an UNAMBIGUOUS 1:1:1 join trigger↔gate↔handoff, and links arbitration.
+    const bySetup = recs.filter(r => r.setupId === sid)
+    expect(bySetup.map(r => r.eventType).sort()).toEqual(['execution_handoff', 'gate_evaluation', 'strategy_trigger'])
+    const arb = recs.find(r => r.eventType === 'arbitration_decision')!
+    expect(arb.eligibleSetupIds).toContain(sid)
+    // discovery is per-symbol (no setupId) — the legitimate 1→many symbol→setups edge.
+    const disc = recs.find(r => r.eventType === 'discovery_observed')!
+    expect(disc.symbols[0].symbol).toBe('MEDS')
+    // strategyId present wherever a strategy is known.
+    expect(recs.filter(r => r.strategyId).every(r => r.strategyId === 'BASE')).toBe(true)
   })
 })

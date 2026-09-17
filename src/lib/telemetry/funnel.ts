@@ -46,6 +46,7 @@ export type FunnelEventType =
   | 'gate_evaluation'
   | 'arbitration_decision'
   | 'execution_handoff'
+  | 'telemetry_gap'      // durable marker: N events were lost to write failures then recovered
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 
@@ -85,11 +86,21 @@ export function newSweepId(now: number = Date.now()): string {
 // market loop is never blocked or altered.
 let consecutiveFailures = 0
 let escalated = false
+// RESEARCH INTEGRITY: total events lost since the last successful write. On recovery a
+// durable `telemetry_gap` marker records this count IN the funnel file, so a later audit
+// can tell a complete session from one that silently dropped events. Never reset except
+// by a successful gap marker.
+let droppedSinceLastOk = 0
+let droppedEverThisRun = 0
 const ESCALATE_AFTER = 5
 
 function onWriteError(err: unknown): void {
   consecutiveFailures++
-  if (consecutiveFailures <= ESCALATE_AFTER) {
+  droppedSinceLastOk++
+  droppedEverThisRun++
+  // Loud for the first ESCALATE_AFTER, then rate-limited (every 100th) so a long outage
+  // is never fully silent but also never spams — the durable gap marker carries the exact count.
+  if (consecutiveFailures <= ESCALATE_AFTER || consecutiveFailures % 100 === 0) {
     console.warn(`[funnel] telemetry write failed (${consecutiveFailures}): ${(err as Error)?.message ?? err}`)
   }
   if (consecutiveFailures === ESCALATE_AFTER && !escalated) {
@@ -104,6 +115,11 @@ function onWriteError(err: unknown): void {
 /** True after ESCALATE_AFTER consecutive failures — for a health/heartbeat readout. */
 export function funnelDegraded(): boolean {
   return consecutiveFailures >= ESCALATE_AFTER
+}
+
+/** Total events dropped this daemon run (never resets) — for a session-level readout. */
+export function funnelDroppedTotal(): number {
+  return droppedEverThisRun
 }
 
 // Defensive scrub: never let an accidental secret reach disk. Keys matching this are
@@ -141,7 +157,25 @@ export function emitFunnel(
       producerHead: ctx.producerHead ?? null,
       ...(scrub(payload) as Record<string, unknown>),
     }
-    appendFileSync(funnelFile(etDayKey(now)), JSON.stringify(record) + '\n')
+    const file = funnelFile(etDayKey(now))
+    appendFileSync(file, JSON.stringify(record) + '\n')
+    // RESEARCH INTEGRITY: the write just succeeded. If events were lost during a prior
+    // outage, persist a durable gap marker so the file self-documents the loss (a later
+    // audit reading only the file can then exclude a telemetry-compromised session).
+    if (droppedSinceLastOk > 0) {
+      const gap = {
+        eventType: 'telemetry_gap' as FunnelEventType,
+        schemaVersion: FUNNEL_SCHEMA_VERSION,
+        tsUtc: new Date(now).toISOString(),
+        sweepId: ctx.sweepId,
+        producerHead: ctx.producerHead ?? null,
+        droppedEvents: droppedSinceLastOk,
+        droppedTotalThisRun: droppedEverThisRun,
+        note: 'funnel writes failed then recovered — this file is missing droppedEvents records for the preceding window; exclude this session from strict prospective analysis',
+      }
+      appendFileSync(file, JSON.stringify(gap) + '\n')  // if THIS throws, catch below keeps the counter for the next retry
+      droppedSinceLastOk = 0
+    }
     consecutiveFailures = 0
     escalated = false
   } catch (err) {
