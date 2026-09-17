@@ -194,6 +194,29 @@ export interface DetectedSetup {
   levelStrength?: number | null
   spaceR?: number | null
 
+  /**
+   * OBSERVATIONAL TELEMETRY (H3A) — additive, NEVER read by any decision/gate/ordering.
+   * The exact per-component quality-veto geometry already computed inside buildSetup,
+   * surfaced verbatim so the funnel log can record which gate(s) actually fired without
+   * reconstructing them later. `qualityVetoed` (the real gate input) === (fadedChase ||
+   * lateInLeg || unconfirmed || quarantined || noRoom || vetoTriggerActive); the fields
+   * here only expose the booleans and their inputs. `extended`/`unaccepted` are trigger
+   * (not quality) gates but recorded here too for completeness.
+   */
+  gateGeometry?: {
+    offHighPct: number | null
+    fadedChase: boolean
+    runUpPct: number | null
+    lateInLeg: boolean
+    unconfirmed: boolean
+    quarantined: boolean
+    spaceR: number | null
+    noRoom: boolean
+    vetoTriggerActive: boolean
+    extended: boolean
+    unaccepted: boolean
+  }
+
   /** Decisive buy/sell directive derived from state + geometry. */
   signal: TradeSignal
 }

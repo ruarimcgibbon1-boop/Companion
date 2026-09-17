@@ -194,3 +194,107 @@ export function classifyBuy(setup: DetectedSetup, r: MonitorResult, ctx: Classif
   }
   return { verdict: 'logged', buy }
 }
+
+// ── H3A gate decomposition (telemetry only) ──────────────────────────────────
+// A PURE PROJECTION of the classifyBuy gate stack into per-gate PASS/FAIL/binding,
+// so the funnel log distinguishes OFF_HIGH_ONLY / GRADE_ONLY / OFF_HIGH+GRADE / etc.
+// WITHOUT any later reconstruction. It recomputes the SAME intermediates classifyBuy
+// uses (verbatim) and NEVER changes a decision — `decomposeGates().verdict` is asserted
+// to equal `classifyBuy().verdict` for the same input (see tests). classifyBuy above is
+// untouched. The veto tier is broken into its real sub-components, read from the
+// additive `setup.gateGeometry` the detector already computed.
+
+export interface BuyGateRecord {
+  gateId: string
+  observedValue: number | string | boolean | null
+  ruleValue: number | string | boolean | null
+  result: 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
+  binding: boolean | 'unknown'
+}
+
+export function decomposeGates(
+  setup: DetectedSetup,
+  r: MonitorResult,
+  ctx: ClassifyContext,
+): { verdict: BuyVerdict; gates: BuyGateRecord[] } {
+  const { now, priorBuys, priorLogs, priorStates } = ctx
+  const fill = setup.entryFill ?? setup.zoneUpper
+
+  // Same intermediates as classifyBuy (kept verbatim; parity-tested).
+  const standDown = BOUNCE_TYPES.has(setup.type) && recentlyFailedBounce(setup.symbol, now, priorStates)
+  const symbolLogsThisSession = priorBuys.filter(
+    b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS,
+  ).length
+  const overLogged = symbolLogsThisSession >= MAX_LOGS_PER_SYMBOL
+  const capped = overLogged || symbolCapReached(setup.symbol, now, priorLogs, priorBuys)
+  const gradeFloorFail = setup.grade === 'below' && !GRADE_FLOOR_EXEMPT.has(setup.type)
+  const dup = isDuplicateBuy(setup.symbol, fill, now, priorBuys)
+  const tradeable = r.integrity.session === 'premarket' ||
+    (r.integrity.session === 'regular' && etMinutesOfDay(now) < LATE_LOG_CUTOFF_ET_MIN)
+  const premarketSurge = r.relativeVolume != null && r.relativeVolume >= PREMARKET_SURGE_RVOL
+  const volumeOk = r.integrity.session === 'premarket'
+    ? r.premarketVolume == null || r.premarketVolume >= MIN_PREMARKET_BUY_VOLUME || premarketSurge
+    : r.volume === 0 || r.volume >= MIN_BUY_VOLUME
+  const vetoFail = (setup.qualityVetoed ?? false) || gradeFloorFail
+
+  // Ordered tiers exactly as classifyBuy short-circuits them.
+  const tiers: Array<{ name: string; verdict: BuyVerdict; fail: boolean }> = [
+    { name: 'session', verdict: 'session', fail: !tradeable },
+    { name: 'volume', verdict: 'volume', fail: !volumeOk },
+    { name: 'veto', verdict: 'veto', fail: vetoFail },
+    { name: 'standDown', verdict: 'standDown', fail: standDown },
+    { name: 'capped', verdict: 'capped', fail: capped },
+    { name: 'dup', verdict: 'dup', fail: dup },
+  ]
+  const bindingIdx = tiers.findIndex(t => t.fail)
+  const verdict: BuyVerdict = bindingIdx === -1 ? 'logged' : tiers[bindingIdx].verdict
+  const tierIndex: Record<string, number> = { session: 0, volume: 1, veto: 2, standDown: 3, capped: 4, dup: 5 }
+  // NOT_APPLICABLE once short-circuited: a gate whose tier is strictly past the binding tier was never reached.
+  const reached = (tier: string) => bindingIdx === -1 || tierIndex[tier] <= bindingIdx
+  const gg = setup.gateGeometry
+
+  // Veto sub-gates (only meaningfully evaluated when session+volume passed).
+  const vetoReached = reached('veto')
+  const subFails: Record<string, boolean> = {
+    off_high: gg?.fadedChase ?? false,
+    grade_floor: gradeFloorFail,
+    space: gg?.noRoom ?? false,
+    runup: gg?.lateInLeg ?? false,
+    quality_other: (gg?.unconfirmed ?? false) || (gg?.quarantined ?? false) || (gg?.vetoTriggerActive ?? false),
+  }
+  const nSubFail = Object.values(subFails).filter(Boolean).length
+  const subBinding = (fail: boolean): boolean | 'unknown' =>
+    bindingIdx !== -1 && tiers[bindingIdx].name === 'veto' && fail ? (nSubFail > 1 ? 'unknown' : true) : false
+  const res = (reachedTier: boolean, fail: boolean): 'PASS' | 'FAIL' | 'NOT_APPLICABLE' =>
+    !reachedTier ? 'NOT_APPLICABLE' : fail ? 'FAIL' : 'PASS'
+  const soleBinding = (tier: string, fail: boolean): boolean =>
+    bindingIdx !== -1 && tiers[bindingIdx].name === tier && fail
+
+  const gates: BuyGateRecord[] = [
+    { gateId: 'session', observedValue: r.integrity.session, ruleValue: 'premarket || (regular && <14:00 ET)',
+      result: res(reached('session'), !tradeable), binding: soleBinding('session', !tradeable) },
+    { gateId: r.integrity.session === 'premarket' ? 'premarket_volume' : 'volume',
+      observedValue: r.integrity.session === 'premarket' ? (r.premarketVolume ?? null) : r.volume,
+      ruleValue: r.integrity.session === 'premarket' ? MIN_PREMARKET_BUY_VOLUME : MIN_BUY_VOLUME,
+      result: res(reached('volume'), !volumeOk), binding: soleBinding('volume', !volumeOk) },
+    // veto sub-gates
+    { gateId: 'off_high', observedValue: gg?.offHighPct ?? null, ruleValue: -5,
+      result: res(vetoReached, subFails.off_high), binding: subBinding(subFails.off_high) },
+    { gateId: 'grade_floor', observedValue: setup.grade, ruleValue: "not 'below' (unless exempt)",
+      result: res(vetoReached, subFails.grade_floor), binding: subBinding(subFails.grade_floor) },
+    { gateId: 'space', observedValue: gg?.spaceR ?? setup.spaceR ?? null, ruleValue: 0.5,
+      result: res(vetoReached, subFails.space), binding: subBinding(subFails.space) },
+    { gateId: 'runup', observedValue: gg?.runUpPct ?? null, ruleValue: 'MAX_LEG_RUNUP_PCT',
+      result: res(vetoReached, subFails.runup), binding: subBinding(subFails.runup) },
+    { gateId: 'quality_other', observedValue: null, ruleValue: 'no unconfirmed/quarantined/vetoTrigger',
+      result: res(vetoReached, subFails.quality_other), binding: subBinding(subFails.quality_other) },
+    // remaining single tiers
+    { gateId: 'stand_down', observedValue: standDown, ruleValue: false,
+      result: res(reached('standDown'), standDown), binding: soleBinding('standDown', standDown) },
+    { gateId: 'same_symbol_cap', observedValue: symbolLogsThisSession, ruleValue: MAX_LOGS_PER_SYMBOL,
+      result: res(reached('capped'), capped), binding: soleBinding('capped', capped) },
+    { gateId: 'dedupe', observedValue: fill, ruleValue: 'not a duplicate fill', result: res(reached('dup'), dup),
+      binding: soleBinding('dup', dup) },
+  ]
+  return { verdict, gates }
+}

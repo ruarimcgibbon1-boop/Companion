@@ -9,6 +9,7 @@ import { sessionFractionElapsed } from '@/lib/technical'
 import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-volume'
 import { getWebullGainers, type WebullRankType } from '@/lib/webull-client'
 import { readMomentum, compareByMomentum } from '@/lib/momentum-rank'
+import { emitFunnel } from '@/lib/telemetry/funnel'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -538,6 +539,30 @@ export async function GET(request: Request) {
         })
       })
     )
+
+    // ── H3A funnel telemetry (discovery + merge) — best-effort, side-channel only ──
+    // Emitted ONLY when the instrumented daemon passes a sweepId (the browser scanner
+    // and ad-hoc callers don't, so they never write). One compact event carries the
+    // FULL pre-rank discovery set with its winning source + whether it survived to the
+    // ranked/monitored pool — the "was symbol X ever discovered?" evidence H1 lacked.
+    // Reads only already-computed arrays; changes nothing about the response above.
+    const sweepId = searchParams.get('sweepId')
+    if (sweepId) {
+      try {
+        const producerHead = searchParams.get('producerHead')
+        const rankedSymbols = new Set(ranked.map(r => r.symbol))
+        const discovered = universe.map(g => ({
+          symbol: g.symbol,
+          source: g.webull ? 'webull' : (g.yfChangePct !== undefined ? 'yahoo' : 'fmp'),
+          changePct: typeof g.changesPercentage === 'number' ? g.changesPercentage : Number(g.changesPercentage ?? 0),
+          mergedEligible: rankedSymbols.has(g.symbol),
+        }))
+        emitFunnel({ sweepId, producerHead }, 'discovery_observed', {
+          session: sessionType, inPremarket,
+          discoveredCount: discovered.length, rankedCount: ranked.length, symbols: discovered,
+        })
+      } catch { /* telemetry is best-effort; never affects the response */ }
+    }
 
     return NextResponse.json({ rows: ranked, sessionType, timestamp: Date.now() })
   } catch (err) {

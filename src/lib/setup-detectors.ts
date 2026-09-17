@@ -1004,6 +1004,22 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     // SPACE gate — and were previously discarded. Exposing them changes nothing.
     levelStrength: level?.strength ?? null,
     spaceR: space.r,
+    // H3A funnel telemetry (additive; not read by any gate/decision/ordering). Every
+    // field is a value already computed above for the veto/trigger logic; recording
+    // them lets the funnel log show WHICH gate fired without reconstructing it later.
+    gateGeometry: {
+      offHighPct: distFromHigh,
+      fadedChase,
+      runUpPct: runUp,
+      lateInLeg,
+      unconfirmed,
+      quarantined,
+      spaceR: space.r,
+      noRoom,
+      vetoTriggerActive: args.vetoTrigger?.active ?? false,
+      extended,
+      unaccepted,
+    },
   }
 
   return { ...built, signal: deriveSignal(built as DetectedSetup) }

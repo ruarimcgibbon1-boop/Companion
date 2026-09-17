@@ -23,7 +23,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 import type { MonitorResult, BuySignalRecord, DetectedSetup } from '@/types'
-import { classifyBuy, passesTrackingFloor, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
+import { classifyBuy, decomposeGates, passesTrackingFloor, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
 import { getSessionType } from '@/lib/market-hours'
 import { loadEnvLocal } from '@/lib/execution/env'
 import { AlpacaBroker } from '@/lib/execution/alpaca'
@@ -31,6 +31,7 @@ import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
 import { authorityLockPath } from '@/lib/execution/authority'
 import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
+import { emitFunnel, newSweepId, type SweepContext } from '@/lib/telemetry/funnel'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -69,6 +70,24 @@ const POSITION_MS = 3_000               // held-position check cadence
 const POSITION_IDLE_MS = 10_000         // slower spin when flat
 const MIN_LEVEL_STRENGTH = 40           // store default notificationSettings.minLevelStrength
 const TOP_GAINERS_UNIVERSE = 15         // matches useMonitor.gatherUniverse
+
+// H3A funnel telemetry: producer head for event provenance, set once at startup from
+// the same provenance the executor uses. Telemetry-only; never read by any decision.
+let PRODUCER_HEAD: string | null = null
+
+/** One ranked row as the gainers route returns it — used ONLY for telemetry. */
+interface RankedRow {
+  symbol: string
+  changePct: number
+  rank?: number
+  momentumScore?: number | null
+  offHighPct?: number | null
+  rocPct?: number | null
+  relativeVolume?: number | null
+  volume?: number
+  float?: number | null
+  premarketVolume?: number | null
+}
 const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
 // Every triggered setup + its verdict, appended as JSONL. This is the session
 // audit trail: at end of day you can answer "did we miss X?" from data instead of
@@ -159,16 +178,29 @@ function recordArbitration(row: Record<string, unknown>, now: number): void {
   try { appendFileSync(arbitrationFile(etDayKey(now)), JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
 }
 
-async function fetchUniverse(): Promise<string[]> {
+/**
+ * Fetch + rank the monitored universe. BEHAVIOR UNCHANGED: `symbols` is the same
+ * top-`TOP_GAINERS_UNIVERSE` set (same day-change re-sort + slice) the daemon has
+ * always monitored. The extra `rankedRows` return and the sweepId/producerHead query
+ * params are TELEMETRY ONLY — the route ignores unknown params, so selection is
+ * identical; the params never influence the ranking or the returned set.
+ */
+async function fetchUniverse(ctx?: SweepContext): Promise<{ symbols: string[]; rankedRows: RankedRow[] }> {
   const params = new URLSearchParams({
     minChangePct: '3', minPrice: '0.1', maxPrice: '300', minVolume: '500000', minRvol: '1.5', maxResults: '30',
   })
+  if (ctx) {
+    params.set('sweepId', ctx.sweepId)
+    if (ctx.producerHead) params.set('producerHead', ctx.producerHead)
+  }
   const res = await fetch(`${BASE}/api/gainers?${params}`)
   if (!res.ok) throw new Error(`gainers HTTP ${res.status}`)
-  const data = await res.json() as { rows?: { symbol: string; changePct: number }[] }
-  return (data.rows ?? [])
+  const data = await res.json() as { rows?: RankedRow[] }
+  const rankedRows = data.rows ?? []
+  const symbols = rankedRows
     .slice().sort((a, b) => b.changePct - a.changePct)
     .slice(0, TOP_GAINERS_UNIVERSE).map(r => r.symbol)
+  return { symbols, rankedRows }
 }
 
 async function fetchResults(symbols: string[]): Promise<MonitorResult[]> {
@@ -209,7 +241,34 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   // NB: position management is NOT done here — it runs on its own faster loop
   // (see positionLoop / POSITION_MS). Ticking here too would double-poll and, more
   // importantly, would put exits back behind the universe scan.
-  const universe = await fetchUniverse()
+  // H3A: one sweep identity threads all telemetry for this cycle. Created BEFORE the
+  // universe fetch so the fetch can carry it; NEVER read by any decision.
+  const sweepStart = Date.now()
+  const sweepCtx: SweepContext = { sweepId: newSweepId(sweepStart), producerHead: PRODUCER_HEAD }
+  const { symbols: universe, rankedRows } = await fetchUniverse(sweepCtx)
+  // Funnel telemetry: sweep + monitored-universe decisions (best-effort; selection
+  // is exactly `universe`, computed identically to before this instrumentation).
+  const monitoredSet = new Set(universe)
+  emitFunnel(sweepCtx, 'sweep_started', {
+    session: getSessionType(sweepStart), universeSize: universe.length, poolSize: rankedRows.length,
+  }, sweepStart)
+  rankedRows.slice().sort((a, b) => b.changePct - a.changePct).forEach((row, i) => {
+    const monitored = monitoredSet.has(row.symbol)
+    emitFunnel(sweepCtx, 'universe_decision', {
+      symbol: row.symbol, strategyId: 'BASE',
+      routeRank: row.rank ?? null,          // rank after the route's momentum re-rank
+      daychangeRank: i + 1,                 // rank after the daemon's day-change re-sort
+      monitored, monitoredRank: monitored ? i + 1 : null,
+      admissionReason: monitored ? 'within_top_gainers_universe_cap' : null,
+      exclusionReason: monitored ? null : 'below_daemon_truncation',
+      universeSizeBefore: rankedRows.length, universeSizeAfter: universe.length,
+      rankComponents: {
+        changePct: row.changePct, momentumScore: row.momentumScore ?? null, offHighPct: row.offHighPct ?? null,
+        rocPct: row.rocPct ?? null, relativeVolume: row.relativeVolume ?? null, volume: row.volume ?? null,
+        float: row.float ?? null, premarketVolume: row.premarketVolume ?? null,
+      },
+    }, sweepStart)
+  })
   if (universe.length === 0) return buys
   const results = await fetchResults(universe)
 
@@ -235,6 +294,17 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       // bounce stand-down no-op on empty logs/states; dedup + the
       // strong-continuation override still apply, which is the alerting core.
       const { verdict, buy } = classifyBuy(setup, r, { now, priorBuys: state, priorLogs: [], priorStates: [] })
+      // H3A funnel: exact per-gate PASS/FAIL/binding (pure projection; gd.verdict === verdict).
+      const gd = decomposeGates(setup, r, { now, priorBuys: state, priorLogs: [], priorStates: [] })
+      emitFunnel(sweepCtx, 'strategy_trigger', {
+        symbol: setup.symbol, strategyId: 'BASE', setupId: setup.id, setupType: setup.type,
+        state: setup.state, triggeredRaw: setup.triggeredRaw ?? false, score: setup.score, grade: setup.grade,
+        offHighPct: setup.gateGeometry?.offHighPct ?? null, verdict,
+      }, now)
+      emitFunnel(sweepCtx, 'gate_evaluation', {
+        symbol: setup.symbol, strategyId: 'BASE', setupId: setup.id, setupType: setup.type,
+        verdict, gates: gd.gates,
+      }, now)
       const attrs = signalAttrs(setup, r)
       // Audit trail: every trigger + verdict, so end-of-session "did we miss X?"
       // is answerable from data — near-misses included. `attrs` is a read-only
@@ -276,6 +346,12 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
             submitted = false
             blockReason = `executor_error: ${(e as Error).message}`
           }
+          // H3A funnel: the handoff to the single execution authority (records the
+          // outcome only; the submit call above is entirely unchanged).
+          emitFunnel(sweepCtx, 'execution_handoff', {
+            symbol: buy.symbol, strategyId: 'BASE', setupId: buy.setupId, setupType: buy.setupType,
+            submitted, blockReason,
+          }, now)
         }
 
         // Observational: record this eligible candidate + its submission outcome.
@@ -299,6 +375,15 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       submittedCount: eligibleCandidates.filter(c => c.submitted === true).length,
       capacityBlockedCount: eligibleCandidates.filter(c => c.submitted === false).length,
       candidates: eligibleCandidates,
+    }, now)
+    // H3A funnel: slim arbitration decision (references by setupId; no fat candidate
+    // payloads — the legacy arbitration log above keeps the full detail).
+    emitFunnel(sweepCtx, 'arbitration_decision', {
+      session: getSessionType(now), universeSize: universe.length,
+      eligibleCount: eligibleCandidates.length,
+      submittedCount: eligibleCandidates.filter(c => c.submitted === true).length,
+      capacityBlockedCount: eligibleCandidates.filter(c => c.submitted === false).length,
+      eligibleSetupIds: eligibleCandidates.map(c => c.setupId ?? null),
     }, now)
   }
   // Log on activity, or periodically so a quiet stretch is visibly alive (not hung).
@@ -347,6 +432,8 @@ async function main() {
   // closed and exits non-zero on a dirty/unverifiable producer when paper trading,
   // unless ALLOW_DIRTY_PRODUCER=1. Records provenance for the init event.
   const provenance = enforceProducerProvenance({ requireAuthority: PAPER_TRADE, override: LAUNCH_ALLOW_DIRTY_PRODUCER, log })
+  // H3A: stamp funnel telemetry with the same producer head the executor records.
+  PRODUCER_HEAD = provenance.producerHead ?? null
 
   let executor: PaperExecutor | null = null
   try {
