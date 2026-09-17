@@ -10,7 +10,7 @@ import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-vo
 import { getWebullGainers, type WebullRankType } from '@/lib/webull-client'
 import { readMomentum, compareByMomentum } from '@/lib/momentum-rank'
 import { emitFunnel } from '@/lib/telemetry/funnel'
-import { assembleDiscoveryProvenance } from '@/lib/universe/discovery-provenance'
+import { assembleDiscoveryProvenance, type SourceObservation, type DiscoverySymbolProv } from '@/lib/universe/discovery-provenance'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -317,14 +317,18 @@ export async function GET(request: Request) {
     // H3B pre-trigger provenance (telemetry only; never affects `universe`/ranking/response).
     // Captured AT each decision point — no after-the-fact inference. All-sources per symbol +
     // exact exclusion/filter reason + pre-truncation ranks feed one enriched discovery event.
-    const allSources = new Map<string, string[]>()
+    const allSources = new Map<string, SourceObservation[]>()
     for (const [label, arr] of ([['webull', webullRows], ['yahoo', yfRows], ['yahoo_trending', trendingRows], ['fmp', fmpRows]] as const)) {
-      for (const g of arr) {
-        if (!g.symbol) continue
+      arr.forEach((g, i) => {
+        if (!g.symbol) return
         const a = allSources.get(g.symbol) ?? []
-        if (!a.includes(label)) a.push(label)
+        if (!a.some(o => o.source === label)) {
+          const chg = typeof g.changesPercentage === 'number' ? g.changesPercentage
+            : (g.changesPercentage != null ? Number(g.changesPercentage) : (g.yfChangePct ?? g.wbChangePct ?? null))
+          a.push({ source: label, rank: i + 1, changePct: chg == null || Number.isNaN(chg) ? null : chg })
+        }
         allSources.set(g.symbol, a)
-      }
+      })
     }
     const dropReason = new Map<string, string>()   // symbol -> exact stage/reason it left the funnel
     interface RankProv { pre60Rank?: number; survived60?: boolean; pre30Rank?: number; survived30?: boolean; routeRank?: number }
@@ -577,21 +581,26 @@ export async function GET(request: Request) {
     // FULL pre-rank discovery set with its winning source + whether it survived to the
     // ranked/monitored pool — the "was symbol X ever discovered?" evidence H1 lacked.
     // Reads only already-computed arrays; changes nothing about the response above.
+    // H3B: the full pre-trigger provenance is the CANONICAL universe truth — computed once from
+    // values recorded at each decision point above, then (a) emitted to the funnel AND (b) returned
+    // in the daemon-only envelope so the UniverseCoordinator can build a COMPLETE SweepSnapshot
+    // (H3C reads the snapshot, not the JSONL). Same single request — ZERO extra provider work.
     const sweepId = searchParams.get('sweepId')
+    let discovery: DiscoverySymbolProv[] | undefined
     if (sweepId) {
+      discovery = assembleDiscoveryProvenance(universe, ranked, allSources, dropReason, rankProv)
       try {
         const producerHead = searchParams.get('producerHead')
-        // Pure assembly (unit-tested in isolation): every field was recorded AT its decision point
-        // above (all-sources at merge, exact reason at each filter, ranks at each truncation).
-        const symbols = assembleDiscoveryProvenance(universe, ranked, allSources, dropReason, rankProv)
         emitFunnel({ sweepId, producerHead }, 'discovery_observed', {
           session: sessionType, inPremarket,
-          discoveredCount: symbols.length, rankedCount: ranked.length, symbols,
+          discoveredCount: discovery.length, rankedCount: ranked.length, symbols: discovery,
         })
       } catch { /* telemetry is best-effort; never affects the response */ }
     }
 
-    return NextResponse.json({ rows: ranked, sessionType, timestamp: Date.now() })
+    // `discovery` is present ONLY for the instrumented daemon call (sweepId). Browser/ad-hoc callers
+    // get the legacy shape unchanged; unknown extra fields are harmless if they ever see it.
+    return NextResponse.json({ rows: ranked, sessionType, timestamp: Date.now(), ...(discovery ? { discovery } : {}) })
   } catch (err) {
     console.error('gainers route error:', err)
     return NextResponse.json({ error: 'Failed to fetch gainers' }, { status: 500 })

@@ -14,8 +14,11 @@ describe('H3B discovery provenance assembler', () => {
     { symbol: 'FOO', changesPercentage: 40 },                        // fmp-only, dropped by a map filter
   ]
   const ranked = [{ symbol: 'MEDS', rank: 2 }, { symbol: 'BAR', rank: 1 }]
-  const allSources = new Map<string, string[]>([
-    ['MEDS', ['webull', 'yahoo', 'fmp']], ['DLXY', ['yahoo']], ['FOO', ['fmp']], ['ETFX', ['fmp', 'yahoo']],
+  const so = (source: string, rank: number, changePct: number | null = null) => ({ source, rank, changePct })
+  const allSources = new Map([
+    ['MEDS', [so('webull', 1, 300), so('yahoo', 3, 298), so('fmp', 5, 301)]],
+    ['DLXY', [so('yahoo', 2, 120)]], ['FOO', [so('fmp', 9, 40)]],
+    ['ETFX', [so('fmp', 4, 15), so('yahoo', 7, 14)]],
   ])
   const dropReason = new Map<string, string>([
     ['FOO', 'below_min_volume'],
@@ -30,8 +33,9 @@ describe('H3B discovery provenance assembler', () => {
   const prov = assembleDiscoveryProvenance(universe, ranked, allSources, dropReason, rankProv)
   const by = (s: string) => prov.find(p => p.symbol === s)!
 
-  it('captures ALL discovery sources + the winning source', () => {
-    expect(by('MEDS').sources).toEqual(['webull', 'yahoo', 'fmp'])
+  it('captures ALL discovery sources (with per-source rank + raw change) + the winning source', () => {
+    expect(by('MEDS').sources.map(s => s.source)).toEqual(['webull', 'yahoo', 'fmp'])
+    expect(by('MEDS').sources.find(s => s.source === 'yahoo')).toEqual({ source: 'yahoo', rank: 3, changePct: 298 })
     expect(by('MEDS').winningSource).toBe('webull')
     expect(by('DLXY').winningSource).toBe('yahoo')
     expect(by('FOO').winningSource).toBe('fmp')
@@ -57,7 +61,7 @@ describe('H3B discovery provenance assembler', () => {
     const etfx = by('ETFX')
     expect(etfx).toBeTruthy()
     expect(etfx.exclusionReason).toBe('excluded_non_common_stock')
-    expect(etfx.sources).toEqual(['fmp', 'yahoo'])
+    expect(etfx.sources.map(s => s.source)).toEqual(['fmp', 'yahoo'])
     expect(etfx.mergedEligible).toBe(false)
     expect(etfx.routeRank).toBeNull()
   })

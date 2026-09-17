@@ -32,8 +32,9 @@ import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } f
 import { authorityLockPath } from '@/lib/execution/authority'
 import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
 import { emitFunnel, emitSessionSummary, newSweepId, ensureFunnelRunId, funnelDegraded, funnelDroppedTotal, type SweepContext } from '@/lib/telemetry/funnel'
-import { UniverseCoordinator, type SweepSnapshot } from '@/lib/universe/coordinator'
+import { UniverseCoordinator, type SweepSnapshot, type UniverseEnvelope } from '@/lib/universe/coordinator'
 import type { RankedRow } from '@/lib/universe/pipeline'
+import type { DiscoverySymbolProv } from '@/lib/universe/discovery-provenance'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -181,7 +182,7 @@ function recordArbitration(row: Record<string, unknown>, now: number): void {
  * and does not touch cache scope). The daemon-side SELECTION now lives in UniverseCoordinator,
  * not here. `ctx` carries sweepId/producerHead so the route's discovery telemetry shares them.
  */
-async function fetchRankedRows(ctx?: SweepContext): Promise<RankedRow[]> {
+async function fetchUniverseEnvelope(ctx?: SweepContext): Promise<UniverseEnvelope> {
   const params = new URLSearchParams({
     minChangePct: '3', minPrice: '0.1', maxPrice: '300', minVolume: '500000', minRvol: '1.5', maxResults: '30',
   })
@@ -191,13 +192,13 @@ async function fetchRankedRows(ctx?: SweepContext): Promise<RankedRow[]> {
   }
   const res = await fetch(`${BASE}/api/gainers?${params}`)
   if (!res.ok) throw new Error(`gainers HTTP ${res.status}`)
-  const data = await res.json() as { rows?: RankedRow[] }
-  return data.rows ?? []
+  const data = await res.json() as { rows?: RankedRow[]; discovery?: DiscoverySymbolProv[] }
+  return { rows: data.rows ?? [], discovery: data.discovery ?? [] }
 }
 
 // One coordinator owns the daemon-side canonical universe (compatibility mode = legacy output).
 const universeCoordinator = new UniverseCoordinator({
-  fetchRankedRows: (c) => fetchRankedRows({ sweepId: c.sweepId, producerHead: c.producerHead }),
+  fetchUniverse: (c) => fetchUniverseEnvelope({ sweepId: c.sweepId, producerHead: c.producerHead }),
   monitoredCap: TOP_GAINERS_UNIVERSE,
 })
 

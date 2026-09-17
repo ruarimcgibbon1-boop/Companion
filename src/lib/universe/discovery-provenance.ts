@@ -1,10 +1,19 @@
 /**
- * H3B — pure assembly of the per-symbol discovery/merge/rank provenance that the
- * /api/gainers route records (telemetry only). Extracted so the logic is unit-testable
- * without the route's provider I/O. Every input map is populated AT the route's decision
- * points (all-sources at merge, exact reason at each filter, ranks at each truncation) —
- * this function only shapes them, it never infers a reason.
+ * H3B — pure assembly of the per-symbol discovery/merge/rank provenance.
+ *
+ * This is the CANONICAL pre-trigger universe truth: it is both recorded in the funnel
+ * (telemetry) AND returned in the daemon-only universe envelope so the coordinator can put
+ * it in the live SweepSnapshot (H3C leader-state observation reads the snapshot, never the
+ * JSONL). Every input map is populated AT the route's decision points (all-sources at merge,
+ * exact reason at each filter, ranks at each truncation) — this function only shapes them.
  */
+
+/** One source's observation of a symbol — available WITHOUT any new provider request. */
+export interface SourceObservation {
+  source: string           // webull | yahoo | yahoo_trending | fmp
+  rank: number             // 1-based position within that source's list (the provider's own order)
+  changePct: number | null // that source's raw change value, when it carries one
+}
 export interface ProvUniverseEntry {
   symbol: string
   webull?: boolean
@@ -16,11 +25,11 @@ export interface RankProvEntry { pre60Rank?: number; survived60?: boolean; pre30
 
 export interface DiscoverySymbolProv {
   symbol: string
-  sources: string[]
-  winningSource: string | null
+  sources: SourceObservation[]     // ALL sources that observed the symbol, with per-source rank + raw change
+  winningSource: string | null     // the first-wins merge winner
   changePct: number
-  mergedEligible: boolean
-  exclusionReason: string | null   // null = survived to the ranked pool
+  mergedEligible: boolean           // survived to the final ranked pool
+  exclusionReason: string | null    // null = survived; else the EXACT stage/reason it left the funnel
   pre60Rank: number | null
   survived60: boolean
   pre30Rank: number | null
@@ -31,7 +40,7 @@ export interface DiscoverySymbolProv {
 export function assembleDiscoveryProvenance(
   universe: ProvUniverseEntry[],
   ranked: ProvRankedRow[],
-  allSources: Map<string, string[]>,
+  allSources: Map<string, SourceObservation[]>,
   dropReason: Map<string, string>,
   rankProv: Map<string, RankProvEntry>,
 ): DiscoverySymbolProv[] {
@@ -51,8 +60,6 @@ export function assembleDiscoveryProvenance(
       routeRank: rankMap.get(g.symbol) ?? null,
     }
   })
-  // Symbols excluded at the MERGE stage never entered `universe`; surface them too so the
-  // "did we ever discover X?" question is fully answerable from one event.
   const inUniverse = new Set(universe.map(g => g.symbol))
   const excludedAtMerge: DiscoverySymbolProv[] = [...dropReason.entries()]
     .filter(([sym]) => !inUniverse.has(sym))
