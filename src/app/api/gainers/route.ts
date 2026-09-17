@@ -10,6 +10,7 @@ import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-vo
 import { getWebullGainers, type WebullRankType } from '@/lib/webull-client'
 import { readMomentum, compareByMomentum } from '@/lib/momentum-rank'
 import { emitFunnel } from '@/lib/telemetry/funnel'
+import { assembleDiscoveryProvenance } from '@/lib/universe/discovery-provenance'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -313,10 +314,27 @@ export async function GET(request: Request) {
     // Webull first so its fresh premarket movers seed the universe; FMP/Yahoo rows
     // for the same symbol are deduped out but their richer data is re-joined by the
     // per-symbol quote/candle fetches below.
+    // H3B pre-trigger provenance (telemetry only; never affects `universe`/ranking/response).
+    // Captured AT each decision point — no after-the-fact inference. All-sources per symbol +
+    // exact exclusion/filter reason + pre-truncation ranks feed one enriched discovery event.
+    const allSources = new Map<string, string[]>()
+    for (const [label, arr] of ([['webull', webullRows], ['yahoo', yfRows], ['yahoo_trending', trendingRows], ['fmp', fmpRows]] as const)) {
+      for (const g of arr) {
+        if (!g.symbol) continue
+        const a = allSources.get(g.symbol) ?? []
+        if (!a.includes(label)) a.push(label)
+        allSources.set(g.symbol, a)
+      }
+    }
+    const dropReason = new Map<string, string>()   // symbol -> exact stage/reason it left the funnel
+    interface RankProv { pre60Rank?: number; survived60?: boolean; pre30Rank?: number; survived30?: boolean; routeRank?: number }
+    const rankProv = new Map<string, RankProv>()   // symbol -> pre-truncation ranks (60-pool, 30-route)
+
     const universe = [...webullRows, ...yfRows, ...trendingRows, ...fmpRows].filter(g => {
-      if (!g.symbol || seen.has(g.symbol)) return false
+      if (!g.symbol) return false
+      if (seen.has(g.symbol)) { return false }   // duplicate across sources (first-wins); not a real drop
       seen.add(g.symbol)
-      if (filters.commonStocksOnly && isExcluded(g.name ?? '', g.symbol, g.exchange)) return false
+      if (filters.commonStocksOnly && isExcluded(g.name ?? '', g.symbol, g.exchange)) { dropReason.set(g.symbol, 'excluded_non_common_stock'); return false }
       return true
     })
 
@@ -368,7 +386,7 @@ export async function GET(request: Request) {
     // explicit choice. RTH keeps the normal floor.
     const effectiveMinPrice = inPremarket ? Math.min(filters.minPrice, 0.05) : filters.minPrice
 
-    const rows: ScannerRow[] = universe
+    const mapped: ScannerRow[] = universe
       .map((g: UniverseEntry, i: number) => {
         const q = quoteMap.get(g.symbol)
         const pm = inPremarket ? pmDataMap.get(g.symbol) : undefined
@@ -381,7 +399,7 @@ export async function GET(request: Request) {
         const isFmpCryptoMisclassification = g.yfChangePct !== undefined && ['CRYPTO','FOREX','COMMODITY'].includes(qExchange) && !['CRYPTO','FOREX','COMMODITY'].includes(gExchange)
         if (!isFmpCryptoMisclassification) {
           const quoteExchange = qExchange || gExchange
-          if (['CRYPTO', 'FOREX', 'COMMODITY'].includes(quoteExchange)) return null
+          if (['CRYPTO', 'FOREX', 'COMMODITY'].includes(quoteExchange)) { dropReason.set(g.symbol, 'non_equity_exchange'); return null }
         }
 
         let price: number
@@ -439,22 +457,22 @@ export async function GET(request: Request) {
         const rvol = avgVol > 0 ? volume / (avgVol * scannerSessionFraction()) : null
 
 
-        if (price < effectiveMinPrice || price > filters.maxPrice) return null
+        if (price < effectiveMinPrice || price > filters.maxPrice) { dropReason.set(g.symbol, 'price_out_of_range'); return null }
         // During premarket only show upside gappers (positive change)
         const absPct = Math.abs(changePct)
-        if (absPct < filters.minChangePct || absPct > filters.maxChangePct) return null
-        if (inPremarket && changePct <= 0) return null  // skip stocks gapping down in premarket scanner
+        if (absPct < filters.minChangePct || absPct > filters.maxChangePct) { dropReason.set(g.symbol, 'change_out_of_range'); return null }
+        if (inPremarket && changePct <= 0) { dropReason.set(g.symbol, 'premarket_not_up'); return null }  // skip stocks gapping down in premarket scanner
         // Volume floor: RTH only. In premarket the `volume` here is often a stale
         // regular-session fallback (RAIN's 20k FMP volume tripped the floor and
         // dropped a +110% gapper) — premarket volume is measured later in the
         // backfill and screened there on the real number.
-        if (!inPremarket && volume > 0 && volume < effectiveMinVolume) return null
-        if (filters.minRelativeVolume > 0 && rvol !== null && rvol < filters.minRelativeVolume) return null
+        if (!inPremarket && volume > 0 && volume < effectiveMinVolume) { dropReason.set(g.symbol, 'below_min_volume'); return null }
+        if (filters.minRelativeVolume > 0 && rvol !== null && rvol < filters.minRelativeVolume) { dropReason.set(g.symbol, 'below_min_rvol'); return null }
 
         const float = floatMap.get(g.symbol) ?? null
         // Only exclude on maxFloat when we actually know the float — never drop a
         // name for missing data.
-        if (filters.maxFloat != null && float != null && float > filters.maxFloat) return null
+        if (filters.maxFloat != null && float != null && float > filters.maxFloat) { dropReason.set(g.symbol, 'above_max_float'); return null }
 
         // Catalyst + badges are attached after ranking (see below), so leave
         // placeholders here.
@@ -488,11 +506,14 @@ export async function GET(request: Request) {
         } as ScannerRow
       })
       .filter((r): r is NonNullable<typeof r> => r !== null)
-      // Pre-rank on day change only to pick a CANDIDATE POOL — deliberately wider
-      // than maxResults, because the whole point of the momentum pass below is that
-      // day-change order is wrong. A name mid-leg can sit well down this list.
-      .sort((a, b) => b.changePct - a.changePct)
-      .slice(0, MOMENTUM_POOL_SIZE)
+    // Pre-rank on day change only to pick a CANDIDATE POOL — deliberately wider than
+    // maxResults, because the whole point of the momentum pass below is that day-change
+    // order is wrong. A name mid-leg can sit well down this list.
+    // (H3B: split from the old single chain so the pre-60 rank is recorded at the decision
+    // point. Output is identical — same sort, same slice.)
+    const byChange = mapped.slice().sort((a, b) => b.changePct - a.changePct)
+    byChange.forEach((r, i) => rankProv.set(r.symbol, { pre60Rank: i + 1, survived60: i < MOMENTUM_POOL_SIZE }))
+    const rows: ScannerRow[] = byChange.slice(0, MOMENTUM_POOL_SIZE)
 
     // Re-rank on how each name is moving NOW. See momentum-rank.ts: ranking by
     // change-from-close surfaces names AFTER their move, at which point the
@@ -500,6 +521,8 @@ export async function GET(request: Request) {
     // were already >5% off their session high, and 46 setups on them triggered 0.
     await attachMomentum(rows, inPremarket)
     rows.sort(compareByMomentum)
+    // H3B: record the momentum-ranked position BEFORE the 30-truncation (decision point).
+    rows.forEach((r, i) => { const p = rankProv.get(r.symbol); if (p) { p.pre30Rank = i + 1; p.survived30 = i < filters.maxResults } })
     rows.splice(filters.maxResults)
     rows.forEach((r, i) => { r.rank = i + 1 })
 
@@ -512,8 +535,16 @@ export async function GET(request: Request) {
     // be screened on volume at all. Rows still lacking a measurement are kept: never
     // drop a name for missing data.
     const ranked = rows
-      .filter(r => filters.minRelativeVolume <= 0 || r.relativeVolume == null || r.relativeVolume >= filters.minRelativeVolume)
-      .filter(r => !inPremarket || r.premarketVolume == null || r.premarketVolume >= effectiveMinVolume)
+      .filter(r => {
+        const ok = filters.minRelativeVolume <= 0 || r.relativeVolume == null || r.relativeVolume >= filters.minRelativeVolume
+        if (!ok) dropReason.set(r.symbol, 'post_rank_below_min_rvol')   // H3B: capture the final re-filter drop
+        return ok
+      })
+      .filter(r => {
+        const ok = !inPremarket || r.premarketVolume == null || r.premarketVolume >= effectiveMinVolume
+        if (!ok) dropReason.set(r.symbol, 'post_rank_below_premarket_volume')
+        return ok
+      })
       .map((r, i) => ({ ...r, rank: i + 1 }))
 
     // Catalyst enrichment for the ranked rows only. Merge press-releases with the
@@ -550,16 +581,12 @@ export async function GET(request: Request) {
     if (sweepId) {
       try {
         const producerHead = searchParams.get('producerHead')
-        const rankedSymbols = new Set(ranked.map(r => r.symbol))
-        const discovered = universe.map(g => ({
-          symbol: g.symbol,
-          source: g.webull ? 'webull' : (g.yfChangePct !== undefined ? 'yahoo' : 'fmp'),
-          changePct: typeof g.changesPercentage === 'number' ? g.changesPercentage : Number(g.changesPercentage ?? 0),
-          mergedEligible: rankedSymbols.has(g.symbol),
-        }))
+        // Pure assembly (unit-tested in isolation): every field was recorded AT its decision point
+        // above (all-sources at merge, exact reason at each filter, ranks at each truncation).
+        const symbols = assembleDiscoveryProvenance(universe, ranked, allSources, dropReason, rankProv)
         emitFunnel({ sweepId, producerHead }, 'discovery_observed', {
           session: sessionType, inPremarket,
-          discoveredCount: discovered.length, rankedCount: ranked.length, symbols: discovered,
+          discoveredCount: symbols.length, rankedCount: ranked.length, symbols,
         })
       } catch { /* telemetry is best-effort; never affects the response */ }
     }
