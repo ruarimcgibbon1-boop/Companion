@@ -35,6 +35,8 @@ import { emitFunnel, emitSessionSummary, newSweepId, ensureFunnelRunId, funnelDe
 import { UniverseCoordinator, type SweepSnapshot, type UniverseEnvelope } from '@/lib/universe/coordinator'
 import type { RankedRow } from '@/lib/universe/pipeline'
 import type { DiscoverySymbolProv } from '@/lib/universe/discovery-provenance'
+import { updateLeaderState, etDay, DEFAULT_LEADER_CONFIG, type LeaderStateMap } from '@/lib/leader/leader-state'
+import { loadLeaderState, saveLeaderState } from '@/lib/leader/leader-store'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -77,6 +79,13 @@ const TOP_GAINERS_UNIVERSE = 15         // matches useMonitor.gatherUniverse
 // H3A funnel telemetry: producer head for event provenance, set once at startup from
 // the same provenance the executor uses. Telemetry-only; never read by any decision.
 let PRODUCER_HEAD: string | null = null
+
+// H3C observational leader state (persistent history over the canonical snapshot). SHADOW ONLY —
+// never changes the monitored universe, BASE inputs, or execution. Read from disk at startup.
+let leaderState: LeaderStateMap = {}
+let leaderHistoryComplete = true          // false once a degraded/fresh load happens
+let leaderSweepCounter = 0
+const LEADER_PERSIST_EVERY = 20           // periodic save (~5 min at 15s), plus on shutdown
 
 // RankedRow now lives in the shared universe pipeline (single source of truth).
 const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
@@ -277,6 +286,44 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       },
     }, sweepStart)
   })
+  // ── H3C: observational leader state ───────────────────────────────────────
+  // Consumes the (deep-frozen) snapshot; SHADOW ONLY — it cannot and does not change `universe`,
+  // BASE inputs, or execution. Best-effort: a throw here must never break the sweep.
+  try {
+    const before = universe                                   // capture to assert isolation below
+    const upd = updateLeaderState(leaderState, snapshot, DEFAULT_LEADER_CONFIG, sweepStart, leaderHistoryComplete)
+    leaderState = upd.state
+    for (const t of upd.transitions) emitFunnel(sweepCtx, 'leader_state_transition', {
+      symbol: t.symbol, leaderEpisodeId: t.leaderEpisodeId, priorState: t.priorState, newState: t.newState,
+      transitionReason: t.reason, ruleVersion: DEFAULT_LEADER_CONFIG.ruleVersion,
+    }, sweepStart)
+    for (const rc of upd.roleChanges) emitFunnel(sweepCtx, 'leader_role_changed', {
+      symbol: rc.symbol, leaderEpisodeId: rc.leaderEpisodeId, priorRole: rc.priorRole, newRole: rc.newRole,
+      ruleVersion: DEFAULT_LEADER_CONFIG.ruleVersion,
+    }, sweepStart)
+    // Compact per-sweep observation for role holders only (bounded — never a full-state dump).
+    for (const rec of Object.values(leaderState)) {
+      if (rec.role === 'NONE' || !rec.presentThisSweep) continue
+      emitFunnel(sweepCtx, 'leader_state_observed', {
+        symbol: rec.symbol, leaderEpisodeId: rec.leaderEpisodeId, role: rec.role, lifecycleState: rec.lifecycleState,
+        peakChangePct: rec.peakObservedChangePct, currentChangePct: rec.currentChangePct, offHighPct: rec.currentOffHighPct,
+        bestRouteRank: rec.bestRouteRank, timesTop30: rec.timesTop30, consecutiveSweepsSeen: rec.consecutiveSweepsSeen,
+        historyComplete: rec.historyComplete, ruleVersion: DEFAULT_LEADER_CONFIG.ruleVersion,
+      }, sweepStart)
+    }
+    // ISOLATION ASSERT: the monitored universe must be byte-identical after the leader-state update.
+    if (universe !== before || universe.length !== snapshot.monitoredSymbols.length) {
+      log('FATAL: leader-state update altered the monitored universe — this must never happen'); process.exit(1)
+    }
+    // Periodic atomic persist (research only; never blocks). Also persisted on shutdown.
+    if (++leaderSweepCounter % LEADER_PERSIST_EVERY === 0) {
+      const ok = saveLeaderState(leaderState, PRODUCER_HEAD, etDay(sweepStart), log)
+      emitFunnel(sweepCtx, 'leader_state_persisted', { ok, recordCount: Object.keys(leaderState).length, evicted: upd.evicted }, sweepStart)
+    }
+  } catch (e) {
+    log('leader-state update failed (research only; sweep continues):', (e as Error).message)
+  }
+
   if (universe.length === 0) return buys
   const results = await fetchResults(universe)
 
@@ -458,6 +505,19 @@ async function main() {
   // H3A: stamp funnel telemetry with the same producer head the executor records.
   PRODUCER_HEAD = provenance.producerHead ?? null
 
+  // H3C: recover observational leader state (research only; NEVER blocks execution). A corrupt/absent
+  // file starts fresh and marks history INCOMPLETE — a restart must not pretend it knows a symbol's
+  // earlier-in-day leadership.
+  {
+    const lr = loadLeaderState(PRODUCER_HEAD, log)
+    leaderState = lr.records
+    leaderHistoryComplete = lr.loadedFromDisk && !lr.degraded
+    const ctx0: SweepContext = { sweepId: newSweepId(), producerHead: PRODUCER_HEAD }
+    if (lr.degraded) emitFunnel(ctx0, 'leader_state_degraded', { reason: lr.reason, recordCount: 0, historyComplete: false })
+    else emitFunnel(ctx0, 'leader_state_recovered', { loadedFromDisk: lr.loadedFromDisk, reason: lr.reason, producerHeadChanged: lr.producerHeadChanged, recordCount: Object.keys(leaderState).length, historyComplete: leaderHistoryComplete })
+    log(`leader-state: ${lr.loadedFromDisk ? `recovered ${Object.keys(leaderState).length} records` : 'fresh'}${lr.degraded ? ' (DEGRADED — history incomplete)' : ''}`)
+  }
+
   let executor: PaperExecutor | null = null
   try {
     executor = await buildExecutor(provenance)
@@ -493,6 +553,8 @@ async function main() {
     shuttingDown = true
     log(`${signal} — shutting down`)
     observerLoop?.stop()   // clear its interval + abort in-flight reads before we exit
+    // H3C: persist observational leader state on the way out (research only; best-effort, never blocks).
+    try { saveLeaderState(leaderState, PRODUCER_HEAD, etDay(Date.now()), log) } catch { /* research persistence is best-effort */ }
     if (executor) {
       // Explicit ordered shutdown: cancel/settle pending entries, flatten open exposure,
       // reconcile, and release execution authority ONLY if the result is SAFE.
