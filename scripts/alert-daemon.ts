@@ -31,7 +31,7 @@ import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
 import { authorityLockPath } from '@/lib/execution/authority'
 import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
-import { emitFunnel, newSweepId, funnelDegraded, funnelDroppedTotal, type SweepContext } from '@/lib/telemetry/funnel'
+import { emitFunnel, emitSessionSummary, newSweepId, funnelDegraded, funnelDroppedTotal, type SweepContext } from '@/lib/telemetry/funnel'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -482,11 +482,18 @@ async function main() {
       })
       log('paper session summary:\n' + executor.summary())
       if (!result.safe) {
+        // Terminal funnel certificate: this was still a GRACEFUL process shutdown, so the
+        // funnel file is certifiable even though execution exposure was unresolved (that is
+        // encoded separately in the paper summary + retained authority marker).
+        emitSessionSummary(PRODUCER_HEAD)
         // Do NOT report a clean shutdown and do NOT exit 0: authority marker was retained.
         log(`EXIT 1 — ${result.reason ?? 'shutdown unresolved'}; execution authority marker retained for manual reconciliation`)
         process.exit(1)
       }
     }
+    // Terminal funnel certificate — best-effort; if it can't be written the ABSENT marker
+    // is itself the evidence the file is not certifiably complete. Never blocks the exit.
+    emitSessionSummary(PRODUCER_HEAD)
     process.exit(0)
   }
   process.on('SIGINT', () => { void shutdown('SIGINT') })
@@ -516,7 +523,7 @@ async function main() {
   while (true) {
     const session = getSessionType()
     if (session === 'overnight' || session === 'closed') {
-      if (ONCE) { log('market closed — nothing to sweep'); return }
+      if (ONCE) { log('market closed — nothing to sweep'); emitSessionSummary(PRODUCER_HEAD); return }
       await sleep(IDLE_MS); continue
     }
     try {
@@ -527,6 +534,7 @@ async function main() {
     }
     if (ONCE) {
       if (executor) log('paper session summary:\n' + executor.summary())
+      emitSessionSummary(PRODUCER_HEAD)   // terminal funnel certificate for the ONCE run
       return
     }
     await sleep(SWEEP_MS)

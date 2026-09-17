@@ -94,10 +94,30 @@ let droppedSinceLastOk = 0
 let droppedEverThisRun = 0
 const ESCALATE_AFTER = 5
 
+// Session-level tallies for the terminal `session_observability_summary` (research only).
+let eventsAttempted = 0
+let eventsWritten = 0
+let sweepStartedCount = 0
+let firstSweepId: string | null = null
+let lastSweepId: string | null = null
+let firstFailureAt: string | null = null
+let lastFailureAt: string | null = null
+let degradedEver = false
+
+/** TEST ONLY: reset session counters so per-test assertions are deterministic. */
+export function __resetFunnelCountersForTest(): void {
+  consecutiveFailures = 0; escalated = false; droppedSinceLastOk = 0; droppedEverThisRun = 0
+  eventsAttempted = 0; eventsWritten = 0; sweepStartedCount = 0
+  firstSweepId = null; lastSweepId = null; firstFailureAt = null; lastFailureAt = null; degradedEver = false
+}
+
 function onWriteError(err: unknown): void {
   consecutiveFailures++
   droppedSinceLastOk++
   droppedEverThisRun++
+  const nowIso = new Date().toISOString()
+  if (firstFailureAt === null) firstFailureAt = nowIso
+  lastFailureAt = nowIso
   // Loud for the first ESCALATE_AFTER, then rate-limited (every 100th) so a long outage
   // is never fully silent but also never spams — the durable gap marker carries the exact count.
   if (consecutiveFailures <= ESCALATE_AFTER || consecutiveFailures % 100 === 0) {
@@ -105,6 +125,7 @@ function onWriteError(err: unknown): void {
   }
   if (consecutiveFailures === ESCALATE_AFTER && !escalated) {
     escalated = true
+    degradedEver = true
     console.error(
       `[funnel] telemetry has failed ${ESCALATE_AFTER} times in a row — CONTINUING TO TRADE with DEGRADED observability. ` +
       `Trading/execution safety is unaffected; only the audit trail is impaired. Investigate ${funnelFile()}.`,
@@ -148,6 +169,10 @@ export function emitFunnel(
   payload: Record<string, unknown> = {},
   now: number = Date.now(),
 ): void {
+  eventsAttempted++
+  if (firstSweepId === null && ctx.sweepId) firstSweepId = ctx.sweepId
+  if (ctx.sweepId) lastSweepId = ctx.sweepId
+  if (eventType === 'sweep_started') sweepStartedCount++
   try {
     const record = {
       eventType,
@@ -159,6 +184,7 @@ export function emitFunnel(
     }
     const file = funnelFile(etDayKey(now))
     appendFileSync(file, JSON.stringify(record) + '\n')
+    eventsWritten++
     // RESEARCH INTEGRITY: the write just succeeded. If events were lost during a prior
     // outage, persist a durable gap marker so the file self-documents the loss (a later
     // audit reading only the file can then exclude a telemetry-compromised session).
@@ -193,4 +219,76 @@ export function emitFunnelBatch(
   now: number = Date.now(),
 ): void {
   for (const e of events) emitFunnel(ctx, e.type, e.payload ?? {}, now)
+}
+
+// ── Terminal session summary + completeness (research integrity) ─────────────
+
+/** The terminal record's payload — a self-contained certificate of session completeness. */
+export interface SessionObservabilitySummary {
+  firstSweepId: string | null
+  lastSweepId: string | null
+  sweepsObserved: number
+  eventsAttempted: number
+  eventsWritten: number
+  droppedTotal: number
+  degradedEver: boolean
+  firstFailureAt: string | null
+  lastFailureAt: string | null
+  cleanClose: true
+}
+
+/** Snapshot the live session tallies (does not write). */
+export function buildSessionSummary(): SessionObservabilitySummary {
+  return {
+    firstSweepId, lastSweepId,
+    sweepsObserved: sweepStartedCount,
+    eventsAttempted, eventsWritten,
+    droppedTotal: droppedEverThisRun,
+    degradedEver,
+    firstFailureAt, lastFailureAt,
+    cleanClose: true,
+  }
+}
+
+/**
+ * Append the terminal `session_observability_summary`. Call on graceful shutdown ONLY.
+ * BEST-EFFORT: if the funnel is unwritable through shutdown this throws internally and
+ * returns false — the marker is NOT persisted, and its ABSENCE is the (correct) evidence
+ * that the file cannot be certified complete. Never throws; never affects execution.
+ * Returns whether the summary was actually written.
+ */
+export function emitSessionSummary(producerHead: string | null, now: number = Date.now()): boolean {
+  try {
+    const record = {
+      eventType: 'session_observability_summary' as const,
+      schemaVersion: FUNNEL_SCHEMA_VERSION,
+      tsUtc: new Date(now).toISOString(),
+      sweepId: lastSweepId,
+      producerHead: producerHead ?? null,
+      ...buildSessionSummary(),
+    }
+    appendFileSync(funnelFile(etDayKey(now)), JSON.stringify(record) + '\n')
+    return true
+  } catch {
+    // Do NOT pretend it persisted. The missing terminal marker certifies incompleteness.
+    return false
+  }
+}
+
+export type FunnelCompleteness = 'COMPLETE' | 'DEGRADED_COMPLETE' | 'INCOMPLETE'
+
+/**
+ * PURE research/telemetry helper. Classify a funnel event stream's completeness:
+ *   INCOMPLETE        — no terminal session_observability_summary (or cleanClose !== true).
+ *                       Absence NEVER means "zero drops" — completeness is UNKNOWN, treated as incomplete.
+ *   DEGRADED_COMPLETE — terminal summary present AND (droppedTotal>0 || degradedEver || a telemetry_gap exists).
+ *   COMPLETE          — terminal summary present, no drops, never degraded, no gap markers.
+ */
+export function assessFunnelCompleteness(events: Array<Record<string, unknown>>): FunnelCompleteness {
+  const summary = [...events].reverse().find(e => e.eventType === 'session_observability_summary')
+  if (!summary || summary.cleanClose !== true) return 'INCOMPLETE'
+  const hadGap = events.some(e => e.eventType === 'telemetry_gap')
+  const dropped = typeof summary.droppedTotal === 'number' ? summary.droppedTotal : 0
+  if (dropped > 0 || summary.degradedEver === true || hadGap) return 'DEGRADED_COMPLETE'
+  return 'COMPLETE'
 }
