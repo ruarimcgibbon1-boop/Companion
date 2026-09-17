@@ -8,7 +8,8 @@ import { UniverseCoordinator, type SweepContextIn } from '../src/lib/universe/co
 import type { RankedRow } from '../src/lib/universe/pipeline'
 import type { DiscoverySymbolProv } from '../src/lib/universe/discovery-provenance'
 import {
-  updateLeaderState, DEFAULT_LEADER_CONFIG, etDay, type LeaderStateMap, type LeaderStateConfig,
+  updateLeaderState, DEFAULT_LEADER_CONFIG, etDay, leaderConfigHash, resolveLeaderConfig,
+  type LeaderStateMap, type LeaderStateConfig, type LeaderStateRecord, type LifecycleState, type LeaderRole,
 } from '../src/lib/leader/leader-state'
 
 const cfg: LeaderStateConfig = { ...DEFAULT_LEADER_CONFIG, staleAbsentSweeps: 2, expireAbsentSweeps: 4, maxRecords: 5 }
@@ -144,5 +145,115 @@ describe('H3C OBSERVATIONAL ISOLATION (§12/§15)', () => {
     const r = updateLeaderState(prev, s, cfg, T(0))
     expect(Object.keys(prev)).toHaveLength(0)                  // prev untouched
     expect(r.state.A).toBeTruthy()
+  })
+})
+
+// ── Red-team §2: provisional config provenance (fingerprint of the EFFECTIVE config) ──────────────
+describe('H3C config provenance (§2)', () => {
+  it('same config → same hash; any behavior-affecting threshold change → different hash', () => {
+    const base = leaderConfigHash(DEFAULT_LEADER_CONFIG)
+    expect(leaderConfigHash({ ...DEFAULT_LEADER_CONFIG })).toBe(base)     // deterministic
+    for (const k of ['candidateMinChangePct', 'confirmMinChangePct', 'confirmTimesTop30', 'resettingOffHighPct', 'staleAbsentSweeps', 'expireAbsentSweeps', 'maxRecords'] as const) {
+      expect(leaderConfigHash({ ...DEFAULT_LEADER_CONFIG, [k]: DEFAULT_LEADER_CONFIG[k] + 1 })).not.toBe(base)
+    }
+    expect(leaderConfigHash({ ...DEFAULT_LEADER_CONFIG, ruleVersion: 'other' })).not.toBe(base)
+  })
+
+  it('env overrides resolve into the effective config and change the fingerprint', () => {
+    const before = leaderConfigHash(resolveLeaderConfig({}))
+    const cfgEnv = resolveLeaderConfig({ COMPANION_LEADER_STALE_ABSENT: '7', COMPANION_LEADER_MAX_RECORDS: '123' })
+    expect(cfgEnv.staleAbsentSweeps).toBe(7); expect(cfgEnv.maxRecords).toBe(123)
+    expect(leaderConfigHash(cfgEnv)).not.toBe(before)
+    // a garbage override falls back to the default (never NaN)
+    expect(resolveLeaderConfig({ COMPANION_LEADER_STALE_ABSENT: 'notanumber' }).staleAbsentSweeps).toBe(DEFAULT_LEADER_CONFIG.staleAbsentSweeps)
+  })
+})
+
+// ── Red-team §3: sustained absence stales+expires from EVERY active lifecycle state ────────────────
+describe('H3C absence from every active state (§3)', () => {
+  const drive = (setup: Spec[][]): { st: LeaderStateMap; next: number } => {
+    let st: LeaderStateMap = {}
+    setup.forEach((specs, i) => { ({ state: st } = updateLeaderState(st, snap(`su${i}`, specs).s, cfg, T(i))) })
+    return { st, next: setup.length }
+  }
+  const cases: [LifecycleState, Spec[][]][] = [
+    ['DISCOVERED', [[{ symbol: 'S', changePct: 20 }]]],
+    ['LEADER_CANDIDATE', [[{ symbol: 'S', changePct: 40, survived30: true }]]],
+    ['LEADER_CONFIRMED', [[{ symbol: 'S', changePct: 80, survived30: true }]]],
+    ['RESETTING', [[{ symbol: 'S', changePct: 80, survived30: true, offHighPct: -10 }]]],
+    ['REEXPANDING', [[{ symbol: 'S', changePct: 80, survived30: true, offHighPct: -10 }], [{ symbol: 'S', changePct: 95, survived30: true, offHighPct: 0 }]]],
+  ]
+  it.each(cases)('%s → sustained absence → STALE → EXPIRED and role drops to NONE', (expected, setup) => {
+    const { st, next } = drive(setup)
+    expect(st.S.lifecycleState).toBe(expected)                 // reached the target active state
+    let s = st, t = next
+    for (let i = 0; i < cfg.staleAbsentSweeps; i++) ({ state: s } = updateLeaderState(s, snap(`ab${t}`, [{ symbol: 'OTHER', changePct: 5 }]).s, cfg, T(t++)))
+    expect(s.S.lifecycleState).toBe('STALE'); expect(s.S.role).toBe('NONE')       // never stuck CORE/CHALLENGER
+    for (let i = cfg.staleAbsentSweeps; i < cfg.expireAbsentSweeps; i++) ({ state: s } = updateLeaderState(s, snap(`ab${t}`, [{ symbol: 'OTHER', changePct: 5 }]).s, cfg, T(t++)))
+    expect(s.S.lifecycleState).toBe('EXPIRED'); expect(s.S.role).toBe('NONE')
+  })
+})
+
+// ── Red-team §4: capacity eviction must be auditable, and must protect active CORE ────────────────
+describe('H3C capacity eviction is auditable (§4)', () => {
+  const day = etDay(T(0))
+  const mk = (symbol: string, lifecycleState: LifecycleState, role: LeaderRole, lastSeenMs: number): LeaderStateRecord => ({
+    symbol, leaderEpisodeId: `led-${symbol}`, tradingDay: day, firstSeenAt: 'x', lastSeenAt: new Date(lastSeenMs).toISOString(),
+    firstSeenSweepId: 's', lastSeenSweepId: 's', firstEverSeenAt: 'x', episodeCount: 1,
+    sourcesEverSeen: ['fmp'], currentSources: ['fmp'], bestSourceRank: 1, currentSourceRanks: { fmp: 1 },
+    bestPre60Rank: 1, bestPre30Rank: 1, bestRouteRank: 1, bestLegacyTop15Rank: 1,
+    firstTop60At: null, firstTop30At: null, firstLegacyTop15At: null, timesTop60: 0, timesTop30: 0, timesLegacyTop15: 0,
+    firstObservedChangePct: 80, currentChangePct: 80, peakObservedChangePct: 80, peakObservedAt: 'x',
+    currentOffHighPct: null, peakRvol: null, currentVolume: null, currentFloat: null,
+    presentThisSweep: true, consecutiveSweepsSeen: 1, consecutiveSweepsAbsent: 0, lastPresentAt: 'x', lastAbsentAt: null,
+    reappearanceCount: 0, lifecycleState, lifecycleEnteredAt: 'x', priorLifecycleState: null,
+    transitionReason: null, transitionSweepId: null, role, roleEnteredAt: 'x', priorRole: null,
+    roleRuleVersion: 'h3c-provisional-1', historyComplete: true,
+  })
+  // maxRecords 3: the carried records go absent (absent=1 < stale=2) so they HOLD their state this sweep,
+  // and one new DISCOVERED symbol pushes over the cap → exactly one eviction.
+  const capCfg: LeaderStateConfig = { ...cfg, maxRecords: 3 }
+
+  it('evicts EXPIRED first; active CORE survives (not silently dropped)', () => {
+    const prev: LeaderStateMap = {
+      OLDEXP: mk('OLDEXP', 'EXPIRED', 'NONE', T(0)),
+      C1: mk('C1', 'LEADER_CONFIRMED', 'CORE', T(1)),
+      C2: mk('C2', 'LEADER_CONFIRMED', 'CORE', T(2)),
+    }
+    const r = updateLeaderState(prev, snap('new', [{ symbol: 'NEW', changePct: 10 }]).s, capCfg, T(3))
+    expect(r.evictions).toHaveLength(1)
+    expect(r.evictions[0].symbol).toBe('OLDEXP'); expect(r.evictions[0].active).toBe(false)
+    expect(r.state.C1).toBeTruthy(); expect(r.state.C2).toBeTruthy()       // CORE protected
+  })
+
+  it('with no EXPIRED, evicts a NONE (DISCOVERED) before any CORE', () => {
+    const prev: LeaderStateMap = {
+      OLDDISC: mk('OLDDISC', 'DISCOVERED', 'NONE', T(0)),
+      C1: mk('C1', 'LEADER_CONFIRMED', 'CORE', T(1)),
+      C2: mk('C2', 'LEADER_CONFIRMED', 'CORE', T(2)),
+    }
+    const r = updateLeaderState(prev, snap('new', [{ symbol: 'NEW', changePct: 10 }]).s, capCfg, T(3))
+    expect(r.evictions.map(e => e.symbol)).toEqual(['OLDDISC'])
+    expect(r.state.C1).toBeTruthy(); expect(r.state.C2).toBeTruthy()
+  })
+
+  it('when only active CORE remain, a CORE IS evicted but the eviction is AUDITABLE (active=true), never silent', () => {
+    const prev: LeaderStateMap = {
+      C0: mk('C0', 'LEADER_CONFIRMED', 'CORE', T(0)),   // oldest
+      C1: mk('C1', 'LEADER_CONFIRMED', 'CORE', T(1)),
+      C2: mk('C2', 'LEADER_CONFIRMED', 'CORE', T(2)),
+    }
+    // keep C2 present so it is unambiguously retained; C0/C1 go absent(1) and hold CORE. Cap 2 forces
+    // one CORE out even though nothing cheaper exists.
+    const r = updateLeaderState(prev, snap('keep', [{ symbol: 'C2', changePct: 80, survived30: true }]).s, { ...capCfg, maxRecords: 2 }, T(3))
+    expect(r.evictions).toHaveLength(1)
+    expect(r.evictions[0].role).toBe('CORE'); expect(r.evictions[0].active).toBe(true)   // surfaced, not silent
+    expect(r.evictions[0].symbol).toBe('C0')                                             // oldest CORE
+  })
+
+  it('memory stays bounded and evictions never exceed the overflow', () => {
+    let st: LeaderStateMap = {}
+    for (let i = 0; i < 20; i++) ({ state: st } = updateLeaderState(st, snap(`s${i}`, [{ symbol: `SYM${i}`, changePct: 10 }]).s, capCfg, T(i)))
+    expect(Object.keys(st).length).toBeLessThanOrEqual(capCfg.maxRecords)
   })
 })

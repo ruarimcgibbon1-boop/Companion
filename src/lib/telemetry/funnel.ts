@@ -54,7 +54,8 @@ export type FunnelEventType =
   | 'leader_role_changed'      // H3C: shadow role change (observational only)
   | 'leader_state_persisted'   // H3C: leader state saved to disk
   | 'leader_state_recovered'   // H3C: leader state loaded from disk on restart
-  | 'leader_state_degraded'    // H3C: corrupt/missing state -> started fresh; history INCOMPLETE
+  | 'leader_state_degraded'    // H3C: corrupt/crashed/secondary state -> history INCOMPLETE
+  | 'leader_state_evicted'     // H3C: a non-expired record dropped under hard capacity pressure (auditable)
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 

@@ -74,13 +74,59 @@ export const DEFAULT_LEADER_CONFIG: LeaderStateConfig = {
   resettingOffHighPct: -8, staleAbsentSweeps: 20, expireAbsentSweeps: 80, maxRecords: 500,
 }
 
+// ── PROVISIONAL CONFIG PROVENANCE (red-team §2) ──────────────────────────────
+// A static ruleVersion is not enough: env overrides can change behavior while the version string
+// stays the same. `leaderConfigHash` is a deterministic fingerprint over EVERY behavior-affecting
+// provisional value, so telemetry/persisted state can pin exactly which effective config produced a
+// transition. `resolveLeaderConfig` reads the (observational-only) env overrides — these never touch
+// trading; they only tune the shadow lifecycle/role thresholds.
+const numEnv = (v: string | undefined, d: number): number => {
+  if (v == null || v.trim() === '') return d
+  const n = Number(v)
+  return Number.isFinite(n) ? n : d
+}
+export function resolveLeaderConfig(env: Record<string, string | undefined> = process.env): LeaderStateConfig {
+  const d = DEFAULT_LEADER_CONFIG
+  return {
+    ruleVersion: env.COMPANION_LEADER_RULE_VERSION?.trim() || d.ruleVersion,
+    candidateMinChangePct: numEnv(env.COMPANION_LEADER_CANDIDATE_MIN_CHANGE, d.candidateMinChangePct),
+    confirmMinChangePct: numEnv(env.COMPANION_LEADER_CONFIRM_MIN_CHANGE, d.confirmMinChangePct),
+    confirmTimesTop30: numEnv(env.COMPANION_LEADER_CONFIRM_TIMES_TOP30, d.confirmTimesTop30),
+    resettingOffHighPct: numEnv(env.COMPANION_LEADER_RESETTING_OFFHIGH, d.resettingOffHighPct),
+    staleAbsentSweeps: numEnv(env.COMPANION_LEADER_STALE_ABSENT, d.staleAbsentSweeps),
+    expireAbsentSweeps: numEnv(env.COMPANION_LEADER_EXPIRE_ABSENT, d.expireAbsentSweeps),
+    maxRecords: numEnv(env.COMPANION_LEADER_MAX_RECORDS, d.maxRecords),
+  }
+}
+/** Canonical, order-stable serialization of every behavior-affecting config value. */
+export function leaderConfigCanonical(cfg: LeaderStateConfig): string {
+  return [
+    'h3c', `rv=${cfg.ruleVersion}`,
+    `cand=${cfg.candidateMinChangePct}`, `conf=${cfg.confirmMinChangePct}`, `ct30=${cfg.confirmTimesTop30}`,
+    `reset=${cfg.resettingOffHighPct}`, `stale=${cfg.staleAbsentSweeps}`, `expire=${cfg.expireAbsentSweeps}`,
+    `max=${cfg.maxRecords}`,
+  ].join('|')
+}
+/** Deterministic 8-hex fingerprint (FNV-1a, dep-free). Same config → same hash; any change → different. */
+export function leaderConfigHash(cfg: LeaderStateConfig): string {
+  const s = leaderConfigCanonical(cfg)
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) }
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
 export interface LeaderTransition { symbol: string; leaderEpisodeId: string; priorState: LifecycleState | null; newState: LifecycleState; reason: string }
 export interface LeaderRoleChange { symbol: string; leaderEpisodeId: string; priorRole: LeaderRole; newRole: LeaderRole }
+// A capacity eviction must be AUDITABLE (red-team §4). `active` = the evicted record was NOT EXPIRED,
+// i.e. a live episode was dropped under hard capacity pressure — a research-integrity event that the
+// caller surfaces loudly and that marks subsequent history incomplete.
+export interface LeaderEviction { symbol: string; leaderEpisodeId: string; role: LeaderRole; lifecycleState: LifecycleState; tradingDay: string; active: boolean }
 export interface LeaderUpdateResult {
   state: LeaderStateMap
   transitions: LeaderTransition[]
   roleChanges: LeaderRoleChange[]
   evicted: number
+  evictions: LeaderEviction[]
 }
 
 /** ET trading day for a timestamp (mirrors execution/store.etDayKey, kept dep-free here). */
@@ -135,7 +181,7 @@ function classifyLifecycle(rec: LeaderStateRecord, cfg: LeaderStateConfig): { st
   return { state: 'DISCOVERED', reason: 'discovered' }
 }
 
-function classifyRole(state: LifecycleState, cfg: LeaderStateConfig): LeaderRole {
+function classifyRole(state: LifecycleState): LeaderRole {
   // SHADOW ONLY. CORE is never permanent: EXPIRED/STALE drop the role.
   if (state === 'LEADER_CONFIRMED' || state === 'RESETTING' || state === 'REEXPANDING') return 'CORE'
   if (state === 'LEADER_CANDIDATE') return 'CHALLENGER'
@@ -218,8 +264,8 @@ export function updateLeaderState(
     applyLifecycleAndRole(rec, cfg, iso, snap.sweepId, transitions, roleChanges)
   }
 
-  const evicted = evictOverCap(state, cfg.maxRecords)
-  return { state, transitions, roleChanges, evicted }
+  const evictions = evictOverCap(state, cfg.maxRecords)
+  return { state, transitions, roleChanges, evicted: evictions.length, evictions }
 }
 
 function applyLifecycleAndRole(
@@ -232,23 +278,37 @@ function applyLifecycleAndRole(
     rec.priorLifecycleState = rec.lifecycleState; rec.lifecycleState = newState
     rec.lifecycleEnteredAt = iso; rec.transitionReason = reason; rec.transitionSweepId = sweepId
   }
-  const newRole = classifyRole(rec.lifecycleState, cfg)
+  const newRole = classifyRole(rec.lifecycleState)
   if (newRole !== rec.role) {
     roleChanges.push({ symbol: rec.symbol, leaderEpisodeId: rec.leaderEpisodeId, priorRole: rec.role, newRole })
     rec.priorRole = rec.role; rec.role = newRole; rec.roleEnteredAt = iso; rec.roleRuleVersion = cfg.ruleVersion
   }
 }
 
-/** Memory bound: evict EXPIRED first, then oldest lastSeen, until at/under cap. Returns evicted count. */
-function evictOverCap(state: LeaderStateMap, maxRecords: number): number {
+// Eviction PRIORITY (lowest value first): EXPIRED → role NONE (DISCOVERED/STALE) → CHALLENGER → CORE.
+// Active CORE/CHALLENGER are evicted LAST and only under hard capacity pressure where nothing cheaper
+// remains — the caller then emits leader_state_evicted and degrades completeness.
+function evictionTier(rec: LeaderStateRecord): number {
+  if (rec.lifecycleState === 'EXPIRED') return 0
+  if (rec.role === 'NONE') return 1
+  if (rec.role === 'CHALLENGER') return 2
+  return 3   // CORE — protect longest
+}
+/** Memory bound: evict by tier, then oldest lastSeen, until at/under cap. Returns evicted records (auditable). */
+function evictOverCap(state: LeaderStateMap, maxRecords: number): LeaderEviction[] {
   const keys = Object.keys(state)
-  if (keys.length <= maxRecords) return 0
+  if (keys.length <= maxRecords) return []
   const ranked = keys.sort((a, b) => {
-    const ea = state[a].lifecycleState === 'EXPIRED' ? 0 : 1, eb = state[b].lifecycleState === 'EXPIRED' ? 0 : 1
-    if (ea !== eb) return ea - eb
-    return Date.parse(state[a].lastSeenAt) - Date.parse(state[b].lastSeenAt)   // oldest first
+    const ta = evictionTier(state[a]), tb = evictionTier(state[b])
+    if (ta !== tb) return ta - tb
+    return Date.parse(state[a].lastSeenAt) - Date.parse(state[b].lastSeenAt)   // oldest first within tier
   })
-  let evicted = 0
-  for (const k of ranked) { if (Object.keys(state).length <= maxRecords) break; delete state[k]; evicted++ }
-  return evicted
+  const evictions: LeaderEviction[] = []
+  for (const k of ranked) {
+    if (Object.keys(state).length <= maxRecords) break
+    const r = state[k]
+    evictions.push({ symbol: r.symbol, leaderEpisodeId: r.leaderEpisodeId, role: r.role, lifecycleState: r.lifecycleState, tradingDay: r.tradingDay, active: r.lifecycleState !== 'EXPIRED' })
+    delete state[k]
+  }
+  return evictions
 }

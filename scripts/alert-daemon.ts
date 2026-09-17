@@ -35,8 +35,9 @@ import { emitFunnel, emitSessionSummary, newSweepId, ensureFunnelRunId, funnelDe
 import { UniverseCoordinator, type SweepSnapshot, type UniverseEnvelope } from '@/lib/universe/coordinator'
 import type { RankedRow } from '@/lib/universe/pipeline'
 import type { DiscoverySymbolProv } from '@/lib/universe/discovery-provenance'
-import { updateLeaderState, etDay, DEFAULT_LEADER_CONFIG, type LeaderStateMap } from '@/lib/leader/leader-state'
-import { loadLeaderState, saveLeaderState } from '@/lib/leader/leader-store'
+import { updateLeaderState, etDay, resolveLeaderConfig, leaderConfigHash, type LeaderStateConfig, type LeaderStateMap } from '@/lib/leader/leader-state'
+import { loadLeaderState, saveLeaderState, type SaveReason, type RecoveryStatus } from '@/lib/leader/leader-store'
+import { acquireLeaderWriterLock } from '@/lib/leader/leader-lock'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -83,9 +84,29 @@ let PRODUCER_HEAD: string | null = null
 // H3C observational leader state (persistent history over the canonical snapshot). SHADOW ONLY —
 // never changes the monitored universe, BASE inputs, or execution. Read from disk at startup.
 let leaderState: LeaderStateMap = {}
-let leaderHistoryComplete = true          // false once a degraded/fresh load happens
+let leaderHistoryComplete = true          // false once a degraded/fresh load or active eviction happens
 let leaderSweepCounter = 0
 const LEADER_PERSIST_EVERY = 20           // periodic save (~5 min at 15s), plus on shutdown
+// Effective (env-resolved) provisional config + its fingerprint — stamped on every persisted checkpoint
+// and every leader telemetry event so a transition can be pinned to the exact config that produced it.
+let leaderCfg: LeaderStateConfig = resolveLeaderConfig()
+let leaderConfigHashV = leaderConfigHash(leaderCfg)
+let leaderRecoveryStatus: RecoveryStatus = 'FRESH_UNKNOWN'
+let leaderCheckpointSeq = 0
+// Single-writer ownership (research only; NEVER affects trading). A secondary daemon runs without
+// persisting leader state.
+let leaderWriterOwned = false
+let releaseLeaderLock: () => void = () => {}
+
+/** Persist leader state ONLY if we own the writer lease; stamps saveReason + config provenance. */
+function persistLeaderState(reason: SaveReason, now: number, lastSweepId: string | null): boolean {
+  if (!leaderWriterOwned) return false
+  return saveLeaderState({
+    records: leaderState, producerHead: PRODUCER_HEAD, tradingDay: etDay(now), saveReason: reason,
+    runId: ensureFunnelRunId(now), lastSweepId, checkpointSeq: ++leaderCheckpointSeq,
+    configVersion: leaderCfg.ruleVersion, configHash: leaderConfigHashV, log,
+  })
+}
 
 // RankedRow now lives in the shared universe pipeline (single source of truth).
 const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
@@ -291,16 +312,28 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   // BASE inputs, or execution. Best-effort: a throw here must never break the sweep.
   try {
     const before = universe                                   // capture to assert isolation below
-    const upd = updateLeaderState(leaderState, snapshot, DEFAULT_LEADER_CONFIG, sweepStart, leaderHistoryComplete)
+    const upd = updateLeaderState(leaderState, snapshot, leaderCfg, sweepStart, leaderHistoryComplete)
     leaderState = upd.state
+    // Provenance stamp on EVERY leader event: which run + exactly which effective config produced it.
+    const prov = { runId: ensureFunnelRunId(sweepStart), ruleVersion: leaderCfg.ruleVersion, leaderConfigVersion: leaderCfg.ruleVersion, leaderConfigHash: leaderConfigHashV }
     for (const t of upd.transitions) emitFunnel(sweepCtx, 'leader_state_transition', {
       symbol: t.symbol, leaderEpisodeId: t.leaderEpisodeId, priorState: t.priorState, newState: t.newState,
-      transitionReason: t.reason, ruleVersion: DEFAULT_LEADER_CONFIG.ruleVersion,
+      transitionReason: t.reason, ...prov,
     }, sweepStart)
     for (const rc of upd.roleChanges) emitFunnel(sweepCtx, 'leader_role_changed', {
-      symbol: rc.symbol, leaderEpisodeId: rc.leaderEpisodeId, priorRole: rc.priorRole, newRole: rc.newRole,
-      ruleVersion: DEFAULT_LEADER_CONFIG.ruleVersion,
+      symbol: rc.symbol, leaderEpisodeId: rc.leaderEpisodeId, priorRole: rc.priorRole, newRole: rc.newRole, ...prov,
     }, sweepStart)
+    // CAPACITY EVICTION is auditable: a non-expired (active) eviction is a research-integrity event —
+    // emit it loudly and mark subsequent history incomplete so a later reappearance can never masquerade
+    // as clean continuity (a fresh episode, not a normal expiry/re-entry).
+    for (const ev of upd.evictions) {
+      if (!ev.active) continue
+      emitFunnel(sweepCtx, 'leader_state_evicted', {
+        symbol: ev.symbol, leaderEpisodeId: ev.leaderEpisodeId, role: ev.role, lifecycleState: ev.lifecycleState,
+        reason: 'capacity_pressure', historyComplete: false, ...prov,
+      }, sweepStart)
+      leaderHistoryComplete = false
+    }
     // Compact per-sweep observation for role holders only (bounded — never a full-state dump).
     for (const rec of Object.values(leaderState)) {
       if (rec.role === 'NONE' || !rec.presentThisSweep) continue
@@ -308,17 +341,20 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
         symbol: rec.symbol, leaderEpisodeId: rec.leaderEpisodeId, role: rec.role, lifecycleState: rec.lifecycleState,
         peakChangePct: rec.peakObservedChangePct, currentChangePct: rec.currentChangePct, offHighPct: rec.currentOffHighPct,
         bestRouteRank: rec.bestRouteRank, timesTop30: rec.timesTop30, consecutiveSweepsSeen: rec.consecutiveSweepsSeen,
-        historyComplete: rec.historyComplete, ruleVersion: DEFAULT_LEADER_CONFIG.ruleVersion,
+        historyComplete: rec.historyComplete, ...prov,
       }, sweepStart)
     }
     // ISOLATION ASSERT: the monitored universe must be byte-identical after the leader-state update.
     if (universe !== before || universe.length !== snapshot.monitoredSymbols.length) {
       log('FATAL: leader-state update altered the monitored universe — this must never happen'); process.exit(1)
     }
-    // Periodic atomic persist (research only; never blocks). Also persisted on shutdown.
+    // Periodic atomic persist (research only; never blocks; SKIPPED if we don't own the writer lease).
     if (++leaderSweepCounter % LEADER_PERSIST_EVERY === 0) {
-      const ok = saveLeaderState(leaderState, PRODUCER_HEAD, etDay(sweepStart), log)
-      emitFunnel(sweepCtx, 'leader_state_persisted', { ok, recordCount: Object.keys(leaderState).length, evicted: upd.evicted }, sweepStart)
+      const ok = persistLeaderState('PERIODIC', sweepStart, sweepCtx.sweepId)
+      emitFunnel(sweepCtx, 'leader_state_persisted', {
+        ok, writerOwned: leaderWriterOwned, saveReason: 'PERIODIC', recordCount: Object.keys(leaderState).length,
+        evicted: upd.evicted, historyComplete: leaderHistoryComplete, recoveryStatus: leaderRecoveryStatus, ...prov,
+      }, sweepStart)
     }
   } catch (e) {
     log('leader-state update failed (research only; sweep continues):', (e as Error).message)
@@ -509,13 +545,33 @@ async function main() {
   // file starts fresh and marks history INCOMPLETE — a restart must not pretend it knows a symbol's
   // earlier-in-day leadership.
   {
-    const lr = loadLeaderState(PRODUCER_HEAD, log)
+    leaderCfg = resolveLeaderConfig()
+    leaderConfigHashV = leaderConfigHash(leaderCfg)
+    // CRASH-AWARE recovery: only a clean-terminal checkpoint (SHUTDOWN/ONCE) with the same producer +
+    // config is trusted complete; a PERIODIC checkpoint left by a crashed prior run is history-INCOMPLETE.
+    const lr = loadLeaderState({ producerHead: PRODUCER_HEAD, configHash: leaderConfigHashV, log })
     leaderState = lr.records
-    leaderHistoryComplete = lr.loadedFromDisk && !lr.degraded
+    leaderHistoryComplete = lr.historyComplete
+    leaderRecoveryStatus = lr.recoveryStatus
+    // Acquire the single-writer lease (research only; a failure NEVER affects trading — we just don't persist).
+    try {
+      const lock = acquireLeaderWriterLock(
+        { pid: process.pid, runId: ensureFunnelRunId(Date.now()), producerHead: PRODUCER_HEAD, startedAt: new Date().toISOString() }, log,
+      )
+      leaderWriterOwned = lock.acquired
+      releaseLeaderLock = lock.release
+    } catch (e) {
+      leaderWriterOwned = false
+      log('leader-state writer-lease error (research only; trading unaffected):', (e as Error).message)
+    }
     const ctx0: SweepContext = { sweepId: newSweepId(), producerHead: PRODUCER_HEAD }
-    if (lr.degraded) emitFunnel(ctx0, 'leader_state_degraded', { reason: lr.reason, recordCount: 0, historyComplete: false })
-    else emitFunnel(ctx0, 'leader_state_recovered', { loadedFromDisk: lr.loadedFromDisk, reason: lr.reason, producerHeadChanged: lr.producerHeadChanged, recordCount: Object.keys(leaderState).length, historyComplete: leaderHistoryComplete })
-    log(`leader-state: ${lr.loadedFromDisk ? `recovered ${Object.keys(leaderState).length} records` : 'fresh'}${lr.degraded ? ' (DEGRADED — history incomplete)' : ''}`)
+    const prov = { runId: ensureFunnelRunId(Date.now()), leaderConfigVersion: leaderCfg.ruleVersion, leaderConfigHash: leaderConfigHashV }
+    const common = { recoveryStatus: lr.recoveryStatus, historyComplete: lr.historyComplete, recordCount: Object.keys(leaderState).length, writerOwned: leaderWriterOwned, ...prov }
+    if (lr.degraded) emitFunnel(ctx0, 'leader_state_degraded', { reason: lr.reason, ...common })
+    else emitFunnel(ctx0, 'leader_state_recovered', { loadedFromDisk: lr.loadedFromDisk, reason: lr.reason, producerHeadChanged: lr.producerHeadChanged, configChanged: lr.configChanged, savedReason: lr.savedReason, lastSweepId: lr.lastSweepId, ...common })
+    // A secondary daemon (writer lease not owned) is a research-observability degradation — flag it loudly.
+    if (!leaderWriterOwned) emitFunnel(ctx0, 'leader_state_degraded', { reason: 'writer_not_owned_secondary_daemon', ...common })
+    log(`leader-state: ${lr.loadedFromDisk ? `recovered ${Object.keys(leaderState).length} records` : 'fresh'} [${lr.recoveryStatus}]${lr.historyComplete ? '' : ' (history INCOMPLETE)'}${leaderWriterOwned ? '' : ' (SECONDARY — not persisting leader state)'}`)
   }
 
   let executor: PaperExecutor | null = null
@@ -553,8 +609,9 @@ async function main() {
     shuttingDown = true
     log(`${signal} — shutting down`)
     observerLoop?.stop()   // clear its interval + abort in-flight reads before we exit
-    // H3C: persist observational leader state on the way out (research only; best-effort, never blocks).
-    try { saveLeaderState(leaderState, PRODUCER_HEAD, etDay(Date.now()), log) } catch { /* research persistence is best-effort */ }
+    // H3C: write a CLEAN-TERMINAL checkpoint (saveReason=SHUTDOWN) so the next start recovers COMPLETE,
+    // then release the writer lease. Research only; best-effort; never blocks execution.
+    try { persistLeaderState('SHUTDOWN', Date.now(), null); releaseLeaderLock() } catch { /* research persistence is best-effort */ }
     if (executor) {
       // Explicit ordered shutdown: cancel/settle pending entries, flatten open exposure,
       // reconcile, and release execution authority ONLY if the result is SAFE.
@@ -605,7 +662,7 @@ async function main() {
   while (true) {
     const session = getSessionType()
     if (session === 'overnight' || session === 'closed') {
-      if (ONCE) { log('market closed — nothing to sweep'); emitSessionSummary(PRODUCER_HEAD); return }
+      if (ONCE) { log('market closed — nothing to sweep'); try { releaseLeaderLock() } catch { /* best-effort */ } emitSessionSummary(PRODUCER_HEAD); return }
       await sleep(IDLE_MS); continue
     }
     try {
@@ -616,6 +673,8 @@ async function main() {
     }
     if (ONCE) {
       if (executor) log('paper session summary:\n' + executor.summary())
+      // A completed single-shot run is a CLEAN-TERMINAL checkpoint (saveReason=ONCE) — its history is complete.
+      try { persistLeaderState('ONCE', Date.now(), null); releaseLeaderLock() } catch { /* research persistence is best-effort */ }
       emitSessionSummary(PRODUCER_HEAD)   // terminal funnel certificate for the ONCE run
       return
     }
