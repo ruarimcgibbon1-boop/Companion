@@ -23,7 +23,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 import type { MonitorResult, BuySignalRecord, DetectedSetup } from '@/types'
-import { classifyBuy, decomposeGates, passesTrackingFloor, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
+import { classifyBuy, decomposeGates, passesTrackingFloor, DISPLAY_FLOOR_SCORE, SYMBOL_LOG_WINDOW_MS } from '@/lib/buy-log'
 import { getSessionType } from '@/lib/market-hours'
 import { loadEnvLocal } from '@/lib/execution/env'
 import { AlpacaBroker } from '@/lib/execution/alpaca'
@@ -31,7 +31,9 @@ import { PaperExecutor, DEFAULT_EXECUTOR } from '@/lib/execution/executor'
 import { enforceProducerProvenance, overrideEnabled, type ProducerProvenance } from '@/lib/execution/provenance'
 import { authorityLockPath } from '@/lib/execution/authority'
 import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/lib/execution/store'
-import { emitFunnel, emitSessionSummary, newSweepId, funnelDegraded, funnelDroppedTotal, type SweepContext } from '@/lib/telemetry/funnel'
+import { emitFunnel, emitSessionSummary, newSweepId, ensureFunnelRunId, funnelDegraded, funnelDroppedTotal, type SweepContext } from '@/lib/telemetry/funnel'
+import { UniverseCoordinator, type SweepSnapshot } from '@/lib/universe/coordinator'
+import type { RankedRow } from '@/lib/universe/pipeline'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
@@ -75,19 +77,7 @@ const TOP_GAINERS_UNIVERSE = 15         // matches useMonitor.gatherUniverse
 // the same provenance the executor uses. Telemetry-only; never read by any decision.
 let PRODUCER_HEAD: string | null = null
 
-/** One ranked row as the gainers route returns it — used ONLY for telemetry. */
-interface RankedRow {
-  symbol: string
-  changePct: number
-  rank?: number
-  momentumScore?: number | null
-  offHighPct?: number | null
-  rocPct?: number | null
-  relativeVolume?: number | null
-  volume?: number
-  float?: number | null
-  premarketVolume?: number | null
-}
+// RankedRow now lives in the shared universe pipeline (single source of truth).
 const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
 // Every triggered setup + its verdict, appended as JSONL. This is the session
 // audit trail: at end of day you can answer "did we miss X?" from data instead of
@@ -185,7 +175,13 @@ function recordArbitration(row: Record<string, unknown>, now: number): void {
  * params are TELEMETRY ONLY — the route ignores unknown params, so selection is
  * identical; the params never influence the ranking or the returned set.
  */
-async function fetchUniverse(ctx?: SweepContext): Promise<{ symbols: string[]; rankedRows: RankedRow[] }> {
+/**
+ * Fetch the route's ranked rows — the UNCHANGED provider path (one /api/gainers HTTP call per
+ * sweep; the route makes the same provider calls it always did; H3B adds ZERO provider requests
+ * and does not touch cache scope). The daemon-side SELECTION now lives in UniverseCoordinator,
+ * not here. `ctx` carries sweepId/producerHead so the route's discovery telemetry shares them.
+ */
+async function fetchRankedRows(ctx?: SweepContext): Promise<RankedRow[]> {
   const params = new URLSearchParams({
     minChangePct: '3', minPrice: '0.1', maxPrice: '300', minVolume: '500000', minRvol: '1.5', maxResults: '30',
   })
@@ -196,12 +192,14 @@ async function fetchUniverse(ctx?: SweepContext): Promise<{ symbols: string[]; r
   const res = await fetch(`${BASE}/api/gainers?${params}`)
   if (!res.ok) throw new Error(`gainers HTTP ${res.status}`)
   const data = await res.json() as { rows?: RankedRow[] }
-  const rankedRows = data.rows ?? []
-  const symbols = rankedRows
-    .slice().sort((a, b) => b.changePct - a.changePct)
-    .slice(0, TOP_GAINERS_UNIVERSE).map(r => r.symbol)
-  return { symbols, rankedRows }
+  return data.rows ?? []
 }
+
+// One coordinator owns the daemon-side canonical universe (compatibility mode = legacy output).
+const universeCoordinator = new UniverseCoordinator({
+  fetchRankedRows: (c) => fetchRankedRows({ sweepId: c.sweepId, producerHead: c.producerHead }),
+  monitoredCap: TOP_GAINERS_UNIVERSE,
+})
 
 async function fetchResults(symbols: string[]): Promise<MonitorResult[]> {
   const res = await fetch(`${BASE}/api/monitor`, {
@@ -245,12 +243,21 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   // universe fetch so the fetch can carry it; NEVER read by any decision.
   const sweepStart = Date.now()
   const sweepCtx: SweepContext = { sweepId: newSweepId(sweepStart), producerHead: PRODUCER_HEAD }
-  const { symbols: universe, rankedRows } = await fetchUniverse(sweepCtx)
-  // Funnel telemetry: sweep + monitored-universe decisions (best-effort; selection
-  // is exactly `universe`, computed identically to before this instrumentation).
+  // H3B: the UniverseCoordinator is the single owner of the daemon-side canonical universe.
+  // Compatibility mode reproduces the exact legacy monitored set (same rows, same re-sort,
+  // same top-15) — proven by the parity harness. Provider path is unchanged (see fetchRankedRows).
+  const snapshot: SweepSnapshot = await universeCoordinator.buildSweep({
+    sweepId: sweepCtx.sweepId, runId: ensureFunnelRunId(sweepStart),
+    producerHead: PRODUCER_HEAD, session: getSessionType(sweepStart),
+  })
+  const universe = snapshot.monitoredSymbols as string[]
+  const rankedRows = snapshot.rawDiscovery as RankedRow[]
+  // Funnel telemetry: sweep + monitored-universe decisions (best-effort; selection is exactly
+  // `snapshot.monitoredSymbols`, owned by the coordinator).
   const monitoredSet = new Set(universe)
   emitFunnel(sweepCtx, 'sweep_started', {
-    session: getSessionType(sweepStart), universeSize: universe.length, poolSize: rankedRows.length,
+    session: snapshot.session, universeSize: universe.length, poolSize: rankedRows.length,
+    runId: snapshot.runId, snapshotSchemaVersion: snapshot.schemaVersion, universePolicy: snapshot.policy,
   }, sweepStart)
   rankedRows.slice().sort((a, b) => b.changePct - a.changePct).forEach((row, i) => {
     const monitored = monitoredSet.has(row.symbol)
@@ -288,7 +295,19 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   for (const r of results) {
     for (const setup of r.setups as DetectedSetup[]) {
       if (!(setup.direction === 'long' && setup.triggeredRaw)) continue
-      if (!passesTrackingFloor(setup, MIN_LEVEL_STRENGTH)) continue
+      // H3B (Step 11): a raw trigger that fails the tracking floor was previously dropped
+      // SILENTLY (H3A blind spot). Record it before the (unchanged) `continue` so a research
+      // audit distinguishes "no raw trigger" from "raw trigger below the tracking floor".
+      if (!passesTrackingFloor(setup, MIN_LEVEL_STRENGTH)) {
+        emitFunnel(sweepCtx, 'tracking_floor', {
+          symbol: setup.symbol, strategyId: 'BASE', setupId: setup.id, setupType: setup.type,
+          triggeredRaw: setup.triggeredRaw ?? false,
+          observed: { score: setup.score, levelQuality: setup.breakdown?.levelQuality ?? null, levelStrength: setup.levelStrength ?? null },
+          rule: { displayFloorScore: DISPLAY_FLOOR_SCORE, minLevelStrengthPct: MIN_LEVEL_STRENGTH },
+          result: 'FAIL', reason: 'below_tracking_floor',
+        }, now)
+        continue
+      }
       triggered++
       // Daemon tracks buys only (no full log/state machine) — the win/loss cap and
       // bounce stand-down no-op on empty logs/states; dedup + the

@@ -42,6 +42,7 @@ export type FunnelEventType =
   | 'symbol_merged'
   | 'symbol_ranked'
   | 'universe_decision'
+  | 'tracking_floor'      // a raw trigger that failed passesTrackingFloor (was silently dropped pre-H3B)
   | 'strategy_trigger'
   | 'gate_evaluation'
   | 'arbitration_decision'
@@ -114,6 +115,12 @@ let lastWrittenDay: string | null = null   // ET day of the last successful writ
 function ensureRunId(now: number): string {
   if (runId === null) runId = `run-${now}-${Math.random().toString(36).slice(2, 8)}`
   return runId
+}
+
+/** Mint (if needed) and return the funnel run id, so the daemon can stamp the SweepSnapshot with
+ *  the SAME runId its telemetry uses. Pure w.r.t. any decision — just an id. */
+export function ensureFunnelRunId(now: number = Date.now()): string {
+  return ensureRunId(now)
 }
 
 /** TEST ONLY: reset session counters so per-test assertions are deterministic. */
