@@ -220,7 +220,14 @@ export function decomposeGates(
   const { now, priorBuys, priorLogs, priorStates } = ctx
   const fill = setup.entryFill ?? setup.zoneUpper
 
-  // Same intermediates as classifyBuy (kept verbatim; parity-tested).
+  // ── SINGLE SOURCE OF TRUTH ─────────────────────────────────────────────────
+  // The verdict is taken DIRECTLY from classifyBuy — decomposeGates never re-derives
+  // it, so the two can never disagree (no "second truth"). Everything below is pure
+  // ATTRIBUTION: which gate the authoritative verdict corresponds to, plus each
+  // gate's observed value. The recomputed booleans mirror classifyBuy's intermediates
+  // for the per-gate PASS/FAIL readout and are pinned by an exhaustive contract test.
+  const verdict: BuyVerdict = classifyBuy(setup, r, ctx).verdict
+
   const standDown = BOUNCE_TYPES.has(setup.type) && recentlyFailedBounce(setup.symbol, now, priorStates)
   const symbolLogsThisSession = priorBuys.filter(
     b => b.symbol === setup.symbol && now - b.timestamp < SYMBOL_LOG_WINDOW_MS,
@@ -235,48 +242,46 @@ export function decomposeGates(
   const volumeOk = r.integrity.session === 'premarket'
     ? r.premarketVolume == null || r.premarketVolume >= MIN_PREMARKET_BUY_VOLUME || premarketSurge
     : r.volume === 0 || r.volume >= MIN_BUY_VOLUME
-  const vetoFail = (setup.qualityVetoed ?? false) || gradeFloorFail
 
-  // Ordered tiers exactly as classifyBuy short-circuits them.
-  const tiers: Array<{ name: string; verdict: BuyVerdict; fail: boolean }> = [
-    { name: 'session', verdict: 'session', fail: !tradeable },
-    { name: 'volume', verdict: 'volume', fail: !volumeOk },
-    { name: 'veto', verdict: 'veto', fail: vetoFail },
-    { name: 'standDown', verdict: 'standDown', fail: standDown },
-    { name: 'capped', verdict: 'capped', fail: capped },
-    { name: 'dup', verdict: 'dup', fail: dup },
-  ]
-  const bindingIdx = tiers.findIndex(t => t.fail)
-  const verdict: BuyVerdict = bindingIdx === -1 ? 'logged' : tiers[bindingIdx].verdict
-  const tierIndex: Record<string, number> = { session: 0, volume: 1, veto: 2, standDown: 3, capped: 4, dup: 5 }
-  // NOT_APPLICABLE once short-circuited: a gate whose tier is strictly past the binding tier was never reached.
-  const reached = (tier: string) => bindingIdx === -1 || tierIndex[tier] <= bindingIdx
+  // Binding tier = the tier the AUTHORITATIVE verdict names (or none when 'logged').
+  // Everything is keyed off this, so attribution can never contradict the verdict.
+  const order = ['session', 'volume', 'veto', 'standDown', 'capped', 'dup']
+  const bindingName: string | null = verdict === 'logged' ? null : verdict
+  const bindingIdx = bindingName ? order.indexOf(bindingName) : order.length
+  const reached = (tier: string) => order.indexOf(tier) <= bindingIdx
   const gg = setup.gateGeometry
 
-  // Veto sub-gates (only meaningfully evaluated when session+volume passed).
+  // Veto sub-gates, read from the geometry the detector already computed. Invariant
+  // (contract-tested): qualityVetoed === (fadedChase||lateInLeg||unconfirmed||
+  // quarantined||noRoom||vetoTriggerActive). The `quality_other` CATCH-ALL guarantees
+  // a bound veto is NEVER left unattributed even if the geometry is absent/inconsistent.
   const vetoReached = reached('veto')
+  const qualityComponents = (gg?.unconfirmed ?? false) || (gg?.quarantined ?? false) || (gg?.vetoTriggerActive ?? false)
+  const knownVetoSub = (gg?.fadedChase ?? false) || (gg?.noRoom ?? false) || (gg?.lateInLeg ?? false)
+    || qualityComponents || gradeFloorFail
   const subFails: Record<string, boolean> = {
     off_high: gg?.fadedChase ?? false,
     grade_floor: gradeFloorFail,
     space: gg?.noRoom ?? false,
     runup: gg?.lateInLeg ?? false,
-    quality_other: (gg?.unconfirmed ?? false) || (gg?.quarantined ?? false) || (gg?.vetoTriggerActive ?? false),
+    // Catch-all: explicit quality components, OR a veto the tracked components don't explain.
+    quality_other: qualityComponents || (verdict === 'veto' && !knownVetoSub),
   }
   const nSubFail = Object.values(subFails).filter(Boolean).length
   const subBinding = (fail: boolean): boolean | 'unknown' =>
-    bindingIdx !== -1 && tiers[bindingIdx].name === 'veto' && fail ? (nSubFail > 1 ? 'unknown' : true) : false
+    bindingName === 'veto' && fail ? (nSubFail > 1 ? 'unknown' : true) : false
   const res = (reachedTier: boolean, fail: boolean): 'PASS' | 'FAIL' | 'NOT_APPLICABLE' =>
     !reachedTier ? 'NOT_APPLICABLE' : fail ? 'FAIL' : 'PASS'
-  const soleBinding = (tier: string, fail: boolean): boolean =>
-    bindingIdx !== -1 && tiers[bindingIdx].name === tier && fail
+  // Single-tier binding is anchored to the authoritative verdict, not a recomputed bool.
+  const soleBinding = (tier: string): boolean => bindingName === tier
 
   const gates: BuyGateRecord[] = [
     { gateId: 'session', observedValue: r.integrity.session, ruleValue: 'premarket || (regular && <14:00 ET)',
-      result: res(reached('session'), !tradeable), binding: soleBinding('session', !tradeable) },
+      result: res(reached('session'), !tradeable), binding: soleBinding('session') },
     { gateId: r.integrity.session === 'premarket' ? 'premarket_volume' : 'volume',
       observedValue: r.integrity.session === 'premarket' ? (r.premarketVolume ?? null) : r.volume,
       ruleValue: r.integrity.session === 'premarket' ? MIN_PREMARKET_BUY_VOLUME : MIN_BUY_VOLUME,
-      result: res(reached('volume'), !volumeOk), binding: soleBinding('volume', !volumeOk) },
+      result: res(reached('volume'), !volumeOk), binding: soleBinding('volume') },
     // veto sub-gates
     { gateId: 'off_high', observedValue: gg?.offHighPct ?? null, ruleValue: -5,
       result: res(vetoReached, subFails.off_high), binding: subBinding(subFails.off_high) },
@@ -290,11 +295,11 @@ export function decomposeGates(
       result: res(vetoReached, subFails.quality_other), binding: subBinding(subFails.quality_other) },
     // remaining single tiers
     { gateId: 'stand_down', observedValue: standDown, ruleValue: false,
-      result: res(reached('standDown'), standDown), binding: soleBinding('standDown', standDown) },
+      result: res(reached('standDown'), standDown), binding: soleBinding('standDown') },
     { gateId: 'same_symbol_cap', observedValue: symbolLogsThisSession, ruleValue: MAX_LOGS_PER_SYMBOL,
-      result: res(reached('capped'), capped), binding: soleBinding('capped', capped) },
+      result: res(reached('capped'), capped), binding: soleBinding('capped') },
     { gateId: 'dedupe', observedValue: fill, ruleValue: 'not a duplicate fill', result: res(reached('dup'), dup),
-      binding: soleBinding('dup', dup) },
+      binding: soleBinding('dup') },
   ]
   return { verdict, gates }
 }
