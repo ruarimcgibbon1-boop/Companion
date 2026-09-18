@@ -46,8 +46,24 @@ function cachedCatalystScore(sym: string): { score: number; has: boolean } {
   }
 }
 
-export async function buildMonitorResult(symbol: string): Promise<MonitorResult | null> {
+/**
+ * H4A.1 — OBSERVATIONAL-ONLY mode. When `observationalOnly` is set the symbol is a member of the
+ * bounded leader-observation cohort (NOT the BASE monitored set). It rides the SAME canonical
+ * data/compute path (same cache keys, same pure geometry) so there is no second market-data truth,
+ * but it SKIPS the enrichment that only feeds BASE detection/execution and that H4B does not need:
+ *   - float shares (getFloatShares)        — 1 fewer FMP call per cold symbol
+ *   - premarket volume (getExtendedIntraday) — 1 fewer FMP call per cold premarket symbol
+ *   - detectSetups                          — a HARD structural guarantee that an observational
+ *                                             symbol never enters BASE detection at all
+ * candles1m + daily + quote/yfquote are still fetched (they are what honest 1m local geometry needs).
+ * The default (BASE) path is byte-identical to pre-H4A.1.
+ */
+export async function buildMonitorResult(
+  symbol: string,
+  opts: { observationalOnly?: boolean } = {},
+): Promise<MonitorResult | null> {
   const sym = symbol.toUpperCase()
+  const observationalOnly = opts.observationalOnly === true
   const missing: string[] = []
 
   try {
@@ -104,7 +120,7 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
     // premarket measure: today's premarket volume vs this name's own typical
     // premarket volume by this time of day, off the one feed that carries it.
     const session = getSessionType()
-    const premarket = session === 'premarket'
+    const premarket = session === 'premarket' && !observationalOnly
       ? await cached(`pmvol:${sym}`, TTL.PREMARKET_VOL, async () => {
           const rows = await getExtendedIntradayCandles(sym)
           // No rows at all = the fetch failed, NOT a quiet premarket: the window
@@ -125,27 +141,34 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
     const levels = buildKeyLevels({ intraday, daily, sessionLevels, technical, currentPrice: price })
 
     const { score: catalystScore, has: hasCatalyst } = cachedCatalystScore(sym)
-    // Float feeds the in-play gate. Shared 6h cache key with the scanner.
-    const float = await cached(`floatShares:${sym}`, TTL.FLOAT, () => getFloatShares(sym))
-
-    const detCtx: DetectionContext = {
-      symbol: sym,
-      price,
-      candles: intraday,
-      sessionLevels,
-      technical,
-      levels,
-      catalystScore,
-      hasCatalyst,
-      spreadPct: null,     // real-time spread not available from this feed — honestly null
-      changePct: quote?.changePercentage ?? 0,
-      session,
-      minutesSinceOpen: minutesSinceOpen(),
-      float,
-    }
+    // Float feeds the in-play gate (BASE only). Shared 6h cache key with the scanner. Observational
+    // cohort symbols do NOT need it and never reach the gate — skip the provider call for them.
+    const float = observationalOnly
+      ? null
+      : await cached(`floatShares:${sym}`, TTL.FLOAT, () => getFloatShares(sym))
     if (!hasCatalyst) missing.push('catalyst / news')
 
-    const setups = detectSetups(detCtx)
+    // BASE detection. HARD ISOLATION: an observational cohort symbol is never passed to detectSetups,
+    // so it can produce no BASE setup, enter no arbitration set, and reach no executor.
+    let setups: ReturnType<typeof detectSetups> = []
+    if (!observationalOnly) {
+      const detCtx: DetectionContext = {
+        symbol: sym,
+        price,
+        candles: intraday,
+        sessionLevels,
+        technical,
+        levels,
+        catalystScore,
+        hasCatalyst,
+        spreadPct: null,     // real-time spread not available from this feed — honestly null
+        changePct: quote?.changePercentage ?? 0,
+        session,
+        minutesSinceOpen: minutesSinceOpen(),
+        float,
+      }
+      setups = detectSetups(detCtx)
+    }
     const roadmap = buildRoadmap(sym, price, levels)
 
     // Candlestick pattern scan (surfaced for the top-gainer universe). Location =
@@ -248,15 +271,28 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
   }
 }
 
-/** Concurrency-limited batch. */
-export async function buildMonitorBatch(symbols: string[], concurrency = 6): Promise<MonitorResult[]> {
+/**
+ * Concurrency-limited batch over ONE shared data plane.
+ *
+ * `observationalOnly` names the subset of `symbols` that are leader-observation cohort members
+ * (H4A.1) — they take the lighter observational path (no float/pmvol enrichment, no detectSetups).
+ * All symbols share the same cache/single-flight, so a symbol requested once is fetched once; the
+ * cohort never overlaps BASE (it is deduplicated upstream) but the cache would collapse it anyway.
+ * With no options this is byte-identical to the pre-H4A.1 BASE batch.
+ */
+export async function buildMonitorBatch(
+  symbols: string[],
+  opts: { concurrency?: number; observationalOnly?: Iterable<string> } = {},
+): Promise<MonitorResult[]> {
+  const concurrency = opts.concurrency ?? 6
+  const obsOnly = new Set([...(opts.observationalOnly ?? [])].map(s => s.toUpperCase()))
   const unique = [...new Set(symbols.map(s => s.toUpperCase()))].slice(0, 40)
   const out: MonitorResult[] = []
   let idx = 0
   async function worker() {
     while (idx < unique.length) {
       const i = idx++
-      const r = await buildMonitorResult(unique[i])
+      const r = await buildMonitorResult(unique[i], { observationalOnly: obsOnly.has(unique[i]) })
       if (r) out.push(r)
     }
   }

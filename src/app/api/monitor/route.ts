@@ -5,7 +5,7 @@ export const runtime = 'nodejs'
 export const maxDuration = 60
 
 export async function POST(request: Request) {
-  let body: { symbols?: string[] }
+  let body: { symbols?: string[]; observationalOnly?: string[] }
   try {
     body = await request.json()
   } catch {
@@ -13,12 +13,17 @@ export async function POST(request: Request) {
   }
 
   const symbols = Array.isArray(body.symbols) ? body.symbols.filter(s => typeof s === 'string' && s.length > 0) : []
+  // H4A.1: the subset that are leader-observation cohort members (data coverage only — the lighter
+  // observational path, never BASE detection/execution). Optional + additive; absent = all BASE.
+  const observationalOnly = Array.isArray(body.observationalOnly)
+    ? body.observationalOnly.filter(s => typeof s === 'string' && s.length > 0)
+    : []
   if (symbols.length === 0) {
     return NextResponse.json({ results: [], timestamp: Date.now() })
   }
 
   try {
-    const results = await buildMonitorBatch(symbols)
+    const results = await buildMonitorBatch(symbols, { observationalOnly })
     return NextResponse.json({ results, timestamp: Date.now() })
   } catch (err) {
     console.error('monitor route error:', err)
