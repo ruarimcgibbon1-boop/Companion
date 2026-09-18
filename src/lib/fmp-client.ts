@@ -29,7 +29,11 @@ function getApiKey(): string {
 async function fmpGet<T>(
   path: string,
   params: Record<string, string | number | boolean> = {},
-  schema: z.ZodType<T>
+  schema: z.ZodType<T>,
+  // H4A.1: optional cancellation for the OBSERVATIONAL-only path. Undefined for every BASE call, so BASE
+  // provider semantics are byte-unchanged. When provided (observational cohort fetch), an abort tears the
+  // provider request down promptly so stale observational work cannot outlive its bounded lease.
+  signal?: AbortSignal,
 ): Promise<T> {
   const key = getApiKey()
   const url = new URL(`${BASE}${path}`)
@@ -48,6 +52,7 @@ async function fmpGet<T>(
     const res = await fetch(url.toString(), {
       next: { revalidate: 0 },
       headers: { Accept: 'application/json' },
+      signal,
     })
     // Read the body EXACTLY ONCE, as text, both to measure actual response bytes and
     // to parse it. `res.json()` would consume the stream and leave nothing to size;
@@ -200,7 +205,8 @@ export async function getQuotes(symbols: string[]): Promise<FmpQuote[]> {
 
 export async function getIntradayCandles(
   symbol: string,
-  interval: '1min' | '5min' | '15min' = '5min'
+  interval: '1min' | '5min' | '15min' = '5min',
+  signal?: AbortSignal,   // H4A.1: observational-only cancellation (undefined for BASE)
 ): Promise<FmpCandle[]> {
   // Request from yesterday 4pm ET to cover full premarket + regular session today.
   // Use ET date arithmetic: premarket starts 04:00 ET, so fetching from 2 days ago is safe.
@@ -221,7 +227,8 @@ export async function getIntradayCandles(
       const data = await fmpGet(
         `/historical-chart/${interval}`,
         params,
-        z.array(FmpCandleSchema)
+        z.array(FmpCandleSchema),
+        signal,
       )
       if (data.length > 0) {
         return data.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
@@ -258,7 +265,7 @@ export async function getExtendedIntradayCandles(
   }
 }
 
-export async function getDailyCandles(symbol: string): Promise<FmpCandle[]> {
+export async function getDailyCandles(symbol: string, signal?: AbortSignal): Promise<FmpCandle[]> {
   // Daily EOD history — try known endpoint paths
   const attempts: Array<[string, Record<string, string | number | boolean>]> = [
     ['/historical-price-eod/full', { symbol, limit: 252 }],
@@ -269,7 +276,7 @@ export async function getDailyCandles(symbol: string): Promise<FmpCandle[]> {
       const raw = await fmpGet(path, params, z.union([
         z.array(FmpCandleSchema),
         z.object({ historical: z.array(FmpCandleSchema) }),
-      ]))
+      ]), signal)
       const candles = Array.isArray(raw) ? raw : raw.historical
       if (candles.length > 0) {
         return candles.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())

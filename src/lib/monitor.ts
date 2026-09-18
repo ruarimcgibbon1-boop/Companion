@@ -60,10 +60,14 @@ function cachedCatalystScore(sym: string): { score: number; has: boolean } {
  */
 export async function buildMonitorResult(
   symbol: string,
-  opts: { observationalOnly?: boolean } = {},
+  opts: { observationalOnly?: boolean; signal?: AbortSignal } = {},
 ): Promise<MonitorResult | null> {
   const sym = symbol.toUpperCase()
   const observationalOnly = opts.observationalOnly === true
+  // H4A.1: cancellation is scoped to the OBSERVATIONAL path only. It is threaded into the observational
+  // provider fetches below so a timed-out/aborted observational pass tears its provider work down at the
+  // server, bounding server-side lifetime. BASE never provides a signal, so BASE is byte-unchanged.
+  const signal = observationalOnly ? opts.signal : undefined
   const missing: string[] = []
 
   try {
@@ -72,15 +76,15 @@ export async function buildMonitorResult(
       // the rvol baseline (which falls back to the 20-day daily average) and a redundant crypto-guard, so
       // it is not needed for honest 1m local geometry — and dropping it removes 1 FMP call per obs fetch.
       observationalOnly ? Promise.resolve(null) : cached(`quote:${sym}`, TTL.QUOTE, () => getQuote(sym)),
-      cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym)),
+      cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym, signal)),
       cached(`candles1m:${sym}`, TTL.CANDLES_1M, async () => {
         try {
-          const yf = await getYFCandles(sym, '1min')
+          const yf = await getYFCandles(sym, '1min', signal)
           if (yf.length > 0) return yf
         } catch { /* fall through */ }
-        return getIntradayCandles(sym, '1min')
+        return getIntradayCandles(sym, '1min', signal)
       }),
-      cached(`daily:${sym}`, TTL.CANDLES_DAILY, () => getDailyCandles(sym)),
+      cached(`daily:${sym}`, TTL.CANDLES_DAILY, () => getDailyCandles(sym, signal)),
     ])
 
     // Reject non-equities (crypto etc.) unless YF confirms equity pricing.
@@ -285,17 +289,21 @@ export async function buildMonitorResult(
  */
 export async function buildMonitorBatch(
   symbols: string[],
-  opts: { concurrency?: number; observationalOnly?: Iterable<string> } = {},
+  opts: { concurrency?: number; observationalOnly?: Iterable<string>; signal?: AbortSignal } = {},
 ): Promise<MonitorResult[]> {
   const concurrency = opts.concurrency ?? 6
   const obsOnly = new Set([...(opts.observationalOnly ?? [])].map(s => s.toUpperCase()))
+  const signal = opts.signal
   const unique = [...new Set(symbols.map(s => s.toUpperCase()))].slice(0, 40)
   const out: MonitorResult[] = []
   let idx = 0
   async function worker() {
-    while (idx < unique.length) {
+    // H4A.1: on abort (observational-only lease timeout / client disconnect) stop scheduling NEW symbols
+    // and let in-flight provider fetches unwind via their own threaded signal — so the batch settles
+    // promptly and server-side observational work cannot linger into the next BASE sweep.
+    while (idx < unique.length && !signal?.aborted) {
       const i = idx++
-      const r = await buildMonitorResult(unique[i], { observationalOnly: obsOnly.has(unique[i]) })
+      const r = await buildMonitorResult(unique[i], { observationalOnly: obsOnly.has(unique[i]), signal })
       if (r) out.push(r)
     }
   }

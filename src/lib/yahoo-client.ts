@@ -67,13 +67,14 @@ const INTERVAL_MAP: Record<string, YFInterval> = {
 
 export async function getYFCandles(
   symbol: string,
-  interval: '1min' | '5min' | '15min' | 'daily' = '5min'
+  interval: '1min' | '5min' | '15min' | 'daily' = '5min',
+  signal?: AbortSignal,   // H4A.1: observational-only cancellation (undefined for BASE)
 ): Promise<YFCandle[]> {
   const yfInterval = INTERVAL_MAP[interval] ?? '5m'
   const range = interval === 'daily' ? '6mo' : '2d'
 
   const url = `${YF_BASE}/${encodeURIComponent(symbol)}?interval=${yfInterval}&range=${range}&includePrePost=true`
-  const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 0 } })
+  const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 0 }, signal })
   if (!res.ok) throw new Error(`Yahoo Finance HTTP ${res.status} for ${symbol}`)
 
   const json = await res.json()
@@ -160,9 +161,9 @@ export async function getYFScreener(
     }))
 }
 
-export async function getYFQuote(symbol: string): Promise<YFQuote | null> {
+export async function getYFQuote(symbol: string, signal?: AbortSignal): Promise<YFQuote | null> {
   const url = `${YF_BASE}/${encodeURIComponent(symbol)}?interval=1m&range=1d&includePrePost=true`
-  const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 0 } })
+  const res = await fetch(url, { headers: YF_HEADERS, next: { revalidate: 0 }, signal })
   if (!res.ok) return null
 
   const json = await res.json()
