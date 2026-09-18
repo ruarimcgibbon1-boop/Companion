@@ -25,7 +25,7 @@ function build(rows: Row[], spacingSec = 60, startSec = T0): Candle[] {
   })
 }
 const closes = (xs: number[], v = 1000): Row[] => xs.map(c => ({ c, v }))
-const asOf = (cs: Candle[]) => cs[cs.length - 1].time * 1000 + 30_000   // 30s after the last bar → fresh
+const asOf = (cs: Candle[]) => Math.max(...cs.map(c => c.time)) * 1000 + 30_000   // 30s after the newest bar → fresh
 function run(cs: Candle[], globals?: LocalStructureInput['globals'], cfg?: LocalStructureConfig) {
   return computeLocalStructure({ symbol: 'TEST', candles: cs, asOfMs: asOf(cs), session: 'regular', globals }, cfg)
 }
@@ -55,7 +55,7 @@ describe('H4A local-structure engine — synthetic geometry', () => {
       ...flat(6, 10.0),
       { c: 10.5 }, { c: 11.0 }, { c: 11.5 },                       // impulse +15%, peak 11.5
       { c: 11.0 }, { c: 10.7 }, { c: 10.4 },                       // deep pullback (~9.6%, retrace ~73%)
-      { c: 10.8 }, { c: 10.45 }, { c: 10.9 }, { c: 10.5 }, { c: 10.85 }, { c: 10.5 },  // wide, sloppy base
+      { c: 10.5 }, { c: 10.45 }, { c: 10.55 }, { c: 10.5 }, { c: 10.52 }, { c: 10.48 },  // wide region, sub-impulse wiggles
     ])
     const f = run(cs)
     expect(f.impulse.detected).toBe(true)
@@ -236,6 +236,146 @@ describe('H4A data quality & provenance', () => {
     const before = cs.map(c => ({ ...c }))
     computeLocalStructure({ symbol: 'X', candles: cs, asOfMs: asOf(cs) })
     expect(cs).toEqual(before)   // untouched (engine sorts/dedups a copy)
+  })
+})
+
+// ── Red-team §2: CURRENT LOCAL impulse (most recent meaningful), not merely the largest historical ──
+describe('H4A current-vs-dominant impulse (§2)', () => {
+  it('2A. old large impulse + newer meaningful smaller impulse → CURRENT follows the newer one', () => {
+    const cs = build([
+      ...flat(4, 9.0),
+      { c: 9.6 }, { c: 10.3 }, { c: 11.0 },        // impulse #1 → 11 (large, +22%)
+      { c: 10.5 }, { c: 9.8 }, { c: 9.5 },         // reset
+      { c: 9.6 }, { c: 9.55 }, { c: 9.6 },         // base #1
+      { c: 9.9 }, { c: 10.1 }, { c: 10.3 },        // impulse #2 → 10.3 (newer, smaller, from 9.5)
+    ])
+    const f = run(cs)
+    expect(f.impulse.detected).toBe(true)
+    expect(f.impulse.peakPrice!).toBeCloseTo(10.3, 1)          // CURRENT = the newer impulse, not the old 11
+    expect(f.impulse.startPrice!).toBeGreaterThan(9.4)         // its trough (~9.5), not the day base
+    expect(f.impulse.dominantImpulsePct!).toBeGreaterThan(20)  // the old giant is preserved as DOMINANT
+    expect(f.impulse.dominantImpulsePct!).toBeGreaterThan(f.impulse.pct!)   // dominant ≠ current
+  })
+
+  it('2B. a newer sub-threshold noise wiggle does NOT replace the real impulse', () => {
+    const cs = build([
+      ...flat(4, 9.0),
+      { c: 9.6 }, { c: 10.3 }, { c: 11.0 },        // real impulse → 11
+      { c: 10.7 }, { c: 10.5 }, { c: 10.6 }, { c: 10.55 }, { c: 10.62 }, { c: 10.58 }, { c: 10.6 }, { c: 10.63 }, // tiny (<3%) wiggles
+    ])
+    const f = run(cs)
+    expect(f.impulse.peakPrice!).toBeCloseTo(11.0, 1)          // noise did not become "the impulse"
+  })
+
+  it('2C. two similar valid impulses → the MOST RECENT defines local geometry', () => {
+    const cs = build([
+      ...flat(6, 9.0),
+      { c: 9.4 }, { c: 9.7 }, { c: 10.0 },         // impulse #1 → 10
+      { c: 9.7 }, { c: 9.5 }, { c: 9.4 },          // reset
+      { c: 9.7 }, { c: 10.0 }, { c: 10.4 },        // impulse #2 → 10.4 (similar size, newer)
+    ])
+    const f = run(cs)
+    expect(f.impulse.peakPrice!).toBeCloseTo(10.4, 1)
+  })
+
+  it('2D. the latest valid impulse fully retraces → CURRENT describes that failed leg (FAILED)', () => {
+    const cs = build([
+      ...flat(4, 9.0),
+      { c: 9.5 }, { c: 10.0 },                     // impulse #1
+      { c: 9.7 }, { c: 9.5 },                      // reset
+      { c: 9.8 }, { c: 10.1 }, { c: 10.3 },        // impulse #2 → 10.3
+      { c: 9.9 }, { c: 9.5 }, { c: 9.3 }, { c: 9.2 }, // fully collapses back
+    ])
+    const f = run(cs)
+    expect(f.impulse.peakPrice!).toBeCloseTo(10.3, 1)          // the recent leg, even though it failed
+    expect(f.resetState).toBe('FAILED')
+  })
+})
+
+// ── Red-team §3: causal / as-of safety (mandatory before the H4B tape replay) ────────────────────
+describe('H4A causal as-of invariance (§3)', () => {
+  it('future bars (T+1..T+n) cannot change the features reported for T', () => {
+    const full = build(closes([9.5, 9.6, 9.4, 9.8, 10.0, 9.7, 10.2, 9.9, 10.3, 10.1, 10.4, 10.2, 10.5, 10.3, 10.6, 10.4, 10.7, 10.5, 10.8, 10.6, 11.0, 10.8, 11.2, 11.0, 11.3]))
+    const T = full[17].time * 1000 + 1                     // as-of at bar 17
+    const truncated = full.filter(c => c.time * 1000 <= T)
+    const fromFull = computeLocalStructure({ symbol: 'X', candles: full, asOfMs: T })
+    const fromTrunc = computeLocalStructure({ symbol: 'X', candles: truncated, asOfMs: T })
+    // identical geometry+provenance — the ONLY difference is the honest FUTURE_BARS_DROPPED flag.
+    const strip = (x: typeof fromFull) => ({ ...x, qualityFlags: x.qualityFlags.filter(q => q !== 'FUTURE_BARS_DROPPED') })
+    expect(strip(fromFull)).toEqual(strip(fromTrunc))    // later bars filtered internally → identical
+    expect(fromFull.qualityFlags).toContain('FUTURE_BARS_DROPPED')
+    expect(fromTrunc.qualityFlags).not.toContain('FUTURE_BARS_DROPPED')
+  })
+})
+
+// ── Red-team §4: timeframe robustness (a mixed feed must not be labelled 1m) ──────────────────────
+describe('H4A timeframe robustness (§4)', () => {
+  const rising = (n: number) => closes(Array.from({ length: n }, (_, i) => 10 + i * 0.05))
+  it('pure 1m / 5m / 15m are classified correctly', () => {
+    expect(run(build(rising(20), 60)).provenance.timeframe).toBe('1m')
+    expect(run(build(rising(20), 300)).provenance.timeframe).toBe('5m')
+    expect(run(build(rising(20), 900)).provenance.timeframe).toBe('15m')
+  })
+  it('one missing bar (single 2× gap) stays 1m', () => {
+    const rows = rising(20)
+    const cs = build(rows, 60)
+    cs.splice(10, 1)                                        // drop one bar → a single 120s interval
+    expect(run(cs).provenance.timeframe).toBe('1m')
+  })
+  it('mostly 1m + a substantial 5m section → mixed / UNSUPPORTED_TIMEFRAME', () => {
+    const a = build(rising(12), 60, T0)
+    const b = build(rising(8), 300, a[a.length - 1].time + 300)
+    const f = run([...a, ...b])
+    expect(f.status).toBe('UNSUPPORTED_TIMEFRAME')
+    expect(['mixed']).toContain(f.provenance.timeframe)
+    expect(f.qualityFlags).toContain('MIXED_CADENCE')
+  })
+  it('alternating 1m / 5m → mixed / UNSUPPORTED_TIMEFRAME', () => {
+    const cs: Candle[] = []
+    let t = T0
+    for (let i = 0; i < 20; i++) { cs.push({ time: t, open: 10, high: 10.1, low: 9.9, close: 10, volume: 100 }); t += i % 2 === 0 ? 60 : 300 }
+    expect(run(cs).status).toBe('UNSUPPORTED_TIMEFRAME')
+  })
+})
+
+// ── Red-team §6: data-quality composition (multiple simultaneous defects preserved) ──────────────
+describe('H4A composable data quality (§6)', () => {
+  it('stale + missing-volume → primary status plus BOTH flags (no information lost)', () => {
+    const cs = build(closes(Array.from({ length: 20 }, (_, i) => 10 + i * 0.1)).map(r => ({ ...r, v: 0 })) as Row[])
+    const f = computeLocalStructure({ symbol: 'X', candles: cs, asOfMs: cs[cs.length - 1].time * 1000 + 10 * 60_000 })
+    expect(['STALE_BARS', 'MISSING_VOLUME']).toContain(f.status)   // primary is one of them
+    expect(f.qualityFlags).toContain('STALE_BARS')
+    expect(f.qualityFlags).toContain('MISSING_VOLUME')             // the other is preserved as a flag
+  })
+})
+
+// ── Red-team §7: premarket→RTH session-coverage provenance (descriptive only) ─────────────────────
+describe('H4A session-coverage provenance (§7)', () => {
+  it('a window spanning premarket→RTH is flagged, descriptively', () => {
+    const pmStart = Math.floor(Date.parse('2026-09-18T09:20:00-04:00') / 1000)   // 09:20 ET, premarket
+    const cs = build(closes(Array.from({ length: 20 }, (_, i) => 10 + i * 0.05)), 60, pmStart)  // 09:20→09:39 crosses 09:30
+    const f = run(cs)
+    expect(f.provenance.containsSessionBoundary).toBe(true)
+    expect(f.provenance.sessionsInWindow).toEqual(expect.arrayContaining(['premarket', 'regular']))
+    expect(f.qualityFlags).toContain('CONTAINS_SESSION_BOUNDARY')
+  })
+})
+
+// ── Red-team §8: measured performance + telemetry volume (measure, don't just label) ──────────────
+describe('H4A measured performance (§8)', () => {
+  it('per-symbol compute latency and telemetry size are within bounds (and reported)', () => {
+    const cs = build(closes(Array.from({ length: 180 }, (_, i) => 10 + Math.sin(i / 7) * 0.6 + i * 0.01)))
+    const globals = { price: cs[cs.length - 1].close, sessionHigh: 12, vwap: 10.5, ema9: 10.8, ema21: 10.6, atr: 0.2, atrPct: 1.8, relativeVolume: 3, spreadPct: null }
+    const N = 500, times: number[] = []
+    for (let i = 0; i < N; i++) { const t0 = performance.now(); computeLocalStructure({ symbol: 'X', candles: cs, asOfMs: asOf(cs), globals }); times.push(performance.now() - t0) }
+    times.sort((a, b) => a - b)
+    const median = times[Math.floor(N / 2)], p95 = times[Math.floor(N * 0.95)]
+    // a compact telemetry event (the fields the daemon actually emits) — never a bar array
+    const f = computeLocalStructure({ symbol: 'X', candles: cs, asOfMs: asOf(cs), globals })
+    const evBytes = Buffer.byteLength(JSON.stringify({ symbol: 'X', leaderEpisodeId: 'led-X-1', resetState: f.resetState, status: f.status, qualityFlags: f.qualityFlags, timeframe: f.provenance.timeframe, impulsePct: f.impulse.pct, dominantImpulsePct: f.impulse.dominantImpulsePct, pullbackPct: f.pullback.pctFromImpulsePeak, baseRangePct: f.base.rangePct, localExtensionPct: f.localExtension.localExtensionPct, downsideToBaseLowPct: f.localExtension.downsideToBaseLowPct, globalVsLocalExtensionRatio: f.localExtension.globalVsLocalExtensionRatio, reExpansionObserved: f.reExpansion.observed, cadenceConsistency: f.provenance.cadenceConsistency, localFeatureConfigHash: f.provenance.localFeatureConfigHash }))
+    console.log(`[H4A perf] 180-bar compute median=${median.toFixed(4)}ms p95=${p95.toFixed(4)}ms · event≈${evBytes}B · 15 syms/sweep≈${(p95 * 15).toFixed(2)}ms, ≈${(evBytes * 15)}B/sweep`)
+    expect(p95).toBeLessThan(5)          // generous ceiling; negligible vs the 15s cadence + network fetch
+    expect(evBytes).toBeLessThan(1024)   // compact; no bar arrays
   })
 })
 

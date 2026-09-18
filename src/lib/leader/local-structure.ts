@@ -38,6 +38,7 @@ export interface LocalStructureConfig {
   maxBaseRangePct: number     // base range wider than this → not asserted "tight" (provisional)
   baseTestTolPct: number      // proximity (%) to count a touch of base high / low
   gapToleranceMult: number    // a bar gap > mult × median spacing → discontinuity/halt suspicion
+  cadenceConsistencyMin: number // min fraction of intervals matching the dominant cadence, else → mixed
 }
 
 export const DEFAULT_LOCAL_FEATURE_CONFIG: LocalStructureConfig = {
@@ -46,7 +47,7 @@ export const DEFAULT_LOCAL_FEATURE_CONFIG: LocalStructureConfig = {
   swingLookback: 3, minImpulsePct: 3, minImpulseBars: 2,
   shallowPullbackPct: 3, deepPullbackPct: 8, failedRetracePct: 100,
   baseWindowBars: 20, minBaseBars: 4, maxBaseRangePct: 4, baseTestTolPct: 0.3,
-  gapToleranceMult: 4,
+  gapToleranceMult: 4, cadenceConsistencyMin: 0.8,
 }
 
 const numEnv = (v: string | undefined, d: number): number => {
@@ -58,6 +59,7 @@ export function resolveLocalFeatureConfig(env: Record<string, string | undefined
   const d = DEFAULT_LOCAL_FEATURE_CONFIG
   return {
     version: env.COMPANION_H4A_VERSION?.trim() || d.version,
+    cadenceConsistencyMin: numEnv(env.COMPANION_H4A_CADENCE_MIN, d.cadenceConsistencyMin),
     lookbackBars: numEnv(env.COMPANION_H4A_LOOKBACK_BARS, d.lookbackBars),
     minBars: numEnv(env.COMPANION_H4A_MIN_BARS, d.minBars),
     staleBarsMs: numEnv(env.COMPANION_H4A_STALE_BARS_MS, d.staleBarsMs),
@@ -81,7 +83,7 @@ export function localFeatureConfigCanonical(c: LocalStructureConfig): string {
     `swing=${c.swingLookback}`, `impPct=${c.minImpulsePct}`, `impBars=${c.minImpulseBars}`,
     `shallow=${c.shallowPullbackPct}`, `deep=${c.deepPullbackPct}`, `failed=${c.failedRetracePct}`,
     `baseWin=${c.baseWindowBars}`, `baseBars=${c.minBaseBars}`, `baseRange=${c.maxBaseRangePct}`,
-    `baseTol=${c.baseTestTolPct}`, `gap=${c.gapToleranceMult}`,
+    `baseTol=${c.baseTestTolPct}`, `gap=${c.gapToleranceMult}`, `cadence=${c.cadenceConsistencyMin}`,
   ].join('|')
 }
 /** Deterministic 8-hex fingerprint (FNV-1a, dep-free). Same config → same hash; any change → different. */
@@ -111,13 +113,14 @@ export interface GlobalContext {
   timeSinceSessionHighSec: number | null   // only when the session high appears within the window
 }
 export interface ImpulseFeatures {
-  detected: boolean
+  detected: boolean                    // this is the CURRENT LOCAL impulse (most recent qualifying leg)
   startAt: number | null; startPrice: number | null
   peakAt: number | null; peakPrice: number | null
   pct: number | null                   // (peak - start)/start*100
   durationBars: number | null
   volume: number | null
-  relativeVolume: number | null        // leg avg bar volume / window avg bar volume (PROXY; not the RTH rvol)
+  volumeVsWindowRatio: number | null   // leg avg bar volume ÷ window avg bar volume — a PROXY, NOT the RTH RVOL
+  dominantImpulsePct: number | null    // magnitude of the LARGEST qualifying leg in the window (may differ from the current one)
 }
 export interface PullbackFeatures {
   startAt: number | null               // = impulse peak time
@@ -143,8 +146,8 @@ export interface LocalExtensionFeatures {
   distanceFromBaseHighPct: number | null
   distanceFromBaseLowPct: number | null
   localExtensionPct: number | null     // (price - referencePrice)/referencePrice*100 — ~0 or <0 = locally FRESH
-  baseRiskPct: number | null           // (price - baseLow)/price*100 — downside to structural invalidation
-  localRewardSpacePct: number | null   // (sessionHigh - price)/price*100 — observable room back to HOD
+  downsideToBaseLowPct: number | null  // (price - baseLow)/price*100 — GEOMETRIC distance down to the base low (NOT a stop)
+  spaceToSessionHighPct: number | null // (sessionHigh - price)/price*100 — GEOMETRIC room back to the session high (NOT a target)
   globalVsLocalExtensionRatio: number | null // |offHigh| / max(localExtension,ε): high ⇒ globally extended yet locally fresh
 }
 export interface ReExpansionFeatures {
@@ -157,7 +160,7 @@ export interface ReExpansionFeatures {
 }
 export interface PathRiskFeatures {
   recentLocalMAEProxy: number | null   // deepest adverse excursion in the reset region (= maxPullbackPct)
-  localInvalidationPct: number | null  // = baseRiskPct (down to base low) — nearest obvious local invalidation
+  distanceToBaseLowPct: number | null  // GEOMETRIC distance down to the base low — a reference level, NOT a stop instruction
   distanceToImpulseLowPct: number | null
   atrPct: number | null
   realizedVolPct: number | null        // stdev of 1-bar returns over the window, in %
@@ -173,12 +176,21 @@ export interface LocalStructureProvenance {
   barsStartAt: number | null; barsEndAt: number | null; barsCount: number
   dataFreshnessMs: number | null       // age of the last bar vs asOf
   discontinuityInWindow: boolean       // a suspected halt/gap occurred inside the analysis window
+  sessionsInWindow: string[]           // ET session buckets the window spans: 'premarket' | 'regular' | 'afterhours'
+  containsSessionBoundary: boolean     // the window spans ≥2 sessions (e.g. PM→RTH) — DESCRIPTIVE only, no rule imposed
+  cadenceConsistency: number | null    // fraction of intervals matching the dominant cadence (1 = perfectly homogeneous)
   featureSchemaVersion: number
   localFeatureConfigVersion: string
   localFeatureConfigHash: string
 }
+// Composable data-quality: `status` is the PRIMARY (worst) condition; `qualityFlags` preserves EVERY
+// detected defect so an audit can reconstruct e.g. stale+missing-volume, gap+mixed-cadence, etc.
+export type QualityFlag =
+  | 'STALE_BARS' | 'GAP_IN_WINDOW' | 'HALT_OR_DISCONTINUITY' | 'MIXED_CADENCE'
+  | 'MISSING_VOLUME' | 'INSUFFICIENT_BARS' | 'UNSUPPORTED_TIMEFRAME' | 'CONTAINS_SESSION_BOUNDARY' | 'FUTURE_BARS_DROPPED'
 export interface LocalStructureFeatures {
   status: LocalStructureStatus
+  qualityFlags: QualityFlag[]
   resetState: ResetState
   global: GlobalContext
   impulse: ImpulseFeatures
@@ -250,11 +262,36 @@ function maxHigh(seg: Candle[], lo: number, hi: number): number {
   return m
 }
 
-const nullImpulse = (): ImpulseFeatures => ({ detected: false, startAt: null, startPrice: null, peakAt: null, peakPrice: null, pct: null, durationBars: null, volume: null, relativeVolume: null })
+const nullImpulse = (): ImpulseFeatures => ({ detected: false, startAt: null, startPrice: null, peakAt: null, peakPrice: null, pct: null, durationBars: null, volume: null, volumeVsWindowRatio: null, dominantImpulsePct: null })
 const nullPullback = (): PullbackFeatures => ({ startAt: null, lowAt: null, lowPrice: null, pctFromImpulsePeak: null, maxPct: null, durationBars: null, retracementRatio: null, stillPullingBack: false })
 const nullBase = (): BaseFeatures => ({ detected: false, startAt: null, endAt: null, durationBars: null, high: null, low: null, rangePct: null, rangeContraction: null, volumeContraction: null, realizedVolContraction: null, slopePctPerBar: null, upperTests: null, lowerTests: null })
-const nullLocalExt = (): LocalExtensionFeatures => ({ referencePrice: null, distanceFromBaseHighPct: null, distanceFromBaseLowPct: null, localExtensionPct: null, baseRiskPct: null, localRewardSpacePct: null, globalVsLocalExtensionRatio: null })
+const nullLocalExt = (): LocalExtensionFeatures => ({ referencePrice: null, distanceFromBaseHighPct: null, distanceFromBaseLowPct: null, localExtensionPct: null, downsideToBaseLowPct: null, spaceToSessionHighPct: null, globalVsLocalExtensionRatio: null })
 const nullReExp = (): ReExpansionFeatures => ({ observed: false, breakoutAboveBaseHighPct: null, volumeExpansion: null, barsSinceBaseBreak: null, reclaimedVWAP: null, reclaimedEMA9: null })
+
+// ── ET session bucket (no imports — Intl is a global; keeps the engine dependency-free) ─────────────
+const etHourMinFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false })
+function etSession(timeSec: number): 'premarket' | 'regular' | 'afterhours' | 'overnight' {
+  const parts = etHourMinFmt.formatToParts(new Date(timeSec * 1000))
+  const hh = Number(parts.find(p => p.type === 'hour')?.value ?? '0') % 24
+  const mm = Number(parts.find(p => p.type === 'minute')?.value ?? '0')
+  const t = hh * 60 + mm
+  if (t >= 240 && t < 570) return 'premarket'      // 04:00–09:30 ET
+  if (t >= 570 && t < 960) return 'regular'         // 09:30–16:00 ET
+  if (t >= 960 && t < 1200) return 'afterhours'     // 16:00–20:00 ET
+  return 'overnight'
+}
+function sessionsCovered(seg: Candle[]): string[] {
+  const set = new Set<string>()
+  for (const c of seg) set.add(etSession(c.time))
+  return [...set]
+}
+/** Fraction of intervals within tolerance of the dominant (median) spacing — 1 = perfectly homogeneous. */
+function cadenceConsistency(spacings: number[], dominant: number): number {
+  if (spacings.length === 0 || dominant <= 0) return 1
+  const tol = Math.max(dominant * 0.25, 5)
+  const onCadence = spacings.filter(s => Math.abs(s - dominant) <= tol).length
+  return onCadence / spacings.length
+}
 
 function globalContext(input: LocalStructureInput, seg: Candle[], price: number): GlobalContext {
   const g = input.globals ?? {}
@@ -276,28 +313,30 @@ function globalContext(input: LocalStructureInput, seg: Candle[], price: number)
   }
 }
 
-function provenance(input: LocalStructureInput, seg: Candle[], timeframe: Timeframe, discontinuity: boolean, cfg: LocalStructureConfig): LocalStructureProvenance {
+function provenance(input: LocalStructureInput, seg: Candle[], timeframe: Timeframe, discontinuity: boolean, cadenceConsist: number | null, cfg: LocalStructureConfig): LocalStructureProvenance {
   const last = seg.length ? seg[seg.length - 1] : null
+  const sessions = sessionsCovered(seg)
   return {
     symbol: input.symbol, leaderEpisodeId: null, sweepId: null, runId: null,
     asOfUtc: new Date(input.asOfMs).toISOString(), timeframe,
     barsStartAt: seg.length ? seg[0].time : null, barsEndAt: last ? last.time : null, barsCount: seg.length,
     dataFreshnessMs: last ? input.asOfMs - last.time * 1000 : null,
     discontinuityInWindow: discontinuity,
+    sessionsInWindow: sessions, containsSessionBoundary: sessions.length > 1, cadenceConsistency: cadenceConsist,
     featureSchemaVersion: LOCAL_FEATURE_SCHEMA_VERSION,
     localFeatureConfigVersion: cfg.version, localFeatureConfigHash: localFeatureConfigHash(cfg),
   }
 }
 
-/** Build an all-null feature set carrying a specific failure status (fails honestly; never fake zeros). */
-function degraded(input: LocalStructureInput, seg: Candle[], timeframe: Timeframe, status: LocalStructureStatus, price: number, discontinuity = false, cfg = DEFAULT_LOCAL_FEATURE_CONFIG): LocalStructureFeatures {
+/** Build an all-null feature set carrying a specific failure status + all detected quality flags. */
+function degraded(input: LocalStructureInput, seg: Candle[], timeframe: Timeframe, status: LocalStructureStatus, price: number, opts: { discontinuity?: boolean; qualityFlags?: QualityFlag[]; cadence?: number | null } = {}, cfg = DEFAULT_LOCAL_FEATURE_CONFIG): LocalStructureFeatures {
   return {
-    status, resetState: 'UNKNOWN',
+    status, qualityFlags: opts.qualityFlags ?? [], resetState: 'UNKNOWN',
     global: globalContext(input, seg, price),
     impulse: nullImpulse(), pullback: nullPullback(), base: nullBase(),
     localExtension: nullLocalExt(), reExpansion: nullReExp(),
-    pathRisk: { recentLocalMAEProxy: null, localInvalidationPct: null, distanceToImpulseLowPct: null, atrPct: input.globals?.atrPct ?? null, realizedVolPct: null, spreadPct: input.globals?.spreadPct ?? null },
-    provenance: provenance(input, seg, timeframe, discontinuity, cfg),
+    pathRisk: { recentLocalMAEProxy: null, distanceToBaseLowPct: null, distanceToImpulseLowPct: null, atrPct: input.globals?.atrPct ?? null, realizedVolPct: null, spreadPct: input.globals?.spreadPct ?? null },
+    provenance: provenance(input, seg, timeframe, opts.discontinuity ?? false, opts.cadence ?? null, cfg),
   }
 }
 
@@ -305,23 +344,36 @@ function degraded(input: LocalStructureInput, seg: Candle[], timeframe: Timefram
  * Compute the local structural features for one symbol at one moment. Pure: no I/O, inputs untouched.
  */
 export function computeLocalStructure(input: LocalStructureInput, cfg: LocalStructureConfig = DEFAULT_LOCAL_FEATURE_CONFIG): LocalStructureFeatures {
+  // 0) CAUSAL / AS-OF SAFETY: drop any bar dated after asOf BEFORE anything else, so a later bar can
+  //    never influence the features reported for this timestamp (mandatory for the H4B tape replay).
+  const raw = input.candles ?? []
+  const withinAsOf = raw.filter(c => c.time * 1000 <= input.asOfMs)
+  const futureDropped = withinAsOf.length < raw.filter(validCandle).length && raw.some(c => validCandle(c) && c.time * 1000 > input.asOfMs)
+
   // 1) Sanitize & order bars. Drop malformed prints; de-dup identical timestamps (keep the later one);
   //    sort ascending so out-of-order feeds cannot corrupt geometry.
-  const cleaned = (input.candles ?? []).filter(validCandle).sort((a, b) => a.time - b.time)
+  const cleaned = withinAsOf.filter(validCandle).sort((a, b) => a.time - b.time)
   const dedup: Candle[] = []
   for (const c of cleaned) {
     if (dedup.length && dedup[dedup.length - 1].time === c.time) dedup[dedup.length - 1] = c
     else dedup.push(c)
   }
   const priceOf = (arr: Candle[]): number => input.globals?.price ?? (arr.length ? arr[arr.length - 1].close : 0)
+  const flag = (fs: QualityFlag[], f: QualityFlag) => { if (!fs.includes(f)) fs.push(f) }
 
-  if (dedup.length < cfg.minBars) return degraded(input, dedup, dedup.length ? classifyTimeframe(median(diffs(dedup))) : 'unknown', 'INSUFFICIENT_BARS', priceOf(dedup), false, cfg)
+  if (dedup.length < cfg.minBars) return degraded(input, dedup, dedup.length ? classifyTimeframe(median(diffs(dedup))) : 'unknown', 'INSUFFICIENT_BARS', priceOf(dedup), { qualityFlags: ['INSUFFICIENT_BARS'] }, cfg)
 
-  // 2) Timeframe from median spacing; reject unknown cadence (do not label a mixed feed as 1m).
+  // 2) Timeframe from the DOMINANT (median) spacing PLUS a cadence-consistency check — a materially mixed
+  //    feed (e.g. alternating 1m/5m, or a big 5m section) is NOT labelled 1m just because the median is 60s.
   const spacings = diffs(dedup)
   const spacing = median(spacings)
-  const timeframe = classifyTimeframe(spacing)
-  if (timeframe === 'unknown') return degraded(input, dedup, 'unknown', 'UNSUPPORTED_TIMEFRAME', priceOf(dedup), false, cfg)
+  const consistency = cadenceConsistency(spacings, spacing)
+  let timeframe = classifyTimeframe(spacing)
+  if (timeframe === 'unknown' || consistency < cfg.cadenceConsistencyMin) {
+    const flags: QualityFlag[] = ['UNSUPPORTED_TIMEFRAME']
+    if (consistency < cfg.cadenceConsistencyMin && timeframe !== 'unknown') { timeframe = 'mixed'; flag(flags, 'MIXED_CADENCE') }
+    return degraded(input, dedup, timeframe === 'mixed' ? 'mixed' : 'unknown', 'UNSUPPORTED_TIMEFRAME', priceOf(dedup), { qualityFlags: flags, cadence: consistency }, cfg)
+  }
 
   // 3) Analysis window = most recent lookbackBars, then trimmed to the contiguous run AFTER the last
   //    discontinuity (a reopen gap must not be read as one continuous impulse).
@@ -331,11 +383,23 @@ export function computeLocalStructure(input: LocalStructureInput, cfg: LocalStru
   const last = seg[seg.length - 1]
   const freshnessMs = input.asOfMs - last.time * 1000
 
-  if (seg.length < cfg.minBars) return degraded(input, seg, timeframe, discontinuity ? 'HALT_OR_DISCONTINUITY' : 'INSUFFICIENT_BARS', price, discontinuity, cfg)
-  if (freshnessMs > cfg.staleBarsMs) return degraded(input, seg, timeframe, 'STALE_BARS', price, discontinuity, cfg)
-  if (seg.every(c => c.volume === 0)) return degraded(input, seg, timeframe, 'MISSING_VOLUME', price, discontinuity, cfg)
+  // Compose ALL detected defects; `status` is the primary (worst) one, `qualityFlags` keeps the rest.
+  const qualityFlags: QualityFlag[] = []
+  if (futureDropped) flag(qualityFlags, 'FUTURE_BARS_DROPPED')
+  if (discontinuity) flag(qualityFlags, 'GAP_IN_WINDOW')
+  const winConsistency = cadenceConsistency(diffs(seg), spacing)
+  if (seg.length >= 2 && diffs(seg).some(s => s > spacing * cfg.gapToleranceMult)) flag(qualityFlags, 'GAP_IN_WINDOW')
+  if (freshnessMs > cfg.staleBarsMs) flag(qualityFlags, 'STALE_BARS')
+  if (seg.every(c => c.volume === 0)) flag(qualityFlags, 'MISSING_VOLUME')
+  else if (seg.some(c => c.volume === 0)) flag(qualityFlags, 'MISSING_VOLUME')
+  if (sessionsCovered(seg).length > 1) flag(qualityFlags, 'CONTAINS_SESSION_BOUNDARY')
 
-  // 4) Impulse — the dominant recent up-leg (largest qualifying swing-low→swing-high magnitude).
+  if (seg.length < cfg.minBars) return degraded(input, seg, timeframe, discontinuity ? 'HALT_OR_DISCONTINUITY' : 'INSUFFICIENT_BARS', price, { discontinuity, qualityFlags: [...qualityFlags, discontinuity ? 'HALT_OR_DISCONTINUITY' : 'INSUFFICIENT_BARS'], cadence: winConsistency }, cfg)
+  if (freshnessMs > cfg.staleBarsMs) return degraded(input, seg, timeframe, 'STALE_BARS', price, { discontinuity, qualityFlags, cadence: winConsistency }, cfg)
+  if (seg.every(c => c.volume === 0)) return degraded(input, seg, timeframe, 'MISSING_VOLUME', price, { discontinuity, qualityFlags, cadence: winConsistency }, cfg)
+
+  // 4) Impulse — the CURRENT LOCAL impulse (most recent qualifying leg), with the dominant historical
+  //    leg magnitude kept separately so recency and dominance are never conflated.
   const det = detectImpulse(seg, cfg)
   const impulse = det.impulse
 
@@ -365,17 +429,20 @@ export function computeLocalStructure(input: LocalStructureInput, cfg: LocalStru
   for (let i = 1; i < seg.length; i++) if (seg[i - 1].close > 0) returns.push((seg[i].close - seg[i - 1].close) / seg[i - 1].close)
   const pathRisk: PathRiskFeatures = {
     recentLocalMAEProxy: pullback.maxPct,
-    localInvalidationPct: localExtension.baseRiskPct,
+    distanceToBaseLowPct: localExtension.downsideToBaseLowPct,
     distanceToImpulseLowPct: impulse.startPrice != null ? pct(price, impulse.startPrice) : null,
     atrPct: g.atrPct ?? null,
     realizedVolPct: returns.length >= 2 ? stdev(returns) * 100 : null,
     spreadPct: g.spreadPct ?? null,
   }
 
+  // `status` = the single primary condition (worst wins); `qualityFlags` already carries every defect.
+  const status: LocalStructureStatus = qualityFlags.includes('HALT_OR_DISCONTINUITY') ? 'HALT_OR_DISCONTINUITY'
+    : qualityFlags.includes('GAP_IN_WINDOW') ? 'GAP_DETECTED' : 'AVAILABLE'
   return {
-    status: discontinuity ? 'GAP_DETECTED' : 'AVAILABLE',
+    status, qualityFlags,
     resetState, global: globalCtx, impulse, pullback, base, localExtension, reExpansion, pathRisk,
-    provenance: provenance(input, seg, timeframe, discontinuity, cfg),
+    provenance: provenance(input, seg, timeframe, discontinuity, winConsistency, cfg),
   }
 }
 
@@ -401,19 +468,22 @@ interface ImpulseDetection { impulse: ImpulseFeatures; peakIdx: number; troughId
 /**
  * The dominant recent up-leg. Candidate peaks = confirmed swing highs plus the endpoint when it is the
  * window high (an ongoing/vertical move). For each candidate the leg is isolated to the run since the
- * PREVIOUS swing high (so two genuine impulses do not merge), the trough is the lowest low of that run,
- * and among all legs that clear minImpulsePct/minImpulseBars the LARGEST-magnitude one wins (ties → the
- * most recent peak). This makes a base wiggle lose to the real impulse, yet still picks the more recent
- * of two true impulses when it is the larger leg.
+ * PREVIOUS swing high (so two genuine impulses do not merge) and the trough is the lowest low of that run.
+ *
+ * The CURRENT LOCAL impulse is the MOST RECENT leg that clears minImpulsePct/minImpulseBars — so once a
+ * later meaningful impulse establishes new structure, the geometry follows it rather than staying anchored
+ * to an older, larger move. A sub-threshold base wiggle is NOT a new impulse (the size gate rejects it).
+ * The largest qualifying leg is reported separately as `dominantImpulsePct` (dominant ≠ current).
  */
 function detectImpulse(seg: Candle[], cfg: LocalStructureConfig): ImpulseDetection {
   const highs = swingHighs(seg, cfg.swingLookback)
-  const windowMax = maxHigh(seg, 0, seg.length - 1)
   const candidates = new Set(highs)
-  if (seg[seg.length - 1].high >= windowMax - 1e-9) candidates.add(seg.length - 1)   // endpoint peak
+  candidates.add(seg.length - 1)   // the endpoint is always a candidate, so a NEWER impulse whose peak is
+                                   // the current bar (even below the window high) can become the current one
   const windowAvgVol = seg.reduce((s, c) => s + c.volume, 0) / seg.length
 
-  let best: { peakIdx: number; troughIdx: number; legPct: number } | null = null
+  let current: { peakIdx: number; troughIdx: number; legPct: number } | null = null   // most recent qualifying
+  let dominantPct: number | null = null                                                // largest qualifying
   for (const p of candidates) {
     if (p <= 0) continue
     let q = -1                                    // latest swing high strictly before p → isolates this leg
@@ -423,11 +493,13 @@ function detectImpulse(seg: Candle[], cfg: LocalStructureConfig): ImpulseDetecti
     const legPct = pct(seg[p].high, seg[troughIdx].low)
     const durationBars = p - troughIdx
     if (legPct == null || legPct < cfg.minImpulsePct || durationBars < cfg.minImpulseBars) continue
-    if (!best || legPct > best.legPct || (legPct === best.legPct && p > best.peakIdx)) best = { peakIdx: p, troughIdx, legPct }
+    dominantPct = dominantPct == null ? legPct : Math.max(dominantPct, legPct)
+    // recency wins: prefer the later peak; on an exact tie prefer the larger leg.
+    if (!current || p > current.peakIdx || (p === current.peakIdx && legPct > current.legPct)) current = { peakIdx: p, troughIdx, legPct }
   }
-  if (!best) return { impulse: nullImpulse(), peakIdx: -1, troughIdx: -1 }
+  if (!current) return { impulse: nullImpulse(), peakIdx: -1, troughIdx: -1 }
 
-  const { peakIdx, troughIdx } = best
+  const { peakIdx, troughIdx } = current
   let vol = 0
   for (let i = troughIdx + 1; i <= peakIdx; i++) vol += seg[i].volume
   const durationBars = peakIdx - troughIdx
@@ -436,8 +508,8 @@ function detectImpulse(seg: Candle[], cfg: LocalStructureConfig): ImpulseDetecti
     peakIdx, troughIdx,
     impulse: {
       detected: true, startAt: seg[troughIdx].time, startPrice: seg[troughIdx].low,
-      peakAt: seg[peakIdx].time, peakPrice: seg[peakIdx].high, pct: best.legPct, durationBars, volume: vol,
-      relativeVolume: windowAvgVol > 0 ? legAvgVol / windowAvgVol : null,
+      peakAt: seg[peakIdx].time, peakPrice: seg[peakIdx].high, pct: current.legPct, durationBars, volume: vol,
+      volumeVsWindowRatio: windowAvgVol > 0 ? legAvgVol / windowAvgVol : null, dominantImpulsePct: dominantPct,
     },
   }
 }
@@ -537,12 +609,12 @@ function measureLocalExtension(price: number, impulse: ImpulseFeatures, base: Ba
   const distanceFromBaseHighPct = base.high != null ? pct(price, base.high) : null
   const distanceFromBaseLowPct = base.low != null ? pct(price, base.low) : null
   const localExtensionPct = referencePrice != null ? pct(price, referencePrice) : null
-  const baseRiskPct = base.low != null && price > 0 ? ((price - base.low) / price) * 100 : null
-  const localRewardSpacePct = g.sessionHigh != null && price > 0 ? ((g.sessionHigh - price) / price) * 100 : null
+  const downsideToBaseLowPct = base.low != null && price > 0 ? ((price - base.low) / price) * 100 : null
+  const spaceToSessionHighPct = g.sessionHigh != null && price > 0 ? ((g.sessionHigh - price) / price) * 100 : null
   const offHighMag = g.offHighPct != null ? Math.abs(g.offHighPct) : null
   const localExtMag = localExtensionPct != null ? Math.max(Math.abs(localExtensionPct), 0.1) : null
   const globalVsLocalExtensionRatio = offHighMag != null && localExtMag != null ? offHighMag / localExtMag : null
-  return { referencePrice, distanceFromBaseHighPct, distanceFromBaseLowPct, localExtensionPct, baseRiskPct, localRewardSpacePct, globalVsLocalExtensionRatio }
+  return { referencePrice, distanceFromBaseHighPct, distanceFromBaseLowPct, localExtensionPct, downsideToBaseLowPct, spaceToSessionHighPct, globalVsLocalExtensionRatio }
 }
 
 function measureReExpansion(seg: Candle[], base: BaseFeatures, price: number, g: NonNullable<LocalStructureInput['globals']>): ReExpansionFeatures {

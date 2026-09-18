@@ -384,12 +384,14 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       const leaderEpisodeId = leaderState[r.symbol]?.leaderEpisodeId ?? null
       const payload = {
         symbol: r.symbol, leaderEpisodeId, runId: ensureFunnelRunId(sweepStart),
-        resetState: ls.resetState, dataQualityStatus: ls.status, timeframe: ls.provenance.timeframe,
-        globalOffHighPct: ls.global.offHighPct, impulsePct: ls.impulse.pct, pullbackPct: ls.pullback.pctFromImpulsePeak,
-        baseDetected: ls.base.detected, baseRangePct: ls.base.rangePct, baseDurationBars: ls.base.durationBars,
-        volumeContraction: ls.base.volumeContraction, localExtensionPct: ls.localExtension.localExtensionPct,
-        baseRiskPct: ls.localExtension.baseRiskPct, globalVsLocalExtensionRatio: ls.localExtension.globalVsLocalExtensionRatio,
-        reExpansionObserved: ls.reExpansion.observed, discontinuity: ls.provenance.discontinuityInWindow,
+        resetState: ls.resetState, dataQualityStatus: ls.status, qualityFlags: ls.qualityFlags, timeframe: ls.provenance.timeframe,
+        globalOffHighPct: ls.global.offHighPct, impulsePct: ls.impulse.pct, dominantImpulsePct: ls.impulse.dominantImpulsePct,
+        pullbackPct: ls.pullback.pctFromImpulsePeak, baseDetected: ls.base.detected, baseRangePct: ls.base.rangePct,
+        baseDurationBars: ls.base.durationBars, volumeContraction: ls.base.volumeContraction,
+        localExtensionPct: ls.localExtension.localExtensionPct, downsideToBaseLowPct: ls.localExtension.downsideToBaseLowPct,
+        globalVsLocalExtensionRatio: ls.localExtension.globalVsLocalExtensionRatio, reExpansionObserved: ls.reExpansion.observed,
+        discontinuity: ls.provenance.discontinuityInWindow, containsSessionBoundary: ls.provenance.containsSessionBoundary,
+        cadenceConsistency: ls.provenance.cadenceConsistency,
         localFeatureConfigVersion: ls.provenance.localFeatureConfigVersion, localFeatureConfigHash: ls.provenance.localFeatureConfigHash,
       }
       // Emit the snapshot only for symbols carrying real geometry (bounded); always emit a transition.
