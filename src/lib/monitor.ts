@@ -23,6 +23,7 @@ import { buildRoadmap } from './roadmap-engine'
 import { getSessionType, minutesSinceOpen } from './market-hours'
 import { premarketVolumeProfile, etDateNow, etHHMMNow } from './premarket-volume'
 import { cache, cached, TTL } from './cache'
+import { recordBarObservations, recordCandleSource } from './research/tape-1m'
 
 function toCandles(raw: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>): Candle[] {
   return raw.map(c => ({
@@ -80,9 +81,17 @@ export async function buildMonitorResult(
       cached(`candles1m:${sym}`, TTL.CANDLES_1M, async () => {
         try {
           const yf = await getYFCandles(sym, '1min', signal)
-          if (yf.length > 0) return yf
+          if (yf.length > 0) {
+            // H4B-PREP: record which provider actually won, for the research tape's source
+            // provenance (stored in the tape module's OWN bounded map — never the trading cache,
+            // so provider load is unchanged). No extra provider call; the candles are untouched.
+            recordCandleSource(sym, 'yahoo')
+            return yf
+          }
         } catch { /* fall through */ }
-        return getIntradayCandles(sym, '1min', signal)
+        const fmp = await getIntradayCandles(sym, '1min', signal)
+        recordCandleSource(sym, 'fmp')
+        return fmp
       }),
       cached(`daily:${sym}`, TTL.CANDLES_DAILY, () => getDailyCandles(sym, signal)),
     ])
@@ -93,6 +102,18 @@ export async function buildMonitorResult(
 
     const intraday = toCandles(rawIntraday)
     const daily = toCandles(rawDaily)
+
+    // H4B-PREP — CANONICAL 1m RESEARCH TAPE. Record the 1m bars ALREADY fetched above
+    // (BASE or observational cohort) as append-only research evidence. Pure side-channel:
+    // async/buffered, best-effort, never read by any gate/decision/execution, and it never
+    // throws into this path (recordBarObservations swallows all failures internally).
+    recordBarObservations({
+      symbol: sym,
+      candles: intraday,
+      requestKind: observationalOnly ? 'LEADER_OBSERVATION' : 'BASE',
+      session: getSessionType(),
+    })
+
     if (intraday.length === 0) missing.push('intraday candles')
     if (daily.length === 0) missing.push('daily candles')
 
