@@ -36,6 +36,7 @@ import { UniverseCoordinator, type SweepSnapshot, type UniverseEnvelope } from '
 import type { RankedRow } from '@/lib/universe/pipeline'
 import type { DiscoverySymbolProv } from '@/lib/universe/discovery-provenance'
 import { updateLeaderState, etDay, resolveLeaderConfig, leaderConfigHash, type LeaderStateConfig, type LeaderStateMap } from '@/lib/leader/leader-state'
+import { selectLeaderObservationCohort, stableObservationUnion, resolveLeaderObservationConfig, leaderObservationConfigHash, type LeaderObservationConfig } from '@/lib/leader/leader-observation'
 import { loadLeaderState, saveLeaderState, type SaveReason, type RecoveryStatus } from '@/lib/leader/leader-store'
 import { acquireLeaderWriterLock } from '@/lib/leader/leader-lock'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
@@ -91,6 +92,11 @@ const LEADER_PERSIST_EVERY = 20           // periodic save (~5 min at 15s), plus
 // and every leader telemetry event so a transition can be pinned to the exact config that produced it.
 let leaderCfg: LeaderStateConfig = resolveLeaderConfig()
 let leaderConfigHashV = leaderConfigHash(leaderCfg)
+// H4A.1 observational leader cohort — DATA COVERAGE ONLY. Keeps fresh market data for a bounded set of
+// persistent leaders OUTSIDE top15 so H4B can study them. These symbols NEVER enter the BASE universe,
+// detectSetups, arbitration, or execution. Provisional, env-overridable, fingerprinted.
+const leaderObsCfg: LeaderObservationConfig = resolveLeaderObservationConfig()
+const leaderObsConfigHashV = leaderObservationConfigHash(leaderObsCfg)
 let leaderRecoveryStatus: RecoveryStatus = 'FRESH_UNKNOWN'
 let leaderCheckpointSeq = 0
 // Single-writer ownership (research only; NEVER affects trading). A secondary daemon runs without
@@ -237,9 +243,12 @@ const universeCoordinator = new UniverseCoordinator({
   monitoredCap: TOP_GAINERS_UNIVERSE,
 })
 
-async function fetchResults(symbols: string[]): Promise<MonitorResult[]> {
+async function fetchResults(symbols: string[], observationalOnly: string[] = []): Promise<MonitorResult[]> {
   const res = await fetch(`${BASE}/api/monitor`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbols }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    // H4A.1: one shared acquisition pass. `observationalOnly` names the cohort subset that takes the
+    // lighter observational path; absent = every symbol is a full BASE monitor result (unchanged).
+    body: JSON.stringify(observationalOnly.length ? { symbols, observationalOnly } : { symbols }),
   })
   if (!res.ok) throw new Error(`monitor HTTP ${res.status}`)
   const data = await res.json() as { results?: MonitorResult[] }
@@ -366,7 +375,75 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   }
 
   if (universe.length === 0) return buys
-  const results = await fetchResults(universe)
+
+  // ── H4A.1: ONE shared observational data plane ─────────────────────────────
+  // baseSymbols = legacy top15 — the ONLY detection/execution universe (unchanged). The bounded
+  // leader-observation cohort rides the SAME monitor pass to keep fresh market data for persistent
+  // leaders OUTSIDE top15 (the H4B study population). Cohort membership is a pure function of H3C
+  // persistent facts (no H4A feature → no circular bias), deduplicated against base + open positions,
+  // and NEVER enters detectSetups / BASE scoring / arbitration / the executor.
+  const baseSymbols = universe
+  let leaderObservationSymbols: string[] = []
+  let cohortSelected: ReturnType<typeof selectLeaderObservationCohort>['selected'] = []
+  try {
+    const operational = executor ? executor.openTrades().map(t => t.symbol) : []
+    const cohort = selectLeaderObservationCohort(leaderState, baseSymbols, leaderObsCfg, { excludeSymbols: operational })
+    cohortSelected = cohort.selected
+    leaderObservationSymbols = cohort.selected.map(m => m.symbol)
+    emitFunnel(sweepCtx, 'leader_observation_cohort', {
+      runId: ensureFunnelRunId(sweepStart),
+      baseSize: baseSymbols.length, cap: cohort.cap,
+      eligibleCount: cohort.eligibleCount, selectedCount: cohort.selectedCount, excludedByCapCount: cohort.excludedByCapCount,
+      selected: cohort.selected.map(m => ({ symbol: m.symbol, leaderEpisodeId: m.leaderEpisodeId, role: m.role, lifecycleState: m.lifecycleState, reason: m.reason, presentThisSweep: m.presentThisSweep })),
+      excludedByCap: cohort.excludedByCap.map(m => ({ symbol: m.symbol, role: m.role, reason: m.reason })),
+      configVersion: cohort.configVersion, configHash: cohort.configHash,
+    }, sweepStart)
+  } catch (e) {
+    log('leader-observation cohort selection failed (research only; sweep continues):', (e as Error).message)
+    leaderObservationSymbols = []; cohortSelected = []   // fail closed to BASE-only coverage; execution unaffected
+  }
+
+  // ONE acquisition pass over the stable union (base FIRST, deduplicated → single-flight per symbol).
+  const observationSymbols = stableObservationUnion(baseSymbols, leaderObservationSymbols)
+  const allResults = await fetchResults(observationSymbols, leaderObservationSymbols)
+  const baseSet = new Set(baseSymbols)
+  const leaderObservationSet = new Set(leaderObservationSymbols)
+  // BASE consumes ONLY the base slice (never an observational symbol), preserving arrival order among
+  // base symbols — identical semantics to the pre-H4A.1 fetchResults(universe).
+  const results = allResults.filter(r => baseSet.has(r.symbol))
+  // Observational slice: fresh market data / local structure for the cohort. This is the ONLY boundary
+  // the observational telemetry (and, later, H4B) reads from — it can never contain a BASE result.
+  const leaderObservationResults = allResults.filter(r => leaderObservationSet.has(r.symbol))
+  const obsBySymbol = new Map(leaderObservationResults.map(r => [r.symbol, r]))
+
+  // ── H4A.1: per-symbol observational leader data coverage telemetry ─────────
+  // Honest coverage record for every SELECTED cohort symbol — including misses (monitor/local-structure
+  // unavailable). No bar arrays; joins the H3C episode + effective cohort config.
+  try {
+    const prov = { runId: ensureFunnelRunId(sweepStart), leaderObservationConfigVersion: leaderObsCfg.version, leaderObservationConfigHash: leaderObsConfigHashV }
+    for (const m of cohortSelected) {
+      const r = obsBySymbol.get(m.symbol)
+      const ls = r?.localStructure ?? null
+      emitFunnel(sweepCtx, 'leader_observation_data', {
+        symbol: m.symbol, leaderEpisodeId: m.leaderEpisodeId, role: m.role, lifecycleState: m.lifecycleState,
+        cohortReason: m.reason, presentThisSweep: m.presentThisSweep,
+        monitorResultAvailable: !!r,
+        localStructureAvailable: !!ls,
+        timeframe: ls?.provenance.timeframe ?? null,
+        dataQualityStatus: ls?.status ?? (r ? 'NO_LOCAL_STRUCTURE' : 'MONITOR_UNAVAILABLE'),
+        qualityFlags: ls?.qualityFlags ?? [],
+        globalOffHighPct: ls?.global.offHighPct ?? null,
+        dataAsOf: r?.integrity.marketDataTimestamp ?? null,
+        barsFreshnessMs: r?.integrity.ageMs ?? null,
+        delayed: r?.integrity.delayed ?? null,
+        localFeatureConfigVersion: ls?.provenance.localFeatureConfigVersion ?? null,
+        localFeatureConfigHash: ls?.provenance.localFeatureConfigHash ?? null,
+        ...prov,
+      }, sweepStart)
+    }
+  } catch (e) {
+    log('leader-observation data telemetry failed (research only; sweep continues):', (e as Error).message)
+  }
 
   // ── H4A: observational local-reset geometry telemetry ─────────────────────
   // The features are computed at the data source (monitor pipeline, over the same 1m bars — zero new

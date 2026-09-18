@@ -58,6 +58,8 @@ export type FunnelEventType =
   | 'leader_state_evicted'     // H3C: a non-expired record dropped under hard capacity pressure (auditable)
   | 'local_structure_observed'  // H4A: compact local-reset geometry snapshot for a symbol (observational)
   | 'local_structure_changed'   // H4A: the symbol's resetState / data-quality status changed since last sweep
+  | 'leader_observation_cohort' // H4A.1: per-sweep bounded observational leader cohort (selection + cap + provenance)
+  | 'leader_observation_data'   // H4A.1: per-symbol observational data coverage for a cohort member (no bar arrays)
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 
