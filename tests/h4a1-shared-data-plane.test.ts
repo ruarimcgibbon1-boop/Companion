@@ -71,7 +71,7 @@ vi.mock('@/lib/fmp-client', async (orig) => {
       if (rec.failSymbols.has(s.toUpperCase())) throw new Error('simulated quote failure')
       return { symbol: s.toUpperCase(), exchange: 'NASDAQ', price: 11, timestamp: Math.floor(Date.now() / 1000), averageVolume: 3_000_000, volume: 1_500_000, previousClose: 8, changePercentage: 37 }
     }),
-    getIntradayCandles: vi.fn(async (s: string) => { rec.fmpIntraday.calls++; rec.fmpIntraday.symbols.add(s.toUpperCase()); return intraday(Date.now(), 40, rec.fiveMinSymbols.has(s.toUpperCase()) ? 300_000 : 60_000) }),
+    getIntradayCandles: vi.fn(async (s: string) => { rec.fmpIntraday.calls++; rec.fmpIntraday.symbols.add(s.toUpperCase()); if (rec.failSymbols.has(s.toUpperCase())) return []; return intraday(Date.now(), 40, rec.fiveMinSymbols.has(s.toUpperCase()) ? 300_000 : 60_000) }),
     getDailyCandles: vi.fn(async (s: string) => { rec.daily.calls++; rec.daily.symbols.add(s.toUpperCase()); return daily(Date.now()) }),
     getFloatShares: vi.fn(async (s: string) => { rec.float.calls++; rec.float.symbols.add(s.toUpperCase()); return 10_000_000 }),
     getExtendedIntradayCandles: vi.fn(async (s: string) => { rec.extended.calls++; rec.extended.symbols.add(s.toUpperCase()); return intraday(Date.now(), 40) }),
@@ -88,7 +88,7 @@ vi.mock('@/lib/yahoo-client', async (orig) => {
     }),
     getYFCandles: vi.fn(async (s: string) => {
       rec.yfcandles.calls++; rec.yfcandles.symbols.add(s.toUpperCase())
-      if (rec.failSymbols.has(s.toUpperCase())) return []          // force FMP fallback path off; quote failure drives null
+      if (rec.failSymbols.has(s.toUpperCase())) return []          // both candle sources empty → price 0 → null result
       return intraday(Date.now(), 40, rec.fiveMinSymbols.has(s.toUpperCase()) ? 300_000 : 60_000)
     }),
   }
@@ -159,16 +159,17 @@ describe('STEP 15 — isolation of a persisted leader outside top15', () => {
     expect(baseResults.map(r => r.symbol).sort()).toEqual([...BASE].sort())
   })
 
-  it('observational path skips float + premarket-volume provider work; base path does not', async () => {
+  it('observational path skips FMP quote + float + premarket-volume; base path takes them all', async () => {
     const union = stableObservationUnion(BASE, ['Z'])
     await buildMonitorBatch(union, { observationalOnly: ['Z'] })
-    // float fetched for every base symbol, never for Z
+    // Minimal observational dependencies: NO FMP quote, NO float, NO premarket volume for Z.
+    expect(rec.quote.symbols.has('Z')).toBe(false)
     expect(rec.float.symbols.has('Z')).toBe(false)
-    for (const s of BASE) expect(rec.float.symbols.has(s)).toBe(true)
-    // extended (premarket volume) never fetched for Z regardless of session
     expect(rec.extended.symbols.has('Z')).toBe(false)
-    // Z still got the data localStructure needs: quote + candles + daily
-    expect(rec.quote.symbols.has('Z')).toBe(true)
+    // Base symbols take the FULL path: FMP quote + float for every one of them.
+    for (const s of BASE) { expect(rec.quote.symbols.has(s)).toBe(true); expect(rec.float.symbols.has(s)).toBe(true) }
+    // Z still got exactly what honest 1m local geometry needs: yfquote (price) + 1m candles + daily.
+    expect(rec.yfquote.symbols.has('Z')).toBe(true)
     expect(rec.yfcandles.symbols.has('Z')).toBe(true)
     expect(rec.daily.symbols.has('Z')).toBe(true)
   })
@@ -216,6 +217,21 @@ describe('STEP 8 — timeframe fidelity (no 5m masquerading as 1m)', () => {
     const five = all.find(r => r.symbol === 'FIVE')!
     expect(one.localStructure!.provenance.timeframe).toBe('1m')
     expect(five.localStructure!.provenance.timeframe).not.toBe('1m')
+  })
+})
+
+describe('STEP 4 (minimal deps) — dropping FMP quote does not change bar-driven geometry', () => {
+  it('observational local geometry equals the full-path geometry over identical 1m bars', async () => {
+    const [full] = await buildMonitorBatch(['EQ'])                                  // BASE full path (FMP quote present)
+    const [obs] = await buildMonitorBatch(['EQ2'], { observationalOnly: ['EQ2'] })  // observational (FMP quote skipped)
+    expect(rec.quote.symbols.has('EQ')).toBe(true)     // full path fetched the quote
+    expect(rec.quote.symbols.has('EQ2')).toBe(false)   // observational path did not
+    const g = (r: typeof full) => ({
+      impulse: r.localStructure!.impulse, pullback: r.localStructure!.pullback,
+      base: r.localStructure!.base, localExtension: r.localStructure!.localExtension,
+      reExpansion: r.localStructure!.reExpansion, timeframe: r.localStructure!.provenance.timeframe,
+    })
+    expect(g(obs)).toEqual(g(full))   // bar-driven geometry identical; the quote fed only recorded context
   })
 })
 
