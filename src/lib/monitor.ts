@@ -68,7 +68,10 @@ export async function buildMonitorResult(
 
   try {
     const [quote, yfQuote, rawIntraday, rawDaily] = await Promise.all([
-      cached(`quote:${sym}`, TTL.QUOTE, () => getQuote(sym)),
+      // H4A.1: observational-only symbols skip the FMP quote entirely. With yfQuote present it feeds only
+      // the rvol baseline (which falls back to the 20-day daily average) and a redundant crypto-guard, so
+      // it is not needed for honest 1m local geometry — and dropping it removes 1 FMP call per obs fetch.
+      observationalOnly ? Promise.resolve(null) : cached(`quote:${sym}`, TTL.QUOTE, () => getQuote(sym)),
       cached(`yfquote:${sym}`, TTL.QUOTE, () => getYFQuote(sym)),
       cached(`candles1m:${sym}`, TTL.CANDLES_1M, async () => {
         try {

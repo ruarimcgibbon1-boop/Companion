@@ -36,7 +36,8 @@ import { UniverseCoordinator, type SweepSnapshot, type UniverseEnvelope } from '
 import type { RankedRow } from '@/lib/universe/pipeline'
 import type { DiscoverySymbolProv } from '@/lib/universe/discovery-provenance'
 import { updateLeaderState, etDay, resolveLeaderConfig, leaderConfigHash, type LeaderStateConfig, type LeaderStateMap } from '@/lib/leader/leader-state'
-import { selectLeaderObservationCohort, stableObservationUnion, resolveLeaderObservationConfig, leaderObservationConfigHash, type LeaderObservationConfig } from '@/lib/leader/leader-observation'
+import { selectLeaderObservationCohort, resolveLeaderObservationConfig, leaderObservationConfigHash, type LeaderObservationConfig } from '@/lib/leader/leader-observation'
+import { runSharedMonitorPass, shouldRefreshObservation, resolveObservationPassConfig, observationPassConfigHash, type ObservationPassConfig } from '@/lib/leader/observation-pass'
 import { loadLeaderState, saveLeaderState, type SaveReason, type RecoveryStatus } from '@/lib/leader/leader-store'
 import { acquireLeaderWriterLock } from '@/lib/leader/leader-lock'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
@@ -97,6 +98,11 @@ let leaderConfigHashV = leaderConfigHash(leaderCfg)
 // detectSetups, arbitration, or execution. Provisional, env-overridable, fingerprinted.
 const leaderObsCfg: LeaderObservationConfig = resolveLeaderObservationConfig()
 const leaderObsConfigHashV = leaderObservationConfigHash(leaderObsCfg)
+// H4A.1 shared-pass coordinator config: BASE-latency isolation + bar-driven observational refresh cadence.
+const obsPassCfg: ObservationPassConfig = resolveObservationPassConfig()
+const obsPassConfigHashV = observationPassConfigHash(obsPassCfg)
+// Last time the observational cohort was actually re-fetched (gated to the bar cadence). Never gates BASE.
+let lastObsRefreshAt: number | null = null
 let leaderRecoveryStatus: RecoveryStatus = 'FRESH_UNKNOWN'
 let leaderCheckpointSeq = 0
 // Single-writer ownership (research only; NEVER affects trading). A secondary daemon runs without
@@ -385,65 +391,42 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   const baseSymbols = universe
   let leaderObservationSymbols: string[] = []
   let cohortSelected: ReturnType<typeof selectLeaderObservationCohort>['selected'] = []
+  let refreshObservation = false   // whether the cohort is RE-FETCHED this sweep (bar-driven cadence)
   try {
     const operational = executor ? executor.openTrades().map(t => t.symbol) : []
     const cohort = selectLeaderObservationCohort(leaderState, baseSymbols, leaderObsCfg, { excludeSymbols: operational })
     cohortSelected = cohort.selected
     leaderObservationSymbols = cohort.selected.map(m => m.symbol)
+    // Selection runs EVERY sweep (a persisted leader stays selected); the data FETCH is gated to the cadence.
+    refreshObservation = leaderObservationSymbols.length > 0 && shouldRefreshObservation(sweepStart, lastObsRefreshAt, obsPassCfg)
     emitFunnel(sweepCtx, 'leader_observation_cohort', {
       runId: ensureFunnelRunId(sweepStart),
       baseSize: baseSymbols.length, cap: cohort.cap,
       eligibleCount: cohort.eligibleCount, selectedCount: cohort.selectedCount, excludedByCapCount: cohort.excludedByCapCount,
       selected: cohort.selected.map(m => ({ symbol: m.symbol, leaderEpisodeId: m.leaderEpisodeId, role: m.role, lifecycleState: m.lifecycleState, reason: m.reason, presentThisSweep: m.presentThisSweep })),
       excludedByCap: cohort.excludedByCap.map(m => ({ symbol: m.symbol, role: m.role, reason: m.reason })),
+      refreshed: refreshObservation, refreshIntervalMs: obsPassCfg.observationRefreshMs,
       configVersion: cohort.configVersion, configHash: cohort.configHash,
+      observationPassConfigVersion: obsPassCfg.version, observationPassConfigHash: obsPassConfigHashV,
     }, sweepStart)
   } catch (e) {
     log('leader-observation cohort selection failed (research only; sweep continues):', (e as Error).message)
-    leaderObservationSymbols = []; cohortSelected = []   // fail closed to BASE-only coverage; execution unaffected
+    leaderObservationSymbols = []; cohortSelected = []; refreshObservation = false   // fail closed to BASE-only coverage
   }
 
-  // ONE acquisition pass over the stable union (base FIRST, deduplicated → single-flight per symbol).
-  const observationSymbols = stableObservationUnion(baseSymbols, leaderObservationSymbols)
-  const allResults = await fetchResults(observationSymbols, leaderObservationSymbols)
-  const baseSet = new Set(baseSymbols)
-  const leaderObservationSet = new Set(leaderObservationSymbols)
-  // BASE consumes ONLY the base slice (never an observational symbol), preserving arrival order among
-  // base symbols — identical semantics to the pre-H4A.1 fetchResults(universe).
-  const results = allResults.filter(r => baseSet.has(r.symbol))
-  // Observational slice: fresh market data / local structure for the cohort. This is the ONLY boundary
-  // the observational telemetry (and, later, H4B) reads from — it can never contain a BASE result.
-  const leaderObservationResults = allResults.filter(r => leaderObservationSet.has(r.symbol))
-  const obsBySymbol = new Map(leaderObservationResults.map(r => [r.symbol, r]))
-
-  // ── H4A.1: per-symbol observational leader data coverage telemetry ─────────
-  // Honest coverage record for every SELECTED cohort symbol — including misses (monitor/local-structure
-  // unavailable). No bar arrays; joins the H3C episode + effective cohort config.
-  try {
-    const prov = { runId: ensureFunnelRunId(sweepStart), leaderObservationConfigVersion: leaderObsCfg.version, leaderObservationConfigHash: leaderObsConfigHashV }
-    for (const m of cohortSelected) {
-      const r = obsBySymbol.get(m.symbol)
-      const ls = r?.localStructure ?? null
-      emitFunnel(sweepCtx, 'leader_observation_data', {
-        symbol: m.symbol, leaderEpisodeId: m.leaderEpisodeId, role: m.role, lifecycleState: m.lifecycleState,
-        cohortReason: m.reason, presentThisSweep: m.presentThisSweep,
-        monitorResultAvailable: !!r,
-        localStructureAvailable: !!ls,
-        timeframe: ls?.provenance.timeframe ?? null,
-        dataQualityStatus: ls?.status ?? (r ? 'NO_LOCAL_STRUCTURE' : 'MONITOR_UNAVAILABLE'),
-        qualityFlags: ls?.qualityFlags ?? [],
-        globalOffHighPct: ls?.global.offHighPct ?? null,
-        dataAsOf: r?.integrity.marketDataTimestamp ?? null,
-        barsFreshnessMs: r?.integrity.ageMs ?? null,
-        delayed: r?.integrity.delayed ?? null,
-        localFeatureConfigVersion: ls?.provenance.localFeatureConfigVersion ?? null,
-        localFeatureConfigHash: ls?.provenance.localFeatureConfigHash ?? null,
-        ...prov,
-      }, sweepStart)
-    }
-  } catch (e) {
-    log('leader-observation data telemetry failed (research only; sweep continues):', (e as Error).message)
-  }
+  // ── H4A.1: shared monitor pass — BASE completion barrier + best-effort observational tail ──
+  // LATENCY ISOLATION (red-team §1): BASE awaits ONLY its own results. The observational request (issued
+  // only on a refresh tick) runs concurrently on the SAME fetcher/endpoint/cache/single-flight and is
+  // drained AFTER the BASE loop, best-effort — a slow, hung, or failed observational fetch can never
+  // delay the moment BASE detection/arbitration/execution begins, nor change any BASE output.
+  const pass = runSharedMonitorPass(
+    fetchResults, baseSymbols, refreshObservation ? leaderObservationSymbols : [],
+    {
+      observationTimeoutMs: obsPassCfg.observationTimeoutMs,
+      onObservationError: e => log('leader-observation fetch failed (research only; BASE unaffected):', (e as Error).message),
+    },
+  )
+  const results = await pass.baseResults   // ← BASE COMPLETION BARRIER — no observational symbol is awaited here
 
   // ── H4A: observational local-reset geometry telemetry ─────────────────────
   // The features are computed at the data source (monitor pipeline, over the same 1m bars — zero new
@@ -606,6 +589,42 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       eligibleSetupIds: eligibleCandidates.map(c => c.setupId ?? null),
     }, now)
   }
+  // ── H4A.1: drain the best-effort observational tail (AFTER all BASE work) ───
+  // BASE detection/arbitration/execution are already complete above. The observational fetch ran
+  // concurrently on the shared plane; here we await it (bounded by the pass timeout — it resolves []
+  // on slow/hung/failed provider work) and emit honest per-symbol coverage. Nothing here can change a
+  // BASE result: this is strictly downstream of the BASE loop.
+  if (refreshObservation) {
+    try {
+      const obsResults = await pass.observationResults          // best-effort: [] on timeout/failure
+      lastObsRefreshAt = sweepStart                             // advance the cadence clock only on an issued refresh
+      const obsBySymbol = new Map(obsResults.map(r => [r.symbol, r]))
+      const prov = { runId: ensureFunnelRunId(sweepStart), leaderObservationConfigVersion: leaderObsCfg.version, leaderObservationConfigHash: leaderObsConfigHashV }
+      for (const m of cohortSelected) {
+        const r = obsBySymbol.get(m.symbol)
+        const ls = r?.localStructure ?? null
+        emitFunnel(sweepCtx, 'leader_observation_data', {
+          symbol: m.symbol, leaderEpisodeId: m.leaderEpisodeId, role: m.role, lifecycleState: m.lifecycleState,
+          cohortReason: m.reason, presentThisSweep: m.presentThisSweep,
+          monitorResultAvailable: !!r,
+          localStructureAvailable: !!ls,
+          timeframe: ls?.provenance.timeframe ?? null,
+          dataQualityStatus: ls?.status ?? (r ? 'NO_LOCAL_STRUCTURE' : 'MONITOR_UNAVAILABLE'),
+          qualityFlags: ls?.qualityFlags ?? [],
+          globalOffHighPct: ls?.global.offHighPct ?? null,
+          dataAsOf: r?.integrity.marketDataTimestamp ?? null,
+          barsFreshnessMs: r?.integrity.ageMs ?? null,
+          delayed: r?.integrity.delayed ?? null,
+          localFeatureConfigVersion: ls?.provenance.localFeatureConfigVersion ?? null,
+          localFeatureConfigHash: ls?.provenance.localFeatureConfigHash ?? null,
+          ...prov,
+        }, sweepStart)
+      }
+    } catch (e) {
+      log('leader-observation data telemetry failed (research only; sweep continues):', (e as Error).message)
+    }
+  }
+
   // Log on activity, or periodically so a quiet stretch is visibly alive (not hung).
   // A degraded-telemetry note rides the same lines so an operator sees observability loss
   // live (execution is unaffected; this is a research-integrity signal only).
