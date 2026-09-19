@@ -45,28 +45,45 @@ export interface BarObservation extends TapeEvent {
   requestKind: TapeRequestKind
 }
 
-/** Parse JSONL text into events. A malformed line (e.g. a torn final append) is skipped and counted. */
-export function parseTape(text: string): { events: TapeEvent[]; malformed: number } {
+/** One ordered non-empty line of a tape file: a parsed event, or a malformed/torn line. */
+export interface TapeEntry { ok: boolean; event?: TapeEvent; raw: string }
+
+/** Parse-integrity metadata — completeness certification MUST consume this, not just print it. */
+export interface TapeParseResult {
+  events: TapeEvent[]          // parsed events, in order (malformed lines excluded)
+  entries: TapeEntry[]         // EVERY non-empty line in order, ok or not (for position-aware certification)
+  malformed: number            // count of malformed/torn lines
+  malformedTrailing: boolean   // the LAST non-empty line was malformed (classic crash-mid-append signature)
+}
+
+/**
+ * Parse JSONL text. A malformed/torn line (e.g. a partial final append) is recorded as a
+ * `{ ok: false }` entry, skipped from `events`, and counted. Ordering is preserved so a
+ * later certification step can tell WHERE the damage is (e.g. after the last clean summary).
+ */
+export function parseTape(text: string): TapeParseResult {
   const events: TapeEvent[] = []
+  const entries: TapeEntry[] = []
   let malformed = 0
+  let malformedTrailing = false
   for (const line of text.split('\n')) {
     const t = line.trim()
     if (!t) continue
     try {
       const e = JSON.parse(t)
-      if (e && typeof e === 'object') events.push(e as TapeEvent)
-      else malformed++
+      if (e && typeof e === 'object') { events.push(e as TapeEvent); entries.push({ ok: true, event: e as TapeEvent, raw: t }); malformedTrailing = false }
+      else { malformed++; entries.push({ ok: false, raw: t }); malformedTrailing = true }
     } catch {
-      malformed++
+      malformed++; entries.push({ ok: false, raw: t }); malformedTrailing = true
     }
   }
-  return { events, malformed }
+  return { events, entries, malformed, malformedTrailing }
 }
 
 /** Impure convenience loader: read + parse one tape file. Missing file → empty. */
-export function readTapeFile(path: string): { events: TapeEvent[]; malformed: number } {
+export function readTapeFile(path: string): TapeParseResult {
   let text = ''
-  try { text = readFileSync(path, 'utf8') } catch { return { events: [], malformed: 0 } }
+  try { text = readFileSync(path, 'utf8') } catch { return { events: [], entries: [], malformed: 0, malformedTrailing: false } }
   return parseTape(text)
 }
 
@@ -170,8 +187,15 @@ const isContinuedOut = (e: TapeEvent): boolean =>
  *   COMPLETE          — terminal summary present, no drops, never degraded, no gap/degraded markers.
  * The LAST closer decides (scan from the end: first event that is a summary OR a continued_in_next_file).
  * A per-day file with several runs should be split first (splitTapeSessions).
+ *
+ * `integrity` (optional) folds torn/malformed-line evidence into the verdict — pass it from
+ * parseTape so a damaged file is NEVER certified COMPLETE. See `assessTapeFile` for the
+ * position-aware, file-level entry point that supplies it automatically.
  */
-export function assessTapeCompleteness(events: TapeEvent[]): TapeCompleteness {
+export function assessTapeCompleteness(
+  events: TapeEvent[],
+  integrity?: { malformedAfterLastCloser?: boolean; malformedInCertifiedRegion?: boolean },
+): TapeCompleteness {
   let closerIdx = -1
   let closerKind: 'summary' | 'continued' | null = null
   for (let i = events.length - 1; i >= 0; i--) {
@@ -180,6 +204,9 @@ export function assessTapeCompleteness(events: TapeEvent[]): TapeCompleteness {
     if (isContinuedOut(e)) { closerIdx = i; closerKind = 'continued'; break }
   }
   if (closerKind === null) return 'INCOMPLETE'
+  // Unexplained bytes after the last certification (e.g. a torn record from a NEW run that died)
+  // mean an earlier clean summary can NOT certify the file.
+  if (integrity?.malformedAfterLastCloser) return 'INCOMPLETE'
   const trailing = events.slice(closerIdx + 1).some(
     e => e.eventType !== 'tape_writer_summary' && e.eventType !== 'tape_rotated')
   if (trailing) return 'INCOMPLETE'
@@ -190,10 +217,43 @@ export function assessTapeCompleteness(events: TapeEvent[]): TapeCompleteness {
   const dropped = typeof summary.eventsDropped === 'number' ? summary.eventsDropped : 0
   const failures = typeof summary.writeFailures === 'number' ? summary.writeFailures : 0
   const overflows = typeof summary.queueOverflows === 'number' ? summary.queueOverflows : 0
-  if (dropped > 0 || failures > 0 || overflows > 0 || summary.degradedEver === true || hadGap) {
+  const asyncFailures = typeof summary.asyncWriteFailures === 'number' ? summary.asyncWriteFailures : 0
+  // A malformed line inside the certified region = a known-lost line → at best DEGRADED.
+  if (dropped > 0 || failures > 0 || overflows > 0 || asyncFailures > 0 || summary.degradedEver === true ||
+      hadGap || integrity?.malformedInCertifiedRegion) {
     return 'DEGRADED_COMPLETE'
   }
   return 'COMPLETE'
+}
+
+/**
+ * File-level completeness that CONSUMES parse-integrity (torn/malformed lines). This is the
+ * authoritative entry point for certifying a tape file on disk:
+ *   - a malformed line AFTER the last clean closer → INCOMPLETE (unexplained bytes; a new run
+ *     began and died without certification — an earlier clean summary must not certify it);
+ *   - a malformed line WITHIN the certified region → at best DEGRADED_COMPLETE (a known-lost line
+ *     means the exact historical event stream is not fully known);
+ *   - otherwise the ordinary event-based verdict.
+ * PURE.
+ */
+export function assessTapeFile(text: string): { completeness: TapeCompleteness; integrity: TapeParseResult } {
+  const parsed = parseTape(text)
+  // Position of the last closer among ALL entries (ok + malformed), in file order.
+  let lastCloserEntryIdx = -1
+  for (let i = parsed.entries.length - 1; i >= 0; i--) {
+    const e = parsed.entries[i]
+    if (!e.ok || !e.event) continue
+    if (e.event.eventType === 'tape_writer_summary' || isContinuedOut(e.event)) { lastCloserEntryIdx = i; break }
+  }
+  let malformedAfterLastCloser = false
+  let malformedInCertifiedRegion = false
+  for (let i = 0; i < parsed.entries.length; i++) {
+    if (parsed.entries[i].ok) continue
+    if (lastCloserEntryIdx >= 0 && i > lastCloserEntryIdx) malformedAfterLastCloser = true
+    else malformedInCertifiedRegion = true
+  }
+  const completeness = assessTapeCompleteness(parsed.events, { malformedAfterLastCloser, malformedInCertifiedRegion })
+  return { completeness, integrity: parsed }
 }
 
 /**
