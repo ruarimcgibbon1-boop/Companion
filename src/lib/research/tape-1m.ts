@@ -107,6 +107,15 @@ const PUBLICATION_MARGIN_SEC = 15
 const CANDLE_SRC_TTL_MS = 30_000        // mirrors TTL.CANDLES_1M; provenance is only meaningful that long
 const MAX_CANDLE_SRC = 2_000
 const ESCALATE_AFTER = 5
+/** Bounded graceful-shutdown drain budget. We never hang shutdown for the tape. */
+function shutdownBudgetMs(): number {
+  const v = Number(process.env.COMPANION_1M_TAPE_SHUTDOWN_MS)
+  return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 2_000
+}
+/** A bounded delay whose timer never keeps the process alive. */
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((res) => { const t = setTimeout(res, ms); if (typeof t.unref === 'function') t.unref() })
+}
 
 // ── Process-singleton state (HMR / dev-reload safe) ──────────────────────────────
 // Dev servers re-evaluate modules on HMR. If writer state lived in module-level `let`s,
@@ -121,6 +130,9 @@ interface TapeState {
   started: boolean
   disabledByLock: boolean
   ownsLock: boolean
+  shuttingDown: boolean
+  summaryWritten: boolean
+  shutdownPromise: Promise<boolean> | null
   runId: string | null
   producerHead: string | null | undefined
   flushTimer: ReturnType<typeof setInterval> | null
@@ -153,6 +165,7 @@ function freshState(): TapeState {
   return {
     queue: [], seen: new Map(), candleSrc: new Map(),
     started: false, disabledByLock: false, ownsLock: false,
+    shuttingDown: false, summaryWritten: false, shutdownPromise: null,
     runId: null, producerHead: undefined,
     flushTimer: null, signalsHooked: false, beforeExitHandler: null, signalHandlers: [],
     lastWrittenDay: null, draining: false, drainPromise: Promise.resolve(),
@@ -491,13 +504,18 @@ function hookExit(): void {
   const s = st()
   if (s.signalsHooked) return
   s.signalsHooked = true
-  s.beforeExitHandler = () => { try { emitTapeSummary() } catch { /* best-effort */ } }
-  process.once('beforeExit', s.beforeExitHandler)
+  // Normal exit: the loop is draining/empty; run the (idempotent) bounded shutdown once. The
+  // `shuttingDown` guard prevents a repeated beforeExit loop; the summary is written at most once.
+  s.beforeExitHandler = () => { if (!s.shuttingDown) void shutdownTape() }
+  process.on('beforeExit', s.beforeExitHandler)
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     const handler = () => {
-      try { emitTapeSummary() } catch { /* best-effort */ }
-      process.removeListener(sig, handler)
-      try { process.kill(process.pid, sig) } catch { /* leave lifecycle untouched if re-raise fails */ }
+      // Await the BOUNDED graceful drain BEFORE re-raising, so an in-flight async append is given
+      // a chance to become durable and no clean summary is written over an outstanding batch.
+      void shutdownTape().finally(() => {
+        process.removeListener(sig, handler)
+        try { process.kill(process.pid, sig) } catch { /* leave lifecycle untouched if re-raise fails */ }
+      })
     }
     s.signalHandlers.push({ sig, handler })
     process.on(sig, handler)
@@ -544,6 +562,7 @@ export function recordBarObservations(input: {
   now?: number
 }): void {
   if (!tapeEnabled()) return
+  if (st().shuttingDown) return // shutdown started: stop accepting new tape events
   const candles = input.candles
   if (!candles || candles.length === 0) return
   const now = input.now ?? Date.now()
@@ -649,26 +668,75 @@ export function buildTapeSummary(): TapeSessionSummary {
 }
 
 /**
- * Append the terminal `tape_writer_summary`. Call on graceful shutdown ONLY. Flushes the tail
- * synchronously (exit path). Releases the writer lease. Returns whether the summary persisted;
- * if the sink is unwritable the marker is ABSENT — that absence correctly certifies incompleteness.
- * Never throws.
+ * Append the terminal `tape_writer_summary` — the SYNCHRONOUS clean-close path (tests + the
+ * fully-drained branch of graceful shutdown). It certifies a clean close ONLY when durability
+ * is guaranteed synchronously:
+ *   - refuses if an async append is IN FLIGHT (`draining`) — a summary must never precede an
+ *     outstanding batch (shutdown must await the drain first via `shutdownTape`);
+ *   - refuses if the queue is still non-empty after its own sync flush (undrained data);
+ *   - refuses to write a second summary (no duplicate).
+ * On durable success it releases the writer lease and returns true. On refusal it returns false
+ * and does NOT release the lease (writes have not settled) — absence of the marker correctly
+ * certifies incompleteness. Never throws.
  */
 export function emitTapeSummary(now: number = Date.now()): boolean {
   const s = st()
-  if (!s.started || s.disabledByLock) return false
+  if (!s.started || s.disabledByLock || s.summaryWritten) return false
+  if (s.draining) return false // an async batch is outstanding — cannot certify clean synchronously
   try {
     flushSync(now)
+    if (s.queue.length > 0) return false // could not fully drain — do NOT certify clean
     const day = etDayKey(now)
     rotateIfNeededSync(day, now)
     appendFileSync(tapeFile(day), stamp({ eventType: 'tape_writer_summary', ...buildTapeSummary() }, now))
     s.lastWrittenDay = day
-    releaseWriterLock()
+    s.summaryWritten = true
+    releaseWriterLock() // lease released ONLY after writes have settled + summary is durable
     return true
   } catch {
-    releaseWriterLock()
-    return false
+    return false // not settled → keep the lease (stale-takeover covers the next run)
   }
+}
+
+/**
+ * Graceful shutdown (the ASYNC path used by beforeExit / SIGINT / SIGTERM). The filesystem op is
+ * asynchronous, so a clean summary must NEVER be written while an async append batch is in flight
+ * or queued-but-not-durable. Sequence:
+ *   1. stop accepting new tape events;
+ *   2. BOUNDED-await any in-flight drain + remaining queue (never hang shutdown for the tape);
+ *   3. if FULLY drained (nothing in flight, queue empty) → write the clean summary (releases lease);
+ *   4. otherwise account the undrained data as lost, mark degraded, and DO NOT certify clean —
+ *      an absent/unclean summary yields INCOMPLETE (research truth > cosmetic clean shutdown).
+ * Idempotent (returns the same promise). Never throws.
+ */
+export function shutdownTape(now: number = Date.now(), timeoutMs: number = shutdownBudgetMs()): Promise<boolean> {
+  const s = st()
+  if (s.shutdownPromise) return s.shutdownPromise
+  s.shutdownPromise = (async () => {
+    if (!s.started || s.disabledByLock) { s.shuttingDown = true; return false }
+    s.shuttingDown = true // stop accepting new events
+    const deadline = Date.now() + Math.max(0, timeoutMs)
+    try {
+      while (s.draining || s.queue.length > 0) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) break
+        scheduleDrain()
+        await Promise.race([s.drainPromise, delay(remaining)])
+      }
+    } catch { /* best-effort */ }
+    if (!s.draining && s.queue.length === 0) {
+      // Fully drained and durable → safe to certify clean.
+      return emitTapeSummary(now)
+    }
+    // Bounded drain expired with data still in flight/queued → do NOT certify clean.
+    const lost = s.queue.length
+    if (lost > 0) { s.eventsDropped += lost; s.droppedSinceLastOk += lost; s.queue.length = 0 }
+    markDegraded('shutdown_timeout')
+    // Keep the lease UNreleased: writes did not settle, so stale-takeover (dead pid) covers the
+    // next run rather than releasing while a stuck append may still touch the file.
+    return false
+  })()
+  return s.shutdownPromise
 }
 
 // ── Health readouts (for a heartbeat / diagnostics; never a decision input) ──────
