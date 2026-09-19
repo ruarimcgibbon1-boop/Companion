@@ -239,7 +239,8 @@ describe('H4B tape writer', () => {
     expect(recs[0].eventType).toBe('tape_writer_started')
     const sum = recs.find(r => r.eventType === 'tape_writer_summary')!
     expect(sum.cleanClose).toBe(true)
-    expect(sum.eventsWritten).toBe(2)
+    expect(sum.eventsWritten).toBe(3)   // tape_writer_started + 2 bar_observation lines
+    expect(bars(recs)).toHaveLength(2)
     expect(sum.degradedEver).toBe(false)
     expect(assessTapeCompleteness(recs as never)).toBe('COMPLETE')
   })
