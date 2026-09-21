@@ -14,7 +14,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { parseTape, assessTapeFile, type TapeEvent, type TapeCompleteness } from '@/lib/research/tape-1m-replay'
-import { evaluateCandidateOutcome, type WindowOutcome } from '@/lib/leader/leader-continuation-outcome'
+import { evaluateCandidateOutcome, type WindowOutcome, type CandidateOutcome } from '@/lib/leader/leader-continuation-outcome'
 import type { ShadowCandidateEvent } from '@/lib/leader/leader-continuation'
 
 function parseArgs(argv: string[]): { days: string[]; out: string } {
@@ -52,6 +52,7 @@ interface Row {
   candidate: ShadowCandidateEvent
   tapeCompleteness: TapeCompleteness
   w: Record<number, WindowOutcome>
+  outcome: CandidateOutcome
 }
 
 export function runH4bSession(cfg: { days: string[]; out: string; funnelDir?: string; tapeDir?: string }): { csvPath: string; sumPath: string; summary: Record<string, unknown> } {
@@ -65,9 +66,14 @@ export function runH4bSession(cfg: { days: string[]; out: string; funnelDir?: st
     const tapePath = join(tapeDir, `.companion-1m-tape-${day}.jsonl`)
     const rawFunnel = readJsonl(funnelPath)
     const candidates = rawFunnel.filter(e => e.eventType === 'leader_continuation_candidate') as unknown as ShadowCandidateEvent[]
-    // Deterministic dedup across the whole day by shadowCandidateId (collapses cross-restart re-emits).
+    // Deterministic dedup by the COLLISION-SAFE canonical key. The retained record is the EARLIEST
+    // causal observation of that candidate (a later restart re-emission never overwrites first facts).
     const byId = new Map<string, ShadowCandidateEvent>()
-    for (const c of candidates) if (!byId.has(c.shadowCandidateId)) byId.set(c.shadowCandidateId, c)
+    for (const c of candidates) {
+      const key = c.canonicalCandidateKey ?? c.shadowCandidateId
+      const prev = byId.get(key)
+      if (!prev || Date.parse(c.candidateObservedAt) < Date.parse(prev.candidateObservedAt)) byId.set(key, c)
+    }
 
     const tapeText = existsSync(tapePath) ? readFileSync(tapePath, 'utf8') : ''
     const tapeCompleteness = tapeText ? assessTapeFile(tapeText).completeness : 'INCOMPLETE'
@@ -84,7 +90,7 @@ export function runH4bSession(cfg: { days: string[]; out: string; funnelDir?: st
       const outcome = evaluateCandidateOutcome(c, evs, { tapeCompleteness })
       const w: Record<number, WindowOutcome> = {}
       for (const wo of outcome.windows) w[wo.windowMin] = wo
-      rows.push({ day, candidate: c, tapeCompleteness, w })
+      rows.push({ day, candidate: c, tapeCompleteness, w, outcome })
     }
   }
 
@@ -100,8 +106,9 @@ export function runH4bSession(cfg: { days: string[]; out: string; funnelDir?: st
     'impulsePct', 'pullbackPct', 'baseRangePct', 'baseDurationBars', 'localExtensionPct', 'spaceToSessionHighPct',
     'referencePrice', 'invalidationPrice', 'riskUnitPct',
     'tapeCompleteness',
+    'outcomeReferencePrice', 'primaryOutcomeStartSec', 'structuralExtensionAtObsPct',
     ...[5, 15, 30].flatMap(m => [
-      `w${m}_terminal`, `w${m}_scorable`, `w${m}_mfePct`, `w${m}_maePct`, `w${m}_mfeR`, `w${m}_maeR`,
+      `w${m}_terminal`, `w${m}_scorable`, `w${m}_prospMfePct`, `w${m}_prospMaePct`, `w${m}_prospMfeR`, `w${m}_prospMaeR`,
       `w${m}_t0_5R`, `w${m}_t1R`, `w${m}_t2R`, `w${m}_invalidated`, `w${m}_tToInval`, `w${m}_ambiguous`, `w${m}_cfPostTermMfePct`,
     ]),
   ]
@@ -116,10 +123,11 @@ export function runH4bSession(cfg: { days: string[]; out: string; funnelDir?: st
       c.impulsePct, c.pullbackPct, c.baseRangePct, c.baseDurationBars, c.localExtensionPct, c.spaceToSessionHighPct,
       c.referencePrice, c.invalidationPrice, c.riskUnitPct,
       r.tapeCompleteness,
+      r.outcome.outcomeReferencePrice, r.outcome.primaryOutcomeStartSec, r.outcome.structuralExtensionAtObsPct,
       ...[5, 15, 30].flatMap(m => {
         const wo = r.w[m]
-        return [wo.terminalState, wo.scorable, wo.causalMfePct, wo.causalMaePct, wo.causalMfeR, wo.causalMaeR,
-          wo.timeTo0_5RSec, wo.timeTo1RSec, wo.timeTo2RSec, wo.invalidationHit, wo.timeToInvalidationSec, wo.ambiguousSameBar, wo.counterfactualPostTerminalMfePct]
+        return [wo.terminalState, wo.scorable, wo.prospectiveMfePct, wo.prospectiveMaePct, wo.prospectiveMfeR, wo.prospectiveMaeR,
+          wo.prospectiveTimeTo0_5RSec, wo.prospectiveTimeTo1RSec, wo.prospectiveTimeTo2RSec, wo.invalidationHit, wo.timeToInvalidationSec, wo.ambiguousSameBar, wo.counterfactualPostTerminalMfePct]
       }),
     ]
     csv.push(vals.map(v => v === null || v === undefined ? '' : String(v)).join(','))
@@ -131,13 +139,13 @@ export function runH4bSession(cfg: { days: string[]; out: string; funnelDir?: st
   const scorable15 = rows.filter(r => r.w[15].scorable)
   const group = (pred: (r: Row) => boolean) => {
     const g = scorable15.filter(pred)
-    const mfe = g.map(r => r.w[15].causalMfePct!).filter(Number.isFinite)
-    const mae = g.map(r => r.w[15].causalMaePct!).filter(Number.isFinite)
-    const mfeR = g.map(r => r.w[15].causalMfeR!).filter(Number.isFinite)
+    const mfe = g.map(r => r.w[15].prospectiveMfePct!).filter(Number.isFinite)
+    const mae = g.map(r => r.w[15].prospectiveMaePct!).filter(Number.isFinite)
+    const mfeR = g.map(r => r.w[15].prospectiveMfeR!).filter(Number.isFinite)
     const inval = g.filter(r => r.w[15].invalidationHit).length
-    const r1 = g.filter(r => r.w[15].timeTo1RSec != null).length
-    const r05 = g.filter(r => r.w[15].timeTo0_5RSec != null).length
-    const r2 = g.filter(r => r.w[15].timeTo2RSec != null).length
+    const r1 = g.filter(r => r.w[15].prospectiveTimeTo1RSec != null).length
+    const r05 = g.filter(r => r.w[15].prospectiveTimeTo0_5RSec != null).length
+    const r2 = g.filter(r => r.w[15].prospectiveTimeTo2RSec != null).length
     return {
       candidates: g.length,
       symbolDays: new Set(g.map(r => `${r.day}:${r.candidate.symbol}`)).size,

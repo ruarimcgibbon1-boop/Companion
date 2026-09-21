@@ -410,18 +410,20 @@ function emitLeaderContinuationCandidates(
         leaderConfigHash: leaderConfigHashV, leaderObservationConfigHash: leaderObsConfigHashV, config: h4bCfg,
       })
       if (res.candidate) {
-        const id = res.candidate.shadowCandidateId
-        if (h4bEmittedCandidates.has(id)) {
+        // Dedup by the COLLISION-SAFE canonical key (never the compact display id).
+        const key = res.candidate.canonicalCandidateKey
+        if (h4bEmittedCandidates.has(key)) {
           emitFunnel(ctx, 'leader_continuation_state', {
             symbol: r.symbol, leaderEpisodeId: leader?.leaderEpisodeId ?? null, state: 'DUPLICATE_STRUCTURE',
-            shadowCandidateId: id, experimentConfigHash: h4bConfigHashV, experimentEpoch: h4bCfg.epoch, runId,
+            shadowCandidateId: res.candidate.shadowCandidateId, canonicalCandidateKey: key,
+            experimentConfigHash: h4bConfigHashV, experimentEpoch: h4bCfg.epoch, runId,
           }, sweepStart)
         } else {
           if (h4bEmittedCandidates.size >= H4B_DEDUP_CAP) {
             const oldest = h4bEmittedCandidates.values().next().value
             if (oldest !== undefined) h4bEmittedCandidates.delete(oldest)
           }
-          h4bEmittedCandidates.add(id)
+          h4bEmittedCandidates.add(key)
           emitFunnel(ctx, 'leader_continuation_candidate', res.candidate as unknown as Record<string, unknown>, sweepStart)
         }
       } else if (leader?.leaderEpisodeId) {
