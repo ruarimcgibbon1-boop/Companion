@@ -11,9 +11,12 @@ import {
   H4B_DEFINITION, DEFAULT_LEADER_CONTINUATION_CONFIG, experimentConfigHash,
   EXPERIMENT_SPEC_VERSION, EXPERIMENT_EPOCH,
 } from '../src/lib/leader/leader-continuation'
+import { H4B_DECISION_POLICY, decisionPolicyHash, DECISION_POLICY_VERSION } from '../src/lib/leader/leader-continuation-policy'
 
 // The frozen v2 fingerprint (recomputed independently below; pinned so any change is deliberate).
 const EXPECTED_CONFIG_HASH = '89e8b4e0'
+// The ratified decision-policy fingerprint (pinned so the human ratification cannot silently drift).
+const EXPECTED_DECISION_HASH = 'cc3ae918'
 
 describe('H4B spec ↔ code contract', () => {
   it('EXPERIMENT_SPEC_VERSION / EPOCH are the frozen v2 values', () => {
@@ -64,8 +67,59 @@ describe('H4B spec ↔ code contract', () => {
     expect(md).toMatch(/-5/)
     expect(md).toMatch(/5m|5 ?min/); expect(md).toMatch(/15m|15 ?min/); expect(md).toMatch(/30m|30 ?min/)
     expect(md).toContain('BASE_HIGH'); expect(md).toContain('BASE_LOW')
-    expect(md).toContain('PRE-COLLECTION')
     // structural vs prospective separation must be documented
     expect(md).toMatch(/outcomeReferencePrice|OUTCOME REFERENCE|prospective/i)
+    // ratified + ready, not yet started
+    expect(md).toContain('RATIFIED')
+    expect(md).toMatch(/READY_NOT_STARTED|READY FOR PROSPECTIVE COLLECTION/)
+    expect(md).toMatch(/COLLECTION NOT YET STARTED|not.*started/i)
+  })
+})
+
+describe('H4B ratified decision policy — pinned (STEP 6)', () => {
+  it('decision-policy version + hash are pinned (human ratification cannot silently drift)', () => {
+    expect(DECISION_POLICY_VERSION).toBe('h4b-decision-1')
+    expect(decisionPolicyHash()).toBe(EXPECTED_DECISION_HASH)
+  })
+
+  it('the ratified policy is Path A + the exact frozen minimums and gates', () => {
+    expect(H4B_DECISION_POLICY).toMatchObject({
+      ratified: true,
+      promotionPath: 'A_CONFIRMATORY_EPOCH_1',
+      officialCollectionStartStatus: 'READY_NOT_STARTED',
+      experimentConfigHash: EXPECTED_CONFIG_HASH,     // binds the policy to the exact experiment
+      collectionMinimum: { candidates: 150, symbolDays: 40, sessions: 10 },
+      regimeCondition: 'DESCRIPTIVE_ONLY',
+      maxCensorOrDegradedRatePct: 10,
+      additiveMinimum: { candidates: 40, symbolDays: 15 },
+      primaryPromotionWindowMin: 15,
+      gate: {
+        medianProspectiveMfeRAtLeast: 0.5,
+        medianProspectiveMaeRGreaterThan: -0.75,
+        oneRBeforeInvalidationRateAtLeast: 0.4,
+        asymmetryRequired: true,
+        maxSingleSymbolDaySharePct: 20,
+      },
+      globalOffHighIsCandidateGate: false,
+      automaticExecution: false,
+    })
+  })
+
+  it('PASS means constrained-paper eligibility only; no state grants automatic execution', () => {
+    expect(H4B_DECISION_POLICY.decisionStates.PASS).toMatch(/constrained PAPER/i)
+    expect(H4B_DECISION_POLICY.decisionStates.PASS).toMatch(/NOT live money|NOT automatic/i)
+    expect(H4B_DECISION_POLICY.automaticExecution).toBe(false)
+  })
+
+  it('the pre-registration markdown embodies the ratified policy values', () => {
+    const specPath = join(process.cwd(), 'reviews/top-mover-audit/H4B_EXPERIMENT_SPEC.md')
+    if (!existsSync(specPath)) throw new Error(`missing ${specPath}`)
+    const md = readFileSync(specPath, 'utf8')
+    expect(md).toContain('h4b-decision-1')
+    expect(md).toContain(EXPECTED_DECISION_HASH)
+    expect(md).toContain('A — CONFIRMATORY EPOCH 1')
+    expect(md).toMatch(/150/); expect(md).toMatch(/40/); expect(md).toMatch(/15m/)
+    expect(md).toMatch(/0\.50R|0\.5R/); expect(md).toMatch(/-0\.75R/); expect(md).toMatch(/40%/); expect(md).toMatch(/20%/)
+    expect(md).toMatch(/constrained.*paper/i)
   })
 })
