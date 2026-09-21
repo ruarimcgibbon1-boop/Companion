@@ -15,7 +15,9 @@
     "session:verify": "npx tsx scripts/session-verify.ts",
     "broker:ledger": "npx tsx scripts/broker-ledger.ts",
     "session:reconcile": "npx tsx scripts/session-reconcile.ts",
-    "fmp:usage": "npx tsx scripts/fmp-usage.ts"
+    "fmp:usage": "npx tsx scripts/fmp-usage.ts",
+    "h4b:start-collection": "npx tsx scripts/research/h4b-start-collection.ts",
+    "h4b:session": "npx tsx scripts/research/h4b-session.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.109.0",
