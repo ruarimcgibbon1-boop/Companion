@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
-  evaluateLeaderContinuation, shadowCandidateId, offHighGroupOf, deriveBaseRelationship,
+  evaluateLeaderContinuation, shadowCandidateId, canonicalCandidateKey, offHighGroupOf, deriveBaseRelationship,
   DEFAULT_LEADER_CONTINUATION_CONFIG, experimentConfigHash, EXPERIMENT_EPOCH, EXPERIMENT_SPEC_VERSION,
   type LeaderContinuationInput,
 } from '../src/lib/leader/leader-continuation'
@@ -175,6 +175,37 @@ describe('H4B identity + subgroups + BASE relationship', () => {
     const h = experimentConfigHash(DEFAULT_LEADER_CONTINUATION_CONFIG)
     expect(h).toBe(experimentConfigHash(DEFAULT_LEADER_CONTINUATION_CONFIG))
     expect(h).not.toBe(experimentConfigHash({ ...DEFAULT_LEADER_CONTINUATION_CONFIG, offHighLegacyBoundaryPct: -6 }))
+  })
+})
+
+describe('H4B candidate identity — collision safety (STEP 2)', () => {
+  const key = (o: { symbol?: string; ep?: string; bs?: number | null; be?: number | null; cfg?: string }) =>
+    canonicalCandidateKey({ symbol: o.symbol ?? 'AAA', leaderEpisodeId: o.ep ?? 'ep-1', baseStartAt: o.bs ?? 100, baseEndAt: o.be ?? 200, experimentConfigHash: o.cfg ?? 'cfg' })
+
+  it('A. identical structural key → dedup (same canonical key)', () => {
+    expect(key({})).toBe(key({}))
+  })
+  it('C. different base → NOT dedup (distinct canonical key)', () => {
+    expect(key({ bs: 100 })).not.toBe(key({ bs: 500 }))
+    expect(key({ be: 200 })).not.toBe(key({ be: 600 }))
+  })
+  it('D. different leaderEpisode → NOT dedup', () => {
+    expect(key({ ep: 'ep-1' })).not.toBe(key({ ep: 'ep-2' }))
+  })
+  it('E. a shared compact display id can NEVER merge candidates with different canonical keys', () => {
+    // The compact FNV id is display-only; dedup compares the canonical key. Even if two events were
+    // forced to share a shadowCandidateId, their canonical keys differ → a canonical-key dedup keeps both.
+    const kA = key({ bs: 100 }), kB = key({ bs: 999 })
+    expect(kA).not.toBe(kB)
+    const seen = new Map<string, string>()
+    for (const [id, ck] of [['lc-COLLIDE', kA], ['lc-COLLIDE', kB]] as const) {
+      if (!seen.has(ck)) seen.set(ck, id)   // dedup by CANONICAL KEY, not the (colliding) display id
+    }
+    expect(seen.size).toBe(2)               // both retained despite the shared display id
+  })
+  it('shadowCandidateId is the FNV of the canonical key (display only)', () => {
+    const args = { symbol: 'AAA', leaderEpisodeId: 'ep-1', baseStartAt: 100, baseEndAt: 200, experimentConfigHash: 'cfg' }
+    expect(shadowCandidateId(args)).toBe(`lc-${(() => { const s = canonicalCandidateKey(args); let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) } return (h >>> 0).toString(16).padStart(8, '0') })()}`)
   })
 
   it('deriveBaseRelationship never infers a verdict BASE did not make', () => {
