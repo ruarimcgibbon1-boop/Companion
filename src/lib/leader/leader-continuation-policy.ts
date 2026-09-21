@@ -10,9 +10,25 @@
  * trial. It is NOT proven profitability, NOT live-money approval, and NOT automatic execution.
  * No decision state grants PaperExecutor access.
  */
-import { experimentConfigHash, DEFAULT_LEADER_CONTINUATION_CONFIG } from './leader-continuation'
+import { experimentConfigHash, DEFAULT_LEADER_CONTINUATION_CONFIG, type BaseRelationship } from './leader-continuation'
 
-export const DECISION_POLICY_VERSION = 'h4b-decision-1'
+// v2 (pre-collection): makes the decision-population definitions machine-exact (additive
+// BASE-relationship set, censor-rate denominator, concentration denominator). No numerical threshold
+// changed. The prior policy `h4b-decision-1` had ZERO collected data.
+export const DECISION_POLICY_VERSION = 'h4b-decision-2'
+
+/**
+ * The EXACT additive population: candidates BASE missed/rejected, PLUS symbols BASE never monitored.
+ * `BASE_PASSED` and `UNKNOWN` are excluded (an additive claim requires a definite non-pass BASE fact).
+ */
+export const ADDITIVE_BASE_RELATIONSHIPS: readonly BaseRelationship[] = [
+  'BASE_VETO_OFF_HIGH', 'BASE_VETO_GRADE', 'BASE_VETO_OTHER',
+  'BASE_TRIGGER_BELOW_TRACKING_FLOOR', 'BASE_MONITORED_NO_TRIGGER',
+  'NOT_IN_BASE_MONITORED_UNIVERSE',
+] as const
+export function isAdditiveBaseRelationship(rel: BaseRelationship): boolean {
+  return ADDITIVE_BASE_RELATIONSHIPS.includes(rel)
+}
 
 export interface H4BDecisionPolicy {
   version: string
@@ -26,8 +42,13 @@ export interface H4BDecisionPolicy {
   regimeCondition: 'DESCRIPTIVE_ONLY'
   // Research-integrity gate.
   maxCensorOrDegradedRatePct: number
-  // Additive population = BASE-missed/rejected OR NOT_IN_BASE_MONITORED_UNIVERSE.
+  // Additive population = the EXACT BaseRelationship set in `additiveBaseRelationships`.
+  additiveBaseRelationships: readonly BaseRelationship[]
   additiveMinimum: { candidates: number; symbolDays: number }
+  // Exact denominators (no prose ambiguity for a later analyst).
+  censorRateNumerator: 'NOT_SCORABLE_AT_PRIMARY_15M_WINDOW'
+  censorRateDenominator: 'ALL_OFFICIAL_DISTINCT_CANDIDATE_EPISODES'
+  concentrationDenominator: 'ADDITIVE_POPULATION_SCORABLE_EPISODES_15M'
   // Bounded-risk gate at the pre-registered primary window.
   primaryPromotionWindowMin: 15
   gate: {
@@ -56,7 +77,11 @@ export const H4B_DECISION_POLICY: H4BDecisionPolicy = {
   collectionMinimum: { candidates: 150, symbolDays: 40, sessions: 10 },
   regimeCondition: 'DESCRIPTIVE_ONLY',
   maxCensorOrDegradedRatePct: 10,
+  additiveBaseRelationships: ADDITIVE_BASE_RELATIONSHIPS,
   additiveMinimum: { candidates: 40, symbolDays: 15 },
+  censorRateNumerator: 'NOT_SCORABLE_AT_PRIMARY_15M_WINDOW',
+  censorRateDenominator: 'ALL_OFFICIAL_DISTINCT_CANDIDATE_EPISODES',
+  concentrationDenominator: 'ADDITIVE_POPULATION_SCORABLE_EPISODES_15M',
   primaryPromotionWindowMin: 15,
   gate: {
     medianProspectiveMfeRAtLeast: 0.50,
@@ -87,9 +112,12 @@ export function decisionPolicyCanonical(p: H4BDecisionPolicy): string {
     'h4b-decision', `v=${p.version}`, `path=${p.promotionPath}`,
     `min=${p.collectionMinimum.candidates}/${p.collectionMinimum.symbolDays}/${p.collectionMinimum.sessions}`,
     `regime=${p.regimeCondition}`, `censorMax=${p.maxCensorOrDegradedRatePct}`,
+    `censorNum=${p.censorRateNumerator}`, `censorDen=${p.censorRateDenominator}`,
+    `add=${[...p.additiveBaseRelationships].join(',')}`,
     `addMin=${p.additiveMinimum.candidates}/${p.additiveMinimum.symbolDays}`, `win=${p.primaryPromotionWindowMin}`,
     `mfeR>=${g.medianProspectiveMfeRAtLeast}`, `maeR>${g.medianProspectiveMaeRGreaterThan}`,
     `r1>=${g.oneRBeforeInvalidationRateAtLeast}`, `asym=${g.asymmetryRequired}`, `conc<=${g.maxSingleSymbolDaySharePct}`,
+    `concDen=${p.concentrationDenominator}`,
     `offHigh=${p.offHighComparison}`, `offHighGate=${p.globalOffHighIsCandidateGate}`,
     `autoExec=${p.automaticExecution}`, `start=${p.officialCollectionStartStatus}`,
     `expCfg=${p.experimentConfigHash}`,
