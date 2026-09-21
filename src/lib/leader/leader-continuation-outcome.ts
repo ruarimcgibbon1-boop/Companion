@@ -2,22 +2,26 @@
  * H4B — LEADER_CONTINUATION causal outcome evaluator (PURE / research-only).
  *
  * Consumes a frozen `ShadowCandidateEvent` + the H4B-PREP 1m tape and computes descriptive
- * causal outcomes over the pre-registered 5m/15m/30m windows. It is runnable only AFTER the
- * horizon has elapsed; it NEVER runs inside candidate generation and NEVER trades.
+ * PROSPECTIVE outcomes over the pre-registered 5m/15m/30m windows. Runnable only AFTER the horizon
+ * has elapsed; never inside candidate generation; never trades.
  *
- * Load-bearing integrity contracts (H4B STEP 13–18):
- *   - NO LOOKAHEAD: bars are reconstructed with the causal tape contract (`barsAsKnownAt`)
- *     as-of an explicit evaluation time; a future revision cannot alter candidate-time facts.
- *   - TERMINAL CAUSALITY: once `low <= invalidationPrice`, the primary path TERMINATES. No later
- *     bar may improve MFE / success / time-to-R. Post-terminal upside is recorded ONLY as an
- *     explicitly-labelled COUNTERFACTUAL, never as primary credit.
- *   - SAME-BAR AMBIGUITY: if one bar breaches invalidation AND reaches a new favourable
- *     threshold, order is unknown → `AMBIGUOUS_SAME_BAR`: the favourable threshold is NOT
- *     credited, terminal invalidation is recorded at that bar, MFE is taken through the prior
- *     completed bar, and that bar's high/low are retained separately for diagnostics.
- *   - TAPE COMPLETENESS: COMPLETE → primary-eligible; DEGRADED_COMPLETE/INCOMPLETE/CONTINUED →
- *     not primary-eligible (recorded, censored). Missing/uncertifiable interval → UNSCORABLE,
- *     never scored as zero.
+ * TWO CLOCKS, TWO PRICES (H4B red-team §3/§4/§6 — load-bearing):
+ *   - STRUCTURAL level (fixed at candidate emission): structuralBreakoutPrice = base.high,
+ *     structuralInvalidationPrice = base.low, structuralRiskUnit = base.high − base.low.
+ *   - PROSPECTIVE outcome (measured post-observation): the primary outcome starts at
+ *     `primaryOutcomeStart` = the FIRST closed 1m bar at/after `candidateObservedAt`; its close is
+ *     `outcomeReferencePrice`. Every prospective metric is measured over bars STRICTLY AFTER that
+ *     start bar, from `outcomeReferencePrice`, normalized by the structural risk unit. Therefore:
+ *       • a price move BEFORE candidate observation earns ZERO prospective credit;
+ *       • an invalidation BEFORE observation cannot terminate the prospective path;
+ *       • +kR reached before observation cannot be credited.
+ *   Prospective metrics are named `prospective*` and are NEVER mixed with the structural level.
+ *
+ * TERMINAL CAUSALITY: once low ≤ structuralInvalidationPrice (post-start), the primary path
+ *   terminates; later bars are COUNTERFACTUAL only. SAME-BAR AMBIGUITY: a bar breaching invalidation
+ *   that also reaches a new favourable threshold → AMBIGUOUS_SAME_BAR (no credit; MFE through prior
+ *   bar). NO LOOKAHEAD: bars via `barsAsKnownAt(asOfMs)`; a later revision cannot alter an earlier
+ *   as-of replay. TAPE COMPLETENESS: only COMPLETE is primary-eligible.
  *
  * No imports from executor/broker/risk/arbitration.
  */
@@ -31,6 +35,7 @@ export type WindowTerminalState =
   | 'HORIZON'
   | '30M_HORIZON'
   | 'INSUFFICIENT_TAPE'
+  | 'NO_OUTCOME_START_BAR'
   | 'DATA_GAP'
   | 'TAPE_INCOMPLETE'
 
@@ -38,13 +43,14 @@ export interface WindowOutcome {
   windowMin: number
   scorable: boolean
   terminalState: WindowTerminalState
-  causalMfePct: number | null
-  causalMaePct: number | null
-  causalMfeR: number | null
-  causalMaeR: number | null
-  timeTo0_5RSec: number | null
-  timeTo1RSec: number | null
-  timeTo2RSec: number | null
+  // PROSPECTIVE (post-observation) metrics — measured from outcomeReferencePrice, normalized by the structural R.
+  prospectiveMfePct: number | null
+  prospectiveMaePct: number | null
+  prospectiveMfeR: number | null
+  prospectiveMaeR: number | null
+  prospectiveTimeTo0_5RSec: number | null
+  prospectiveTimeTo1RSec: number | null
+  prospectiveTimeTo2RSec: number | null
   invalidationHit: boolean
   timeToInvalidationSec: number | null
   ambiguousSameBar: boolean
@@ -58,13 +64,20 @@ export interface WindowOutcome {
 
 export interface CandidateOutcome {
   shadowCandidateId: string
+  canonicalCandidateKey: string
   symbol: string
-  referencePrice: number
-  invalidationPrice: number
-  riskUnitPrice: number
   candidateObservedAt: string
+  // structural level (from candidate emission)
+  structuralBreakoutPrice: number
+  structuralInvalidationPrice: number
+  structuralRiskUnit: number
+  // prospective outcome anchors (from the tape, post-observation)
+  primaryOutcomeStartSec: number | null
+  outcomeReferencePrice: number | null
+  // how far ABOVE the structural breakout the candidate already traded at observation (diagnostic; NOT credit)
+  structuralExtensionAtObsPct: number | null
   tapeCompleteness: TapeCompleteness
-  primaryEligible: boolean         // tape COMPLETE (else recorded but censored from primary efficacy)
+  primaryEligible: boolean            // tape COMPLETE AND a closed outcome-start bar exists
   windows: WindowOutcome[]
   barsAvailableAfterAnchor: number
 }
@@ -72,32 +85,26 @@ export interface CandidateOutcome {
 const SECOND = 1000
 const MINUTE = 60 * SECOND
 const BAR_SEC = 60
-const GAP_TOL_SEC = 2 * BAR_SEC   // a >2-minute jump between adjacent 1m bars = a data gap
+const GAP_TOL_SEC = 2 * BAR_SEC
 
-/** True when the tape verdict permits PRIMARY efficacy scoring. */
 export function tapePrimaryEligible(c: TapeCompleteness): boolean {
   return c === 'COMPLETE'
 }
 
-/**
- * Compute the causal outcome for one candidate. `tapeEvents` are the parsed tape events for this
- * symbol (from parseTape). `asOfMs` is the evaluation time (default: after the last observed bar),
- * used for the causal `barsAsKnownAt` reconstruction — future revisions past this point are invisible.
- */
 export function evaluateCandidateOutcome(
   candidate: ShadowCandidateEvent,
   tapeEvents: TapeEvent[],
   opts: { tapeCompleteness: TapeCompleteness; asOfMs?: number; windowsMin?: number[] },
 ): CandidateOutcome {
   const symbol = candidate.symbol
-  const reference = candidate.referencePrice
-  const invalid = candidate.invalidationPrice
-  const R = candidate.riskUnitPrice
+  const structuralBreakoutPrice = candidate.referencePrice     // base.high
+  const structuralInvalidationPrice = candidate.invalidationPrice // base.low
+  const R = candidate.riskUnitPrice                            // base.high - base.low
   const anchorMs = Date.parse(candidate.candidateObservedAt)
   const windows = opts.windowsMin ?? [5, 15, 30]
-  const primaryEligible = tapePrimaryEligible(opts.tapeCompleteness)
+  const tapeOk = tapePrimaryEligible(opts.tapeCompleteness)
 
-  // Evaluation time: default just past the last observation so the whole horizon is visible.
+  // outcomeEvaluationAsOf: default just past the last observation so the whole horizon is visible.
   let maxObs = anchorMs
   for (const e of tapeEvents) {
     const raw = (e as Record<string, unknown>).observedAtMs
@@ -106,73 +113,87 @@ export function evaluateCandidateOutcome(
   }
   const asOfMs = opts.asOfMs ?? maxObs + 1
 
-  // Causal reconstruction: bars as Companion knew them by asOfMs. NO LOOKAHEAD past asOfMs.
+  // Causal reconstruction (NO LOOKAHEAD past asOfMs).
   const allBars = barsAsKnownAt(tapeEvents, symbol, asOfMs)
-  // Post-anchor path (strictly after the candidate observation), chronological.
-  const postBars = allBars.filter(b => b.time * SECOND > anchorMs).sort((a, b) => a.time - b.time)
+  const sorted = allBars.slice().sort((a, b) => a.time - b.time)
 
-  const windowsOut = windows.map(w => scanWindow(postBars, anchorMs, w, reference, invalid, R, primaryEligible, opts.tapeCompleteness))
+  // FROZEN primary outcome origin: the FIRST bar at/after candidateObservedAt is the outcome-start bar;
+  // its close is the causally-knowable outcome reference. Prospective path = bars STRICTLY AFTER it.
+  const startBar = sorted.find(b => b.time * SECOND >= anchorMs) ?? null
+  const outcomeReferencePrice = startBar ? startBar.close : null
+  const primaryOutcomeStartSec = startBar ? startBar.time : null
+  const postStart = startBar ? sorted.filter(b => b.time > startBar.time) : []
+  const structuralExtensionAtObsPct = outcomeReferencePrice != null && structuralBreakoutPrice > 0
+    ? ((outcomeReferencePrice - structuralBreakoutPrice) / structuralBreakoutPrice) * 100 : null
+
+  const primaryEligible = tapeOk && startBar !== null
+  const windowsOut = windows.map(w =>
+    scanWindow(postStart, startBar, w, outcomeReferencePrice, structuralInvalidationPrice, R, primaryEligible, opts.tapeCompleteness))
 
   return {
     shadowCandidateId: candidate.shadowCandidateId,
+    canonicalCandidateKey: candidate.canonicalCandidateKey,
     symbol,
-    referencePrice: reference,
-    invalidationPrice: invalid,
-    riskUnitPrice: R,
     candidateObservedAt: candidate.candidateObservedAt,
+    structuralBreakoutPrice, structuralInvalidationPrice, structuralRiskUnit: R,
+    primaryOutcomeStartSec, outcomeReferencePrice, structuralExtensionAtObsPct,
     tapeCompleteness: opts.tapeCompleteness,
     primaryEligible,
     windows: windowsOut,
-    barsAvailableAfterAnchor: postBars.length,
+    barsAvailableAfterAnchor: postStart.length,
+  }
+}
+
+function emptyWindow(windowMin: number, terminal: WindowTerminalState, barsInWindow: number): WindowOutcome {
+  return {
+    windowMin, scorable: false, terminalState: terminal,
+    prospectiveMfePct: null, prospectiveMaePct: null, prospectiveMfeR: null, prospectiveMaeR: null,
+    prospectiveTimeTo0_5RSec: null, prospectiveTimeTo1RSec: null, prospectiveTimeTo2RSec: null,
+    invalidationHit: false, timeToInvalidationSec: null,
+    ambiguousSameBar: false, ambiguousBarHigh: null, ambiguousBarLow: null,
+    counterfactualPostTerminalMfePct: null, counterfactualPostTerminalMaxPct: null,
+    barsInWindow,
   }
 }
 
 function scanWindow(
-  postBars: Candle[], anchorMs: number, windowMin: number,
-  reference: number, invalid: number, R: number,
+  postStart: Candle[], startBar: Candle | null, windowMin: number,
+  reference: number | null, invalid: number, R: number,
   primaryEligible: boolean, completeness: TapeCompleteness,
 ): WindowOutcome {
-  const windowEndMs = anchorMs + windowMin * MINUTE
-  const bars = postBars.filter(b => b.time * SECOND <= windowEndMs)
-  const lastAvailMs = postBars.length ? postBars[postBars.length - 1].time * SECOND : anchorMs
+  if (startBar === null || reference === null) return emptyWindow(windowMin, 'NO_OUTCOME_START_BAR', 0)
+  if (!Number.isFinite(reference) || !(R > 0)) return emptyWindow(windowMin, 'DATA_GAP', 0)
+  if (completeness === 'INCOMPLETE' || completeness === 'CONTINUED') return emptyWindow(windowMin, 'TAPE_INCOMPLETE', 0)
 
-  const base: WindowOutcome = {
-    windowMin, scorable: false, terminalState: 'INSUFFICIENT_TAPE',
-    causalMfePct: null, causalMaePct: null, causalMfeR: null, causalMaeR: null,
-    timeTo0_5RSec: null, timeTo1RSec: null, timeTo2RSec: null,
-    invalidationHit: false, timeToInvalidationSec: null,
-    ambiguousSameBar: false, ambiguousBarHigh: null, ambiguousBarLow: null,
-    counterfactualPostTerminalMfePct: null, counterfactualPostTerminalMaxPct: null,
-    barsInWindow: bars.length,
-  }
-  if (!Number.isFinite(reference) || !(R > 0)) { base.terminalState = 'DATA_GAP'; return base }
-  if (completeness === 'INCOMPLETE' || completeness === 'CONTINUED') { base.terminalState = 'TAPE_INCOMPLETE'; return base }
+  const startSec = startBar.time
+  const startMs = startSec * SECOND
+  const windowEndMs = startMs + windowMin * MINUTE
+  const bars = postStart.filter(b => b.time * SECOND <= windowEndMs)
+  const lastAvailMs = postStart.length ? postStart[postStart.length - 1].time * SECOND : startMs
 
+  const out = emptyWindow(windowMin, 'INSUFFICIENT_TAPE', bars.length)
   const thr = (k: number) => reference + k * R
-  let mfeHigh = -Infinity   // max high over bars STRICTLY BEFORE any terminal invalidation bar
-  let maeLow = Infinity     // min low over bars up to and including the terminal bar
+  let mfeHigh = -Infinity, maeLow = Infinity
   let t05: number | null = null, t1: number | null = null, t2: number | null = null
   let terminalIdx = -1
   let terminalState: WindowTerminalState | null = null
   let ambiguous = false, ambHigh: number | null = null, ambLow: number | null = null
   let gapBefore = false
+  let prevTime: number | null = startSec
 
-  let prevTime: number | null = null
   for (let i = 0; i < bars.length; i++) {
     const b = bars[i]
     if (prevTime !== null && b.time - prevTime > GAP_TOL_SEC) { gapBefore = true; terminalIdx = i - 1; terminalState = 'DATA_GAP'; break }
     prevTime = b.time
-    const invalHit = b.low <= invalid
-    if (invalHit) {
+    const tSec = Math.round((b.time * SECOND - startMs) / SECOND)
+    if (b.low <= invalid) {
       const newFav = (b.high >= thr(0.5) && t05 === null) || (b.high >= thr(1) && t1 === null) || (b.high >= thr(2) && t2 === null)
       if (newFav) { ambiguous = true; ambHigh = b.high; ambLow = b.low }
-      maeLow = Math.min(maeLow, b.low)   // the invalidation bar's low IS part of the adverse path
+      maeLow = Math.min(maeLow, b.low)
       terminalIdx = i
       terminalState = ambiguous ? 'AMBIGUOUS_SAME_BAR' : 'INVALIDATION'
       break
     }
-    // No invalidation this bar → credit favourable thresholds (pre-terminal) + extend MFE/MAE.
-    const tSec = Math.round((b.time * SECOND - anchorMs) / SECOND)
     if (t05 === null && b.high >= thr(0.5)) t05 = tSec
     if (t1 === null && b.high >= thr(1)) t1 = tSec
     if (t2 === null && b.high >= thr(2)) t2 = tSec
@@ -180,17 +201,15 @@ function scanWindow(
     maeLow = Math.min(maeLow, b.low)
   }
 
-  // Resolve terminal / coverage.
   if (terminalState === null) {
-    if (lastAvailMs < windowEndMs) { base.terminalState = 'INSUFFICIENT_TAPE'; base.scorable = false; return finalize(base, mfeHigh, maeLow, reference, R, t05, t1, t2, false, null, false, null, null, null, null) }
+    if (lastAvailMs < windowEndMs) { out.terminalState = 'INSUFFICIENT_TAPE'; out.scorable = false; fill(out, mfeHigh, maeLow, reference, R, t05, t1, t2, false, null, false, null, null, null, null); return out }
     terminalState = windowMin >= 30 ? '30M_HORIZON' : 'HORIZON'
   }
 
   const invalidationHit = terminalState === 'INVALIDATION' || terminalState === 'AMBIGUOUS_SAME_BAR'
   const terminalBar = terminalIdx >= 0 ? bars[terminalIdx] : null
-  const timeToInvalidationSec = invalidationHit && terminalBar ? Math.round((terminalBar.time * SECOND - anchorMs) / SECOND) : null
+  const timeToInvalidationSec = invalidationHit && terminalBar ? Math.round((terminalBar.time * SECOND - startMs) / SECOND) : null
 
-  // Counterfactual (post-terminal upside) — diagnosis only, never primary credit.
   let cfMfePct: number | null = null, cfMaxPct: number | null = null
   if (invalidationHit && terminalIdx >= 0) {
     let cfHigh = -Infinity
@@ -198,35 +217,32 @@ function scanWindow(
     if (cfHigh > -Infinity) { cfMfePct = ((cfHigh - reference) / reference) * 100; cfMaxPct = cfHigh }
   }
 
-  const scorable = primaryEligible && terminalState !== 'DATA_GAP' && !gapBefore
-  const out = finalize(base, mfeHigh, maeLow, reference, R, t05, t1, t2, invalidationHit, timeToInvalidationSec, ambiguous, ambHigh, ambLow, cfMfePct, cfMaxPct)
   out.terminalState = terminalState
-  out.scorable = scorable
+  out.scorable = primaryEligible && terminalState !== 'DATA_GAP' && !gapBefore
+  fill(out, mfeHigh, maeLow, reference, R, t05, t1, t2, invalidationHit, timeToInvalidationSec, ambiguous, ambHigh, ambLow, cfMfePct, cfMaxPct)
   return out
 }
 
-function finalize(
-  base: WindowOutcome, mfeHigh: number, maeLow: number, reference: number, R: number,
+function fill(
+  o: WindowOutcome, mfeHigh: number, maeLow: number, reference: number, R: number,
   t05: number | null, t1: number | null, t2: number | null,
   invalidationHit: boolean, timeToInvalidationSec: number | null,
   ambiguous: boolean, ambHigh: number | null, ambLow: number | null,
   cfMfePct: number | null, cfMaxPct: number | null,
-): WindowOutcome {
-  const mfeValid = mfeHigh > -Infinity
-  const maeValid = maeLow < Infinity
-  base.causalMfePct = mfeValid ? ((mfeHigh - reference) / reference) * 100 : null
-  base.causalMaePct = maeValid ? ((maeLow - reference) / reference) * 100 : null
-  base.causalMfeR = mfeValid ? (mfeHigh - reference) / R : null
-  base.causalMaeR = maeValid ? (maeLow - reference) / R : null
-  base.timeTo0_5RSec = t05
-  base.timeTo1RSec = t1
-  base.timeTo2RSec = t2
-  base.invalidationHit = invalidationHit
-  base.timeToInvalidationSec = timeToInvalidationSec
-  base.ambiguousSameBar = ambiguous
-  base.ambiguousBarHigh = ambHigh
-  base.ambiguousBarLow = ambLow
-  base.counterfactualPostTerminalMfePct = cfMfePct
-  base.counterfactualPostTerminalMaxPct = cfMaxPct
-  return base
+): void {
+  const mfeValid = mfeHigh > -Infinity, maeValid = maeLow < Infinity
+  o.prospectiveMfePct = mfeValid ? ((mfeHigh - reference) / reference) * 100 : null
+  o.prospectiveMaePct = maeValid ? ((maeLow - reference) / reference) * 100 : null
+  o.prospectiveMfeR = mfeValid ? (mfeHigh - reference) / R : null
+  o.prospectiveMaeR = maeValid ? (maeLow - reference) / R : null
+  o.prospectiveTimeTo0_5RSec = t05
+  o.prospectiveTimeTo1RSec = t1
+  o.prospectiveTimeTo2RSec = t2
+  o.invalidationHit = invalidationHit
+  o.timeToInvalidationSec = timeToInvalidationSec
+  o.ambiguousSameBar = ambiguous
+  o.ambiguousBarHigh = ambHigh
+  o.ambiguousBarLow = ambLow
+  o.counterfactualPostTerminalMfePct = cfMfePct
+  o.counterfactualPostTerminalMaxPct = cfMaxPct
 }
