@@ -1,34 +1,34 @@
 /**
- * H4B — SPEC ↔ CODE CONTRACT (STEP 8/9). One canonical definition (H4B_DEFINITION) is the single
- * source of truth; runtime behavior and the report/spec values derive from it. This test fails on any
- * behavior-affecting drift: it snapshots the frozen definition, pins the experimentConfigHash, and
- * asserts the pre-registration markdown embodies the same version/epoch/hash/gates/boundary/windows.
+ * H4B — SPEC ↔ CODE CONTRACT (STEP 8). One canonical definition (H4B_DEFINITION) + one ratified
+ * decision policy (H4B_DECISION_POLICY) are the single sources of truth. This test pins them entirely
+ * from TRACKED code — it does NOT read any file under reviews/ (an untracked deliverable) so it passes
+ * on a clean clone / CI. The review Markdown is generated to embody these values; the runtime contract
+ * lives here.
  */
 import { describe, it, expect } from 'vitest'
-import { existsSync, readFileSync } from 'fs'
-import { join } from 'path'
 import {
   H4B_DEFINITION, DEFAULT_LEADER_CONTINUATION_CONFIG, experimentConfigHash,
   EXPERIMENT_SPEC_VERSION, EXPERIMENT_EPOCH,
 } from '../src/lib/leader/leader-continuation'
-import { H4B_DECISION_POLICY, decisionPolicyHash, DECISION_POLICY_VERSION } from '../src/lib/leader/leader-continuation-policy'
+import {
+  H4B_DECISION_POLICY, decisionPolicyHash, DECISION_POLICY_VERSION, ADDITIVE_BASE_RELATIONSHIPS,
+} from '../src/lib/leader/leader-continuation-policy'
 
-// The frozen v2 fingerprint (recomputed independently below; pinned so any change is deliberate).
-const EXPECTED_CONFIG_HASH = '89e8b4e0'
-// The ratified decision-policy fingerprint (pinned so the human ratification cannot silently drift).
-const EXPECTED_DECISION_HASH = 'cc3ae918'
+// Pinned fingerprints (recomputed from the tracked objects; any change must be deliberate).
+const EXPECTED_CONFIG_HASH = '89e8b4e0'      // experiment (candidate/outcome) — MUST stay this
+const EXPECTED_DECISION_HASH = 'e3c1fe88'    // decision policy v2 (adds exact population definitions)
 
-describe('H4B spec ↔ code contract', () => {
-  it('EXPERIMENT_SPEC_VERSION / EPOCH are the frozen v2 values', () => {
+describe('H4B experiment definition — tracked contract', () => {
+  it('spec version / epoch are the frozen v2 values', () => {
     expect(EXPERIMENT_SPEC_VERSION).toBe('h4b-leadercont-2')
     expect(EXPERIMENT_EPOCH).toBe('h4b-epoch-1')
   })
 
-  it('experimentConfigHash is pinned (any behavior-affecting change must bump this deliberately)', () => {
+  it('experimentConfigHash is pinned (candidate/outcome behavior is unchanged)', () => {
     expect(experimentConfigHash(DEFAULT_LEADER_CONTINUATION_CONFIG)).toBe(EXPECTED_CONFIG_HASH)
   })
 
-  it('H4B_DEFINITION snapshot is frozen (single source of truth)', () => {
+  it('H4B_DEFINITION snapshot is frozen (gates, identity, bases, outcome origin, eligibility, windows, policies, boundary)', () => {
     expect(H4B_DEFINITION).toMatchObject({
       strategyId: 'LEADER_CONTINUATION', mode: 'shadow',
       specVersion: 'h4b-leadercont-2', epoch: 'h4b-epoch-1',
@@ -48,46 +48,26 @@ describe('H4B spec ↔ code contract', () => {
     })
   })
 
-  it('the config gates match the frozen candidate rule (no tuned magnitude thresholds)', () => {
+  it('config gates match the frozen candidate rule (no tuned magnitude thresholds)', () => {
     const c = DEFAULT_LEADER_CONTINUATION_CONFIG
     expect(c.requireTimeframe1m && c.requireStatusAvailable && c.requireBaseDetected && c.requireReExpansion && c.requirePositiveRiskUnit).toBe(true)
-    expect(c.offHighLegacyBoundaryPct).toBe(-5)   // subgroup boundary, NOT a candidate gate
+    expect(c.offHighLegacyBoundaryPct).toBe(-5)
     expect(c.primaryWindowsMin).toEqual([5, 15, 30])
-  })
-
-  it('the pre-registration markdown embodies the same version/epoch/hash/boundary/windows', () => {
-    const specPath = join(process.cwd(), 'reviews/top-mover-audit/H4B_EXPERIMENT_SPEC.md')
-    // The spec is an untracked deliverable; it must be present for the contract to be verifiable.
-    expect(existsSync(specPath), `missing ${specPath}`).toBe(true)
-    const md = readFileSync(specPath, 'utf8')
-    expect(md).toContain('h4b-leadercont-2')
-    expect(md).toContain('h4b-epoch-1')
-    expect(md).toContain(EXPECTED_CONFIG_HASH)
-    expect(md).toContain('OFF_HIGH_LEGACY')
-    expect(md).toMatch(/-5/)
-    expect(md).toMatch(/5m|5 ?min/); expect(md).toMatch(/15m|15 ?min/); expect(md).toMatch(/30m|30 ?min/)
-    expect(md).toContain('BASE_HIGH'); expect(md).toContain('BASE_LOW')
-    // structural vs prospective separation must be documented
-    expect(md).toMatch(/outcomeReferencePrice|OUTCOME REFERENCE|prospective/i)
-    // ratified + ready, not yet started
-    expect(md).toContain('RATIFIED')
-    expect(md).toMatch(/READY_NOT_STARTED|READY FOR PROSPECTIVE COLLECTION/)
-    expect(md).toMatch(/COLLECTION NOT YET STARTED|not.*started/i)
   })
 })
 
-describe('H4B ratified decision policy — pinned (STEP 6)', () => {
-  it('decision-policy version + hash are pinned (human ratification cannot silently drift)', () => {
-    expect(DECISION_POLICY_VERSION).toBe('h4b-decision-1')
+describe('H4B ratified decision policy — tracked contract (STEP 6/2)', () => {
+  it('decision-policy version + hash are pinned (ratification cannot silently drift)', () => {
+    expect(DECISION_POLICY_VERSION).toBe('h4b-decision-2')
     expect(decisionPolicyHash()).toBe(EXPECTED_DECISION_HASH)
   })
 
-  it('the ratified policy is Path A + the exact frozen minimums and gates', () => {
+  it('policy is Path A + the exact frozen minimums and gates', () => {
     expect(H4B_DECISION_POLICY).toMatchObject({
       ratified: true,
       promotionPath: 'A_CONFIRMATORY_EPOCH_1',
       officialCollectionStartStatus: 'READY_NOT_STARTED',
-      experimentConfigHash: EXPECTED_CONFIG_HASH,     // binds the policy to the exact experiment
+      experimentConfigHash: EXPECTED_CONFIG_HASH,
       collectionMinimum: { candidates: 150, symbolDays: 40, sessions: 10 },
       regimeCondition: 'DESCRIPTIVE_ONLY',
       maxCensorOrDegradedRatePct: 10,
@@ -105,21 +85,27 @@ describe('H4B ratified decision policy — pinned (STEP 6)', () => {
     })
   })
 
+  it('B. the additive population is an EXACT BaseRelationship set (no prose ambiguity)', () => {
+    expect([...ADDITIVE_BASE_RELATIONSHIPS].sort()).toEqual([
+      'BASE_MONITORED_NO_TRIGGER', 'BASE_TRIGGER_BELOW_TRACKING_FLOOR',
+      'BASE_VETO_GRADE', 'BASE_VETO_OFF_HIGH', 'BASE_VETO_OTHER',
+      'NOT_IN_BASE_MONITORED_UNIVERSE',
+    ])
+    // BASE_PASSED and UNKNOWN are NOT additive.
+    expect(ADDITIVE_BASE_RELATIONSHIPS.includes('BASE_PASSED' as never)).toBe(false)
+    expect(ADDITIVE_BASE_RELATIONSHIPS.includes('UNKNOWN' as never)).toBe(false)
+    expect(H4B_DECISION_POLICY.additiveBaseRelationships).toEqual(ADDITIVE_BASE_RELATIONSHIPS)
+  })
+
+  it('C/D. censor-rate and concentration denominators are pinned explicitly', () => {
+    expect(H4B_DECISION_POLICY.censorRateNumerator).toBe('NOT_SCORABLE_AT_PRIMARY_15M_WINDOW')
+    expect(H4B_DECISION_POLICY.censorRateDenominator).toBe('ALL_OFFICIAL_DISTINCT_CANDIDATE_EPISODES')
+    expect(H4B_DECISION_POLICY.concentrationDenominator).toBe('ADDITIVE_POPULATION_SCORABLE_EPISODES_15M')
+  })
+
   it('PASS means constrained-paper eligibility only; no state grants automatic execution', () => {
     expect(H4B_DECISION_POLICY.decisionStates.PASS).toMatch(/constrained PAPER/i)
     expect(H4B_DECISION_POLICY.decisionStates.PASS).toMatch(/NOT live money|NOT automatic/i)
     expect(H4B_DECISION_POLICY.automaticExecution).toBe(false)
-  })
-
-  it('the pre-registration markdown embodies the ratified policy values', () => {
-    const specPath = join(process.cwd(), 'reviews/top-mover-audit/H4B_EXPERIMENT_SPEC.md')
-    if (!existsSync(specPath)) throw new Error(`missing ${specPath}`)
-    const md = readFileSync(specPath, 'utf8')
-    expect(md).toContain('h4b-decision-1')
-    expect(md).toContain(EXPECTED_DECISION_HASH)
-    expect(md).toContain('A — CONFIRMATORY EPOCH 1')
-    expect(md).toMatch(/150/); expect(md).toMatch(/40/); expect(md).toMatch(/15m/)
-    expect(md).toMatch(/0\.50R|0\.5R/); expect(md).toMatch(/-0\.75R/); expect(md).toMatch(/40%/); expect(md).toMatch(/20%/)
-    expect(md).toMatch(/constrained.*paper/i)
   })
 })
