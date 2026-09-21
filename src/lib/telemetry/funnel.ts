@@ -60,6 +60,8 @@ export type FunnelEventType =
   | 'local_structure_changed'   // H4A: the symbol's resetState / data-quality status changed since last sweep
   | 'leader_observation_cohort' // H4A.1: per-sweep bounded observational leader cohort (selection + cap + provenance)
   | 'leader_observation_data'   // H4A.1: per-symbol observational data coverage for a cohort member (no bar arrays)
+  | 'leader_continuation_state'     // H4B: per-symbol reason-coded shadow funnel state (no candidate produced)
+  | 'leader_continuation_candidate' // H4B: a distinct LEADER_CONTINUATION shadow candidate (structural; no bar arrays)
 
 export type GateResult = 'PASS' | 'FAIL' | 'NOT_APPLICABLE'
 
