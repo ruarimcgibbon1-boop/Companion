@@ -18,8 +18,43 @@ import type { LifecycleState, LeaderRole } from './leader-state'
 
 export const H4B_STRATEGY_ID = 'LEADER_CONTINUATION' as const
 export const H4B_MODE = 'shadow' as const
-export const EXPERIMENT_SPEC_VERSION = 'h4b-leadercont-1'
+// v2 (pre-collection correction): identity is collision-safe via a canonical structural key; the
+// structural breakout level and the PROSPECTIVE outcome reference are separated; the primary outcome
+// time origin + closed-bar eligibility are frozen; all fold into experimentConfigHash. No epoch data
+// ever existed under the superseded v1 hash (540c6bd6). No candidate GATE/threshold changed.
+export const EXPERIMENT_SPEC_VERSION = 'h4b-leadercont-2'
 export const EXPERIMENT_EPOCH = 'h4b-epoch-1'
+
+/**
+ * FROZEN experiment definition — the SINGLE source of truth from which runtime behavior, the config
+ * hash, and the report/spec values all derive. A behavior-affecting change here changes the hash and
+ * MUST be accompanied by a spec update (enforced by the spec↔code contract test).
+ */
+export const H4B_DEFINITION = {
+  strategyId: H4B_STRATEGY_ID,
+  mode: H4B_MODE,
+  specVersion: EXPERIMENT_SPEC_VERSION,
+  epoch: EXPERIMENT_EPOCH,
+  // candidate gates (structural; NOT tuned from outcomes)
+  gates: ['leaderEpisodePresent', 'lifecycleNotExpired', 'timeframe1m', 'statusAvailable', 'baseDetected', 'reExpansionObserved', 'positiveRiskUnit'] as const,
+  // candidate identity fields (stable base-episode anchors). A genuinely distinct later re-expansion
+  // manifests in the H4A model as a NEW base (new baseStartAt/baseEndAt) → a new candidate. A drifting
+  // re-expansion timestamp is deliberately NOT in the identity (it would break same-structure dedup).
+  identityFields: 'symbol|leaderEpisodeId|baseStartAt|baseEndAt' as const,
+  identityVersion: 'lc-id-2' as const,
+  // reference / invalidation / risk
+  structuralBreakoutBasis: 'BASE_HIGH' as const,
+  invalidationBasis: 'BASE_LOW' as const,
+  riskUnitBasis: 'BASE_HIGH_MINUS_BASE_LOW' as const,
+  // PROSPECTIVE outcome causal anchors (separate from the structural level)
+  outcomeReferenceBasis: 'FIRST_CLOSED_BAR_CLOSE_AT_OR_AFTER_CANDIDATE_OBSERVED_AT' as const,
+  primaryOutcomeStartRule: 'FIRST_BAR_STRICTLY_AFTER_PRIMARY_START_BAR' as const,
+  closedBarEligibility: 'PRIMARY_REQUIRES_CLOSED_START_BAR' as const,
+  windowsMin: [5, 15, 30] as const,
+  terminalPolicy: 'INVALIDATION_TERMINATES_PRIMARY' as const,
+  sameBarPolicy: 'CONSERVATIVE_AMBIGUOUS_NO_CREDIT' as const,
+  offHighLegacyBoundaryPct: -5,
+} as const
 
 // ── Config (every candidate-affecting value is fingerprinted) ────────────────────
 
@@ -56,11 +91,17 @@ function fnv1a(s: string): string {
   return (h >>> 0).toString(16).padStart(8, '0')
 }
 export function leaderContinuationConfigCanonical(c: LeaderContinuationConfig): string {
+  const d = H4B_DEFINITION
   return [
     'h4b', `v=${c.version}`, `epoch=${c.epoch}`,
     `tf1m=${c.requireTimeframe1m}`, `avail=${c.requireStatusAvailable}`,
     `base=${c.requireBaseDetected}`, `reexp=${c.requireReExpansion}`, `posR=${c.requirePositiveRiskUnit}`,
     `offHighLegacy=${c.offHighLegacyBoundaryPct}`, `windows=${c.primaryWindowsMin.join(',')}`,
+    // v2: fold every behavior-affecting definitional choice into the fingerprint.
+    `idFields=${d.identityFields}`, `idVer=${d.identityVersion}`,
+    `breakout=${d.structuralBreakoutBasis}`, `invalid=${d.invalidationBasis}`, `riskUnit=${d.riskUnitBasis}`,
+    `outRef=${d.outcomeReferenceBasis}`, `outStart=${d.primaryOutcomeStartRule}`, `closedElig=${d.closedBarEligibility}`,
+    `terminal=${d.terminalPolicy}`, `sameBar=${d.sameBarPolicy}`,
   ].join('|')
 }
 export function experimentConfigHash(c: LeaderContinuationConfig): string {
@@ -130,7 +171,8 @@ export interface ShadowCandidateEvent {
   experimentConfigHash: string
   experimentEpoch: string
 
-  shadowCandidateId: string
+  shadowCandidateId: string          // compact display id (FNV-1a) — NOT an equality proof
+  canonicalCandidateKey: string      // full collision-safe structural identity — dedup compares THIS
   symbol: string
   leaderEpisodeId: string
   setupId: string | null
@@ -191,20 +233,33 @@ export interface ShadowCandidateEvent {
 
 // ── Identity (STEP 6) ────────────────────────────────────────────────────────────
 
-/** Deterministic structural identity: one distinct local-reset/re-expansion episode. */
-export function shadowCandidateId(input: {
+export interface CandidateIdentityInput {
   symbol: string
   leaderEpisodeId: string
   baseStartAt: number | null
   baseEndAt: number | null
   experimentConfigHash: string
-}): string {
-  const key = [
+}
+
+/**
+ * The FULL, deterministic, collision-SAFE structural identity string. Dedup equality compares THIS
+ * key directly — never the compact 32-bit display id — so a hash collision can never merge two
+ * distinct candidate episodes. One distinct base episode (symbol + leaderEpisodeId + baseStartAt +
+ * baseEndAt) is one candidate; a new base/reset or a new leaderEpisodeId is a new key.
+ */
+export function canonicalCandidateKey(input: CandidateIdentityInput): string {
+  return [
+    'lc', H4B_DEFINITION.identityVersion,
     input.symbol.toUpperCase(), input.leaderEpisodeId,
-    input.baseStartAt ?? 'na', input.baseEndAt ?? 'na',
-    input.experimentConfigHash,
+    `bs=${input.baseStartAt ?? 'na'}`, `be=${input.baseEndAt ?? 'na'}`,
+    `cfg=${input.experimentConfigHash}`,
   ].join('|')
-  return `lc-${fnv1a(key)}`
+}
+
+/** Compact, human-readable DISPLAY id (FNV-1a of the canonical key). NOT an equality proof —
+ *  dedup compares `canonicalCandidateKey`; this is only for logs/joins. */
+export function shadowCandidateId(input: CandidateIdentityInput): string {
+  return `lc-${fnv1a(canonicalCandidateKey(input))}`
 }
 
 export function offHighGroupOf(offHighPct: number | null, cfg: LeaderContinuationConfig): OffHighGroup {
@@ -268,7 +323,9 @@ export function evaluateLeaderContinuation(input: LeaderContinuationInput): Lead
   if (!Number.isFinite(riskUnitPct)) return { state: 'INVALID_GEOMETRY', candidate: null }
 
   const offHighPct = ls.global.offHighPct
-  const id = shadowCandidateId({ symbol: input.symbol, leaderEpisodeId, baseStartAt: ls.base.startAt, baseEndAt: ls.base.endAt, experimentConfigHash: cfgHash })
+  const idInput = { symbol: input.symbol, leaderEpisodeId, baseStartAt: ls.base.startAt, baseEndAt: ls.base.endAt, experimentConfigHash: cfgHash }
+  const canonicalKey = canonicalCandidateKey(idInput)
+  const id = shadowCandidateId(idInput)
 
   const candidate: ShadowCandidateEvent = {
     eventType: 'leader_continuation_candidate',
@@ -279,6 +336,7 @@ export function evaluateLeaderContinuation(input: LeaderContinuationInput): Lead
     experimentEpoch: cfg.epoch,
 
     shadowCandidateId: id,
+    canonicalCandidateKey: canonicalKey,
     symbol: input.symbol.toUpperCase(),
     leaderEpisodeId,
     setupId: input.setupId ?? null,
