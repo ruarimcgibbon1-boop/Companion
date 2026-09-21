@@ -39,6 +39,8 @@ import { updateLeaderState, etDay, resolveLeaderConfig, leaderConfigHash, type L
 import { selectLeaderObservationCohort, resolveLeaderObservationConfig, leaderObservationConfigHash, type LeaderObservationConfig } from '@/lib/leader/leader-observation'
 import { runSharedMonitorPass, shouldRefreshObservation, observationBucket, decideObservationAction, resolveObservationPassConfig, observationPassConfigHash, type ObservationPassConfig } from '@/lib/leader/observation-pass'
 import { loadLeaderState, saveLeaderState, type SaveReason, type RecoveryStatus } from '@/lib/leader/leader-store'
+// H4B — LEADER_CONTINUATION shadow candidate engine (SHADOW ONLY; pure evaluation → event, no execution path).
+import { evaluateLeaderContinuation, deriveBaseRelationship, DEFAULT_LEADER_CONTINUATION_CONFIG, experimentConfigHash, type BaseRelationship } from '@/lib/leader/leader-continuation'
 import { acquireLeaderWriterLock } from '@/lib/leader/leader-lock'
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
@@ -101,6 +103,13 @@ const leaderObsConfigHashV = leaderObservationConfigHash(leaderObsCfg)
 // H4A.1 shared-pass coordinator config: BASE-latency isolation + bar-driven observational refresh cadence.
 const obsPassCfg: ObservationPassConfig = resolveObservationPassConfig()
 const obsPassConfigHashV = observationPassConfigHash(obsPassCfg)
+// H4B — LEADER_CONTINUATION shadow experiment (SHADOW ONLY). Frozen candidate config + its fingerprint;
+// a bounded in-run dedup set so one distinct local-reset/re-expansion episode is emitted ONCE (repeated
+// 15s sweeps of the same structure are suppressed). No execution, no BASE effect.
+const h4bCfg = DEFAULT_LEADER_CONTINUATION_CONFIG
+const h4bConfigHashV = experimentConfigHash(h4bCfg)
+const h4bEmittedCandidates = new Set<string>()
+const H4B_DEDUP_CAP = 5000
 // The last 1m bar bucket the observational cohort was fetched for (bar-aligned cadence). Never gates BASE.
 let lastObsBucket: number | null = null
 // AT MOST ONE observational acquisition pass may be outstanding (red-team RT-4). A refresh tick that
@@ -328,6 +337,108 @@ function emitLeaderObservationData(
   }
 }
 
+/**
+ * H4B — per-symbol BASE relationship (SHADOW ONLY, read-only). Classifies whether/why BASE
+ * passed or vetoed this symbol from the SAME telemetry BASE already produced. A BASE verdict is
+ * never inferred for a symbol BASE did not evaluate. Aggregates a symbol's long triggers with a
+ * fixed precedence (passed > off-high veto > grade veto > other veto > below-floor > no-trigger).
+ */
+function baseRelationshipForSymbol(r: MonitorResult, monitored: boolean, priorBuys: BuySignalRecord[], now: number): BaseRelationship {
+  if (!monitored) return 'NOT_IN_BASE_MONITORED_UNIVERSE'
+  const triggers = (r.setups as DetectedSetup[]).filter(s => s.direction === 'long' && s.triggeredRaw)
+  if (triggers.length === 0) return 'BASE_MONITORED_NO_TRIGGER'
+  let belowFloor = false, offHighVeto = false, gradeVeto = false, otherVeto = false
+  for (const setup of triggers) {
+    if (!passesTrackingFloor(setup, MIN_LEVEL_STRENGTH)) { belowFloor = true; continue }
+    const { verdict } = classifyBuy(setup, r, { now, priorBuys, priorLogs: [], priorStates: [] })
+    const gd = decomposeGates(setup, r, { now, priorBuys, priorLogs: [], priorStates: [] })
+    const off = gd.gates.find(g => g.gateId === 'off_high')?.binding === true
+    const grade = gd.gates.find(g => g.gateId === 'grade_floor')?.binding === true
+    const rel = deriveBaseRelationship({
+      monitored: true, hadRawTrigger: true, passedTrackingFloor: true,
+      verdict: verdict === 'logged' ? 'logged' : 'vetoed', offHighGateBinding: off, gradeGateBinding: grade,
+    })
+    if (rel === 'BASE_PASSED') return 'BASE_PASSED'
+    if (rel === 'BASE_VETO_OFF_HIGH') offHighVeto = true
+    else if (rel === 'BASE_VETO_GRADE') gradeVeto = true
+    else otherVeto = true
+  }
+  if (offHighVeto) return 'BASE_VETO_OFF_HIGH'
+  if (gradeVeto) return 'BASE_VETO_GRADE'
+  if (otherVeto) return 'BASE_VETO_OTHER'
+  if (belowFloor) return 'BASE_TRIGGER_BELOW_TRACKING_FLOOR'
+  return 'BASE_MONITORED_NO_TRIGGER'
+}
+
+/**
+ * H4B — emit reason-coded shadow funnel states + distinct LEADER_CONTINUATION candidates.
+ * SHADOW ONLY: pure evaluation → additive funnel events. Deduped by the deterministic
+ * shadowCandidateId so one distinct local-reset/re-expansion episode is emitted once (repeated
+ * 15s sweeps of the same structure become DUPLICATE_STRUCTURE). Best-effort; a throw here can
+ * never affect BASE (called strictly downstream of the BASE await + BASE loop).
+ */
+function emitLeaderContinuationCandidates(
+  ctx: SweepContext, sweepStart: number, results: MonitorResult[],
+  opts: {
+    monitoredSet: Set<string>; universe: string[]; dayChangeRank: Map<string, number>;
+    priorBuys: BuySignalRecord[]; observationalOnly?: boolean;
+  },
+): void {
+  try {
+    const runId = ensureFunnelRunId(sweepStart)
+    for (const r of results) {
+      const rec = leaderState[r.symbol]
+      const leader = rec
+        ? { leaderEpisodeId: rec.leaderEpisodeId, lifecycleState: rec.lifecycleState, role: rec.role, historyComplete: rec.historyComplete }
+        : null
+      const monitored = opts.monitoredSet.has(r.symbol)
+      const monitoredRank = monitored ? opts.universe.indexOf(r.symbol) + 1 : null
+      const dcRank = opts.dayChangeRank.get(r.symbol) ?? null
+      const ranks = {
+        monitoredRank: monitoredRank && monitoredRank > 0 ? monitoredRank : null,
+        inBaseTop15: monitoredRank != null && monitoredRank > 0 && monitoredRank <= 15,
+        inTop30: dcRank != null ? dcRank <= 30 : null,
+        inTop60: dcRank != null ? dcRank <= 60 : null,
+      }
+      const baseRel: BaseRelationship = opts.observationalOnly
+        ? 'NOT_IN_BASE_MONITORED_UNIVERSE'
+        : baseRelationshipForSymbol(r, monitored, opts.priorBuys, sweepStart)
+      const res = evaluateLeaderContinuation({
+        symbol: r.symbol, localStructure: r.localStructure ?? null, leader,
+        baseRelationship: baseRel, ranks,
+        runId, sweepId: ctx.sweepId, nowMs: sweepStart,
+        leaderConfigHash: leaderConfigHashV, leaderObservationConfigHash: leaderObsConfigHashV, config: h4bCfg,
+      })
+      if (res.candidate) {
+        const id = res.candidate.shadowCandidateId
+        if (h4bEmittedCandidates.has(id)) {
+          emitFunnel(ctx, 'leader_continuation_state', {
+            symbol: r.symbol, leaderEpisodeId: leader?.leaderEpisodeId ?? null, state: 'DUPLICATE_STRUCTURE',
+            shadowCandidateId: id, experimentConfigHash: h4bConfigHashV, experimentEpoch: h4bCfg.epoch, runId,
+          }, sweepStart)
+        } else {
+          if (h4bEmittedCandidates.size >= H4B_DEDUP_CAP) {
+            const oldest = h4bEmittedCandidates.values().next().value
+            if (oldest !== undefined) h4bEmittedCandidates.delete(oldest)
+          }
+          h4bEmittedCandidates.add(id)
+          emitFunnel(ctx, 'leader_continuation_candidate', res.candidate as unknown as Record<string, unknown>, sweepStart)
+        }
+      } else if (leader?.leaderEpisodeId) {
+        // Only record funnel states for symbols that actually carry a leader episode (bounded + meaningful).
+        emitFunnel(ctx, 'leader_continuation_state', {
+          symbol: r.symbol, leaderEpisodeId: leader.leaderEpisodeId, state: res.state,
+          leaderLifecycle: leader.lifecycleState, leaderRole: leader.role,
+          globalOffHighPct: r.localStructure?.global.offHighPct ?? null, baseRelationship: baseRel,
+          experimentConfigHash: h4bConfigHashV, experimentEpoch: h4bCfg.epoch, runId,
+        }, sweepStart)
+      }
+    }
+  } catch (e) {
+    log('H4B leader-continuation emission failed (research only; BASE unaffected):', (e as Error).message)
+  }
+}
+
 async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): Promise<BuySignalRecord[]> {
   // NB: position management is NOT done here — it runs on its own faster loop
   // (see positionLoop / POSITION_MS). Ticking here too would double-poll and, more
@@ -486,7 +597,15 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
     lastObsBucket = observationBucket(sweepStart, obsPassCfg)
     const membersForTelemetry = cohortSelected
     void pass.observationResults
-      .then(obsResults => emitLeaderObservationData(sweepCtx, sweepStart, membersForTelemetry, obsResults))
+      .then(obsResults => {
+        emitLeaderObservationData(sweepCtx, sweepStart, membersForTelemetry, obsResults)
+        // H4B: shadow candidates for the observational cohort (outside the BASE universe). Same pure
+        // engine; BASE relationship is NOT_IN_BASE_MONITORED_UNIVERSE by construction.
+        emitLeaderContinuationCandidates(sweepCtx, sweepStart, obsResults, {
+          monitoredSet: new Set<string>(), universe: [], dayChangeRank: new Map<string, number>(),
+          priorBuys: [], observationalOnly: true,
+        })
+      })
       .catch(e => log('leader-observation data telemetry failed (research only):', (e as Error).message))
       .finally(() => { observationPassInFlight = false })
   }
@@ -653,6 +772,18 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       eligibleSetupIds: eligibleCandidates.map(c => c.setupId ?? null),
     }, now)
   }
+
+  // ── H4B: LEADER_CONTINUATION shadow candidates (SHADOW ONLY) ────────────────
+  // Strictly downstream of the BASE await, the BASE trigger loop, and arbitration. Pure evaluation
+  // → additive funnel events; never reaches detector/arbitration/execution and never affects BASE.
+  {
+    const dayChangeRank = new Map<string, number>()
+    rankedRows.slice().sort((a, b) => b.changePct - a.changePct).forEach((row, i) => dayChangeRank.set(row.symbol, i + 1))
+    emitLeaderContinuationCandidates(sweepCtx, sweepStart, results, {
+      monitoredSet, universe, dayChangeRank, priorBuys: state, observationalOnly: false,
+    })
+  }
+
   // NB: the observational tail is NOT awaited here. It is drained fire-and-forget by the handler
   // attached at pass launch (emitLeaderObservationData), so a slow/hung observational fetch can never
   // delay the sweep's return or the next sweep's cadence. This is strictly downstream of BASE.
