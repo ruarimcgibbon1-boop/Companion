@@ -33,6 +33,12 @@ import { isHalted, haltFile, etDayKey, decisionsFile, arbitrationFile } from '@/
 import { AlpacaMarketData } from '@/lib/execution/execution-quality'
 import { makeObserverLoop } from '@/lib/execution/observer-wiring'
 import type { ObserverLoop } from '@/lib/execution/observer-loop'
+// QUALITY_ONLY_CONTINUATION — read-only shadow-observation research hook. See
+// src/lib/experiments/quality-only/ for the full implementation. This import
+// is the ONE addition to this file's dependency surface for that experiment;
+// nothing here is imported BACK by BASE (setup-detectors.ts/buy-log.ts/
+// monitor.ts), and nothing in this experiment touches the broker/executor.
+import { observeQualityOnlyFromDecision, FreshnessTracker, JournalWriter, buildProvenance, resolvePendingCandidates, type ObserverContext } from '@/lib/experiments/quality-only'
 
 // Capture the dirty-producer override from the INHERITED launch environment, BEFORE
 // loadEnvLocal() runs — otherwise a stale `ALLOW_DIRTY_PRODUCER=1` left in .env.local
@@ -82,6 +88,85 @@ const STATE_FILE = join(homedir(), '.companion-alert-daemon.json')
 
 const HEARTBEAT_MS = 5 * 60_000         // "still alive" line when nothing is triggering
 let lastHeartbeat = 0
+
+// ── QUALITY_ONLY_CONTINUATION — read-only shadow-observation state ──────────
+// Lives for the daemon process's lifetime, same posture as `seenDecisions`/
+// `state` above. FreshnessTracker enforces "earliest valid observation wins"
+// across sweeps; JournalWriter queues candidate/outcome rows and is drained on
+// the daemon's existing graceful-shutdown path (see `shutdown` below). Never
+// imported by BASE, never touches the broker/executor, never blocks/alters the
+// real decision flow — see the try/catch wrapper at the call site in `sweep`.
+const QUALITY_ONLY_JOURNAL_FILE = join(homedir(), '.companion-quality-only-journal.ndjson')
+const qualityOnlyFreshness = new FreshnessTracker()
+const qualityOnlyWriter = new JournalWriter(QUALITY_ONLY_JOURNAL_FILE)
+
+/**
+ * Fires immediately after classifyBuy() produces its verdict, with the exact
+ * setup/MonitorResult context already in scope — never recomputes verdict,
+ * never mutates it, never feeds back into `state`/alerts/the executor.
+ *
+ * BAR AVAILABILITY (documented, not silently assumed): this daemon consumes
+ * MonitorResult/DetectedSetup from the JSON `/api/monitor` response, which
+ * carries no raw Candle[] — the sweep loop has no 1m bar array in scope, and
+ * fetching one here would be an incremental provider request (explicitly
+ * disallowed). Candles are therefore passed as `[]`:
+ *   - gate reconstruction stays correct under this branch's live defaults —
+ *     RUNUP needs MAX_LEG_RUNUP_PCT=Infinity (legRunUpPct's result can never
+ *     exceed it, candles or not) and the unconfirmed/green-streak check is
+ *     short-circuited by MIN_GREEN_STREAK=0 — so an empty candle array changes
+ *     no gate outcome under the defaults recorded in this experiment's spec
+ *     (see src/lib/experiments/quality-only/spec.ts). SPACE/OFF_HIGH/GRADE_FLOOR
+ *     need no candles at all (levels/technicals/grade are already in `r`/`setup`).
+ *   - outcome resolution CANNOT happen HERE, at candidate-creation time: MFE/MAE
+ *     requires bars AFTER the candidate's observation instant, which do not
+ *     exist yet at this point in a real sweep. `outcomeCandles` is intentionally
+ *     omitted, so `observeQualityOnlyFromDecision` defers outcome to `null`
+ *     (pending) rather than fabricating one — see outcome.ts's causal-bars
+ *     convention. Resolution DOES now happen on a LATER pass: a passive bar
+ *     mirror (src/lib/research/bar-journal.ts) captures the same 1m bars
+ *     monitor.ts's own `/api/monitor` requests already fetch (zero incremental
+ *     provider requests), and the pending-candidate resolver
+ *     (src/lib/experiments/quality-only/resolver.ts) is invoked once per sweep
+ *     below to read that mirror and causally resolve PENDING candidates into
+ *     SCORABLE/CENSORED/DEGRADED — see the resolver invocation later in this
+ *     sweep() function.
+ */
+function runQualityOnlyObserver(setup: DetectedSetup, r: MonitorResult, verdict: string, now: number, state: BuySignalRecord[]): void {
+  try {
+    const ctx: ObserverContext = {
+      now,
+      minLevelStrength: MIN_LEVEL_STRENGTH,
+      priorBuys: state,
+      priorLogs: [],
+      priorStates: [],
+      everLoggedForSetupId: (setupId: string) => state.some(b => b.setupId === setupId),
+      // Descriptive-only field (sameSymbolMeta), never gates eligibility — a
+      // fixed 24h lookback is a safe, honest approximation without an ET
+      // midnight calculator in this file.
+      dayStartMs: now - 24 * 60 * 60 * 1000,
+      candles: [],
+      freshness: qualityOnlyFreshness,
+    }
+    const result = observeQualityOnlyFromDecision(setup, r, verdict, ctx)
+    if (!result || !result.candidate) return
+    const prov = buildProvenance()
+    qualityOnlyWriter.enqueue({
+      kind: 'candidate', identity: result.candidate.identity, payload: result.candidate,
+      provenance: prov, preOfficial: true, // no collection-start marker exists anywhere in this task
+    })
+    if (result.outcome) {
+      qualityOnlyWriter.enqueue({
+        kind: 'outcome', identity: result.candidate.identity, payload: result.outcome,
+        provenance: prov, preOfficial: true,
+      })
+    }
+  } catch (e) {
+    // Research-only failure — must never compromise BASE's alerting/decision
+    // flow. Caught here AND inside observeQualityOnlyFromDecision itself
+    // (belt-and-suspenders per the task's exception-isolation requirement).
+    try { log('[quality-only] observer error (swallowed):', (e as Error)?.message ?? e) } catch { /* logging must never throw upward */ }
+  }
+}
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a)
@@ -234,6 +319,13 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       // bounce stand-down no-op on empty logs/states; dedup + the
       // strong-continuation override still apply, which is the alerting core.
       const { verdict, buy } = classifyBuy(setup, r, { now, priorBuys: state, priorLogs: [], priorStates: [] })
+      // QUALITY_ONLY_CONTINUATION — read-only research observer, wired in
+      // immediately after the verdict is produced and before it is used for
+      // anything else. Exception-safe (never throws into this loop); never
+      // alters `verdict`/`buy`/`setup`/`r`, never places orders, never touches
+      // the executor/Mike/provider requests. See runQualityOnlyObserver's doc
+      // comment for the bar-availability honesty statement.
+      try { runQualityOnlyObserver(setup, r, verdict, now, state) } catch { /* never propagate into BASE */ }
       const attrs = signalAttrs(setup, r)
       // Audit trail: every trigger + verdict, so end-of-session "did we miss X?"
       // is answerable from data — near-misses included. `attrs` is a read-only
@@ -306,6 +398,22 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
     lastHeartbeat = now
     log(`· alive — watching ${universe.length} names (${universe.slice(0, 5).join(' ')}${universe.length > 5 ? '…' : ''}), no triggers`)
   }
+
+  // QUALITY_ONLY_CONTINUATION — pending-outcome resolver. Runs once per sweep
+  // (the daemon's existing cadence; no new process/timer). Reads ONLY local
+  // files (the candidate journal + the passive research bar journal monitor.ts
+  // mirrors into) — zero provider requests. Exception-isolated: a resolver bug
+  // can never affect BASE's alerting/executor flow above, which has already
+  // fully completed by this point in the sweep.
+  try {
+    const res = resolvePendingCandidates(QUALITY_ONLY_JOURNAL_FILE, now)
+    if (res.resolved > 0) {
+      log(`quality-only: resolved ${res.resolved} pending candidate(s) — scorable=${res.scorable} censored=${res.censored} degraded=${res.degraded} (still pending=${res.stillPending})`)
+    }
+  } catch (e) {
+    log('quality-only: resolver error (swallowed):', (e as Error)?.message ?? e)
+  }
+
   return state
 }
 
@@ -367,10 +475,36 @@ async function main() {
     shuttingDown = true
     log(`${signal} — shutting down`)
     observerLoop?.stop()   // clear its interval + abort in-flight reads before we exit
+
+    // SHUTDOWN PRIORITY (execution safety before research completeness):
+    //   1. stop new daemon work (observerLoop.stop(), above)
+    //   2. execution cancel/flatten/settlement — executor.flattenAll(...)
+    //   3. execution summary
+    //   4. QUALITY_ONLY research drain (bounded — see below)
+    //   5. process exit
+    // Real position-flattening/settlement must NEVER be delayed or blocked by
+    // a research-only write. It used to run AFTER the research drain, which
+    // was backwards (a stuck/slow research write could have held up flatten);
+    // it is now unconditionally first.
     if (executor) {
       await executor.flattenAll('risk_halt').catch(e => log('flatten failed:', (e as Error).message))
       log('paper session summary:\n' + executor.summary())
     }
+
+    // QUALITY_ONLY_CONTINUATION drain — now happens AFTER execution settlement
+    // is complete. Exception-safe AND time-bounded: a slow/stuck disk write
+    // here must never hang process exit indefinitely. 2s is generous for the
+    // low-frequency, small (single JSON line) writes this queue holds; a
+    // timeout leaves any remainder un-flushed rather than blocking exit —
+    // research completeness is best-effort, execution settlement above is not.
+    try {
+      const { drained, timedOut } = qualityOnlyWriter.shutdown(2_000)
+      if (drained > 0) log(`quality-only: drained ${drained} queued research write(s)`)
+      if (timedOut) log('quality-only: drain hit its time budget — remaining writes left queued (non-fatal)')
+    } catch (e) {
+      log('quality-only: drain failed (non-fatal):', (e as Error)?.message ?? e)
+    }
+
     process.exit(0)
   }
   process.on('SIGINT', () => { void shutdown('SIGINT') })
@@ -417,4 +551,17 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1) })
+// Guarded so tests/quality-only-daemon-integration.test.ts can import this
+// module's exported QUALITY_ONLY hook (runQualityOnlyObserver) without
+// starting the real daemon loop (network fetches, SIGINT/SIGTERM handlers,
+// etc.). Vitest sets VITEST=true in its worker env; a real launch
+// (`npx tsx scripts/alert-daemon.ts`) never has it set, so behavior for an
+// actual run is byte-for-byte unchanged.
+if (process.env.VITEST !== 'true') {
+  main().catch(e => { console.error(e); process.exit(1) })
+}
+
+// Exported for tests/quality-only-daemon-integration.test.ts — the ACTUAL
+// daemon-side hook, not a re-implementation. Exporting an existing internal
+// function for test visibility does not change daemon behavior.
+export { runQualityOnlyObserver, qualityOnlyWriter, qualityOnlyFreshness }

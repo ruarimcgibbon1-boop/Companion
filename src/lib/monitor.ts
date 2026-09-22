@@ -22,6 +22,7 @@ import { buildRoadmap } from './roadmap-engine'
 import { getSessionType, minutesSinceOpen } from './market-hours'
 import { premarketVolumeProfile, etDateNow, etHHMMNow } from './premarket-volume'
 import { cache, cached, TTL } from './cache'
+import { mirrorBars } from './research/bar-journal'
 
 function toCandles(raw: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>): Candle[] {
   return raw.map(c => ({
@@ -69,6 +70,14 @@ export async function buildMonitorResult(symbol: string): Promise<MonitorResult 
 
     const intraday = toCandles(rawIntraday)
     const daily = toCandles(rawDaily)
+    // Passive research mirror (QUALITY_ONLY_CONTINUATION data plane) — mirrors
+    // the 1m bars this symbol's live monitor pass ALREADY fetched (shared
+    // `candles1m:<symbol>` cache; see bar-journal.ts's module doc for the full
+    // Phase 1 trace). Zero incremental provider requests: `intraday` is the
+    // exact array computed above for BASE's own use, read here, not re-fetched.
+    // Best-effort/fail-open by construction (mirrorBars never throws) and does
+    // not touch `intraday`, `missing`, or anything BASE reads afterward.
+    mirrorBars(sym, intraday, 'monitor-shared-1m-feed')
     if (intraday.length === 0) missing.push('intraday candles')
     if (daily.length === 0) missing.push('daily candles')
 
