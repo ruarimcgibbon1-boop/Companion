@@ -767,18 +767,36 @@ describe('observer exception isolation', () => {
 })
 
 describe('BASE and Mike unchanged (structural proof)', () => {
-  it('the ONLY existing TRACKED files modified by this task are scripts/alert-daemon.ts and src/lib/monitor.ts (the explicitly authorized (a)/(b)/(c) edits) — src/lib/experiments/quality-only/persistence.ts is also touched but is itself untracked (the whole quality-only/ directory is new, never committed), so it cannot appear as a tracked "M" here', () => {
-    const status = execSync('git status --porcelain', { cwd: process.cwd() }).toString()
-    const modifiedTracked = status.split('\n')
-      .filter(l => l.trim().length > 0 && !l.startsWith('??'))
-      .map(l => l.trim())
-      .sort()
-    expect(modifiedTracked).toEqual([
-      'M scripts/alert-daemon.ts',
-      'M src/lib/monitor.ts',
-    ])
+  // Base commit immediately preceding all QUALITY_ONLY work — the true live tip
+  // this experiment was built on top of. Diffing against a fixed historical
+  // commit (rather than `git status --porcelain`, which only reflects the
+  // transient working-tree/staging state) keeps this invariant meaningful
+  // after the experiment's own files are committed — a bare working-tree
+  // check would trivially "pass" post-commit by seeing nothing modified at
+  // all, which proves nothing.
+  const PRE_EXPERIMENT_BASE_SHA = '061b160'
+
+  it('BASE gate files (setup-detectors.ts, buy-log.ts) are byte-identical to the pre-experiment base commit', () => {
+    for (const f of ['src/lib/setup-detectors.ts', 'src/lib/buy-log.ts']) {
+      const before = execSync(`git show ${PRE_EXPERIMENT_BASE_SHA}:${f}`, { cwd: process.cwd() }).toString()
+      const after = readFileSync(join(process.cwd(), f), 'utf8')
+      expect(after).toEqual(before)
+    }
   })
-  it('no file under src/lib/mike or scripts/mike-scan.ts was added or touched by this task', () => {
+
+  it('scripts/alert-daemon.ts and src/lib/monitor.ts are the only existing files this task authorized to differ from the pre-experiment base commit, and nothing outside the expected new-file prefixes appears', () => {
+    const diffOut = execSync(`git diff --name-only ${PRE_EXPERIMENT_BASE_SHA} HEAD`, { cwd: process.cwd() }).toString()
+    const changed = diffOut.split('\n').filter(Boolean).sort()
+    expect(changed).toEqual(expect.arrayContaining(['scripts/alert-daemon.ts', 'src/lib/monitor.ts']))
+    const allowedExistingEdits = new Set(['scripts/alert-daemon.ts', 'src/lib/monitor.ts'])
+    const allowedNewPrefixes = ['src/lib/experiments/', 'src/lib/research/', 'tests/quality-only', 'scripts/research/']
+    const unexpected = changed.filter(f => !allowedExistingEdits.has(f) && !allowedNewPrefixes.some(p => f.startsWith(p)))
+    expect(unexpected).toEqual([])
+  })
+
+  it('no file under src/lib/mike or scripts/mike-scan.ts was added or touched relative to the pre-experiment base commit', () => {
+    const diffOut = execSync(`git diff --name-only ${PRE_EXPERIMENT_BASE_SHA} HEAD`, { cwd: process.cwd() }).toString()
+    expect(diffOut).not.toMatch(/mike/i)
     const status = execSync('git status --porcelain', { cwd: process.cwd() }).toString()
     expect(status).not.toMatch(/mike/i)
   })
