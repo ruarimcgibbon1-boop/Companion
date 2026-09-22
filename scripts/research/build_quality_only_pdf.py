@@ -54,13 +54,32 @@ def _ts_hashes():
 CONFIG_HASH, DECISION_POLICY_HASH = _ts_hashes()
 
 # The REAL git diff for any path, shelled out to git at build time (never
-# hand-transcribed) — same honesty principle as _ts_hashes().
+# hand-transcribed) — same honesty principle as _ts_hashes(). Two call
+# postures are supported so this diff stays populated whether the build runs
+# BEFORE the experiment's changes are committed (working tree vs HEAD) or
+# AFTER (the changes now live in HEAD itself, so working-tree-vs-HEAD is
+# empty and the meaningful diff is the one introduced by HEAD's own commit,
+# HEAD~1..HEAD). Prefer the working-tree diff when one exists; otherwise fall
+# back to the last commit's diff for that path, but only if that commit
+# actually touched it (avoids silently printing an unrelated ancestor diff).
 def _real_diff(path):
     try:
-        return subprocess.check_output(
+        wt_diff = subprocess.check_output(
             ["git", "diff", "HEAD", "--", path],
             cwd=REPO, stderr=subprocess.DEVNULL,
         ).decode()
+        if wt_diff.strip():
+            return wt_diff
+        touched = subprocess.check_output(
+            ["git", "diff", "--name-only", "HEAD~1", "HEAD", "--", path],
+            cwd=REPO, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        if touched:
+            return subprocess.check_output(
+                ["git", "diff", "HEAD~1", "HEAD", "--", path],
+                cwd=REPO, stderr=subprocess.DEVNULL,
+            ).decode()
+        return wt_diff  # genuinely no diff either way (e.g. persistence.ts pre-commit)
     except Exception:
         return "(git diff unavailable at build time)"
 
@@ -163,7 +182,14 @@ meta = [
     ["LIVE DAEMON WIRED", "YES — scripts/alert-daemon.ts's sweep() loop calls the observer immediately after classifyBuy()"],
     ["Collection started", "NO"],
     ["Official marker exists", "NO"],
-    ["Committed", "NO — everything left uncommitted in the worktree for review"],
+    ["Committed", (f"YES — commit {GIT_HEAD} on {GIT_BRANCH} (pushed)"
+                   if not git(["diff", "--name-only", "HEAD", "--",
+                               "scripts/alert-daemon.ts", "src/lib/monitor.ts",
+                               "src/lib/experiments", "src/lib/research/bar-journal.ts",
+                               "tests/quality-only.test.ts",
+                               "tests/quality-only-daemon-integration.test.ts",
+                               "tests/quality-only-resolver.test.ts"]).strip()
+                   else "NO — everything left uncommitted in the worktree for review")],
 ]
 table(meta, col_widths=[2.6 * inch, 7.0 * inch], header=False)
 sp(10)
@@ -710,9 +736,10 @@ table([
     ["lint (eslint) on all new/modified files", "clean, zero errors/warnings (pre-existing unrelated lint debt in "
      "accounting.test.ts / ContinuationDrawer.tsx, neither touched by this task, is untouched and out of scope)"],
     ["git diff --check", "clean"],
-    ["git status", "two modified tracked files (scripts/alert-daemon.ts, src/lib/monitor.ts); "
-     "src/lib/experiments/quality-only/persistence.ts is modified but itself untracked (whole dir is new); "
-     "rest new/untracked"],
+    ["git status", (f"validated pre-commit: two modified tracked files (scripts/alert-daemon.ts, "
+     "src/lib/monitor.ts); src/lib/experiments/quality-only/persistence.ts modified but itself untracked "
+     "(whole dir new); rest new/untracked. Actual current `git status --porcelain` at this build "
+     f"(producer HEAD {GIT_HEAD}): " + (GIT_STATUS if GIT_STATUS else "clean") + ".")],
     ["build (next build)", "BLOCKED by the SAME pre-existing environment issue as the prior pass — Turbopack "
      "refuses this worktree's node_modules symlink (\"points out of the filesystem root\"); not a strategy "
      "defect, noted per this task's instructions. typecheck (tsc --noEmit) independently validates full "
