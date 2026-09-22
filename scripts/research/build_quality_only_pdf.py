@@ -57,11 +57,13 @@ CONFIG_HASH, DECISION_POLICY_HASH = _ts_hashes()
 # hand-transcribed) — same honesty principle as _ts_hashes(). Two call
 # postures are supported so this diff stays populated whether the build runs
 # BEFORE the experiment's changes are committed (working tree vs HEAD) or
-# AFTER (the changes now live in HEAD itself, so working-tree-vs-HEAD is
-# empty and the meaningful diff is the one introduced by HEAD's own commit,
-# HEAD~1..HEAD). Prefer the working-tree diff when one exists; otherwise fall
-# back to the last commit's diff for that path, but only if that commit
-# actually touched it (avoids silently printing an unrelated ancestor diff).
+# AFTER (the changes now live in some ancestor of HEAD, not necessarily
+# HEAD~1 — a later documentation-only commit may sit on top of it, as
+# happened here). Prefer the working-tree diff when one exists; otherwise
+# find the MOST RECENT commit (reachable from HEAD, HEAD included) that
+# actually touched this path, and diff that commit against its own parent —
+# this stays correct no matter how many trailing doc-only commits follow the
+# one that actually introduced the change.
 def _real_diff(path):
     try:
         wt_diff = subprocess.check_output(
@@ -70,13 +72,13 @@ def _real_diff(path):
         ).decode()
         if wt_diff.strip():
             return wt_diff
-        touched = subprocess.check_output(
-            ["git", "diff", "--name-only", "HEAD~1", "HEAD", "--", path],
+        last_touch = subprocess.check_output(
+            ["git", "log", "-1", "--format=%H", "HEAD", "--", path],
             cwd=REPO, stderr=subprocess.DEVNULL,
         ).decode().strip()
-        if touched:
+        if last_touch:
             return subprocess.check_output(
-                ["git", "diff", "HEAD~1", "HEAD", "--", path],
+                ["git", "diff", f"{last_touch}~1", last_touch, "--", path],
                 cwd=REPO, stderr=subprocess.DEVNULL,
             ).decode()
         return wt_diff  # genuinely no diff either way (e.g. persistence.ts pre-commit)
