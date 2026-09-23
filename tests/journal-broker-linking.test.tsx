@@ -49,7 +49,7 @@ describe('TradeJournal broker-linked section', () => {
     expect(screen.getByText('HIST')).toBeInTheDocument()
   })
 
-  it('shows a broker-linked ledger trade with "Broker: Linked" and its reconciliation status', async () => {
+  it('shows a broker-linked ledger trade as a passive "Linked" status with its reconciliation status', async () => {
     const payload: JournalTradesPayload = {
       ok: true, asOf: Date.now(), trades: [brokerTrade()],
       counts: { total: 1, closed: 1, open: 0, verified: 1, manualReview: 0 },
@@ -57,8 +57,8 @@ describe('TradeJournal broker-linked section', () => {
     mockTradesFetch(payload)
     render(<TradeJournal onClose={() => {}} />)
     await waitFor(() => expect(screen.getByText('STFS')).toBeInTheDocument())
-    expect(screen.getByText('Broker: Linked')).toBeInTheDocument()
-    expect(screen.getByText('VERIFIED')).toBeInTheDocument()
+    expect(screen.getByText('Linked')).toBeInTheDocument()
+    expect(screen.getByText('Verified')).toBeInTheDocument()
   })
 
   it('never fabricates strategy provenance — every ledger row keeps its real setupType', async () => {

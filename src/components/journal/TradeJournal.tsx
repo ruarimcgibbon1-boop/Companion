@@ -402,11 +402,14 @@ function StatsPanel({ stats, trades }: { stats: Stats; trades: Position[] }) {
 // there is no path for an externally-opened Alpaca position to reach this
 // list (see trades-view.ts), so no provenance is ever fabricated here.
 
-const JOURNAL_RECON_META: Record<BrokerTradeView['reconciliationStatus'], { label: string; cls: string }> = {
-  verified:      { label: 'VERIFIED',      cls: 'text-bull border-bull/40 bg-bull/10' },
-  pending:       { label: 'PENDING',       cls: 'text-gray-500 border-gray-700 bg-gray-900/30' },
-  discrepancy:   { label: 'DISCREPANCY',   cls: 'text-red-400 border-red-700 bg-red-900/20' },
-  manual_review: { label: 'MANUAL REVIEW', cls: 'text-yellow-400 border-yellow-700 bg-yellow-900/20' },
+// Passive status indicators, not buttons: no border box, no hover/click styling
+// of their own (the row itself is the click target, for expand/collapse — these
+// are read-only labels riding along on it).
+const JOURNAL_RECON_META: Record<BrokerTradeView['reconciliationStatus'], { label: string; dot: string; text: string }> = {
+  verified:      { label: 'Verified',      dot: 'bg-green-500/70',  text: 'text-green-400/90' },
+  pending:       { label: 'Pending',       dot: 'bg-gray-500/70',   text: 'text-gray-500' },
+  discrepancy:   { label: 'Discrepancy',   dot: 'bg-red-500/70',    text: 'text-red-400/90' },
+  manual_review: { label: 'Manual review', dot: 'bg-yellow-500/70', text: 'text-yellow-400/90' },
 }
 
 function BrokerTradeRow({ t }: { t: BrokerTradeView }) {
@@ -419,7 +422,7 @@ function BrokerTradeRow({ t }: { t: BrokerTradeView }) {
     <div className="border-b border-gray-800/60">
       <div
         onClick={() => setExpanded(v => !v)}
-        className="grid grid-cols-[6rem_5rem_4rem_4rem_5rem_5rem_1fr] gap-2 px-4 py-2 text-xs cursor-pointer hover:bg-gray-800/30 transition-colors"
+        className="grid grid-cols-[6rem_5rem_4rem_4rem_9rem_1fr] gap-2 px-4 py-2 text-xs cursor-pointer hover:bg-gray-800/30 transition-colors"
       >
         <span className="text-gray-400">{fmtDate(t.createdAt)} <span className="text-gray-600">{fmtTime(t.createdAt)}</span></span>
         <span className="font-bold text-white">{t.symbol}</span>
@@ -427,10 +430,17 @@ function BrokerTradeRow({ t }: { t: BrokerTradeView }) {
         <span className={`font-mono font-semibold ${isOpen ? 'text-blue-400' : pnl == null ? 'text-gray-600' : pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
           {isOpen ? 'OPEN' : pnl == null ? '—' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}
         </span>
-        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border text-blue-400 border-blue-700 bg-blue-900/20 w-fit">
-          Broker: Linked
+        <span className="flex items-center gap-1.5 text-[10px] whitespace-nowrap">
+          <span className="inline-flex items-center gap-1 text-blue-400/80" title="Broker-linked Companion trade">
+            <span className="w-1 h-1 rounded-full bg-blue-400/70" aria-hidden="true" />
+            Linked
+          </span>
+          <span className="text-gray-700">·</span>
+          <span className={`inline-flex items-center gap-1 ${recon.text}`} title={`Reconciliation: ${recon.label.toLowerCase()}`}>
+            <span className={`w-1 h-1 rounded-full ${recon.dot}`} aria-hidden="true" />
+            {recon.label}
+          </span>
         </span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border w-fit ${recon.cls}`}>{recon.label}</span>
         <span className="ml-auto text-gray-600">{expanded ? '▲' : '▼'}</span>
       </div>
       {expanded && (
