@@ -252,6 +252,13 @@ export interface ScannerRow {
   ask: number | null
   spread: number | null
   latestTradeTime: number | null
+  // ── Momentum ranking (see src/lib/momentum-rank.ts) ───────────────────────
+  /** % moved over the trailing 15 minutes — "is it moving NOW", not "did it move". */
+  rocPct?: number | null
+  /** Distance below the session high, negative. Drives the fade demotion. */
+  offHighPct?: number | null
+  /** Sort key: names our own gates can trade outrank names they'd refuse. */
+  momentumScore?: number | null
 }
 
 export type BadgeType =

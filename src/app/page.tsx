@@ -4,7 +4,6 @@ import { TopBar } from '@/components/dashboard/TopBar'
 import { ScannerPanel } from '@/components/scanner/ScannerPanel'
 import { ChartPanel } from '@/components/chart/ChartPanel'
 import { CompanionPanel } from '@/components/companion/CompanionPanel'
-import { PositionTracker } from '@/components/positions/PositionTracker'
 
 export default function Dashboard() {
   return (
@@ -27,8 +26,8 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Bottom: Position Tracker */}
-      <PositionTracker />
+      {/* Positions now lives in its own top-right nav tab (TopBar) instead of a
+          persistent bottom dock — see PositionTracker, rendered as a drawer. */}
     </div>
   )
 }

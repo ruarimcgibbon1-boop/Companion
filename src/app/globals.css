@@ -1,29 +1,124 @@
 @import "tailwindcss";
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Design tokens — the single source of truth for the whole workstation.
+   Backgrounds are layered (app → bar → panel → surface → raised) so panels
+   and cards read as distinct planes instead of one flat sheet. Semantic
+   colours carry fixed meaning: bull=green, bear=red, warn=amber,
+   info/struct=cyan/purple, accent=blue for interactive/selected state.
+   ──────────────────────────────────────────────────────────────────────── */
+@theme {
+  /* Typography */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", "Menlo", monospace;
+
+  /* Background layers (darkest → lightest) */
+  --color-app: #090c11;       /* window backdrop, shows through panel seams */
+  --color-bar: #0b0f15;       /* top bar / bottom bar — anchoring chrome */
+  --color-panel: #0e131a;     /* scanner / chart / companion panels */
+  --color-surface: #151b25;   /* cards, list wells */
+  --color-raised: #1b2431;    /* inputs, secondary buttons, hover targets */
+  --color-hover: #19212d;     /* row / control hover wash */
+
+  /* Borders */
+  --color-line: #212a36;      /* default hairline */
+  --color-line-strong: #2f3947;
+
+  /* Text ink ramp */
+  --color-ink: #e9eef5;       /* primary — prices, symbols, headings */
+  --color-ink-soft: #a7b2c1;  /* secondary — body copy */
+  --color-ink-mute: #6f7a8a;  /* tertiary — labels, meta */
+  --color-ink-faint: #48515f; /* disabled / de-emphasised */
+
+  /* Semantic accents */
+  --color-accent: #3f82f7;    /* interactive / selected */
+  --color-accent-hi: #5c97ff;
+  --color-bull: #2ebd85;      /* bullish / positive / valid */
+  --color-bear: #f6465d;      /* invalid / risk / stop / negative */
+  --color-warn: #eaa63c;      /* testing / caution / developing */
+  --color-info: #38bdf8;      /* informational structural overlay */
+  --color-struct: #a06bf5;    /* VWAP / structural levels */
+
+  /* Radius scale — tightened for a sharper, less toy-like feel */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 11px;
+
+  /* Elevation */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-pop: 0 12px 32px -8px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
 :root {
-  --background: #0e1117;
-  --foreground: #e5e7eb;
+  --background: var(--color-app);
+  --foreground: var(--color-ink);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background:
+    radial-gradient(1200px 600px at 78% -10%, rgba(63, 130, 247, 0.05), transparent 60%),
+    radial-gradient(900px 500px at 10% 110%, rgba(160, 107, 245, 0.04), transparent 55%),
+    var(--color-app);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
+/* Numbers align in columns and always render mono + tabular */
+.tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Small uppercase section/stat label */
+.eyebrow {
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--color-ink-mute);
+}
+
+/* Elevated card surface with a faint top highlight for depth */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+.card-hi {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), var(--shadow-card);
+}
+
+/* Focus ring for interactive controls */
+.ring-focus:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--color-accent), 0 0 0 3px rgba(63, 130, 247, 0.2);
+}
+
+/* Scrollbars — thin, unobtrusive, theme-matched */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #374151 #0e1117;
+  scrollbar-color: var(--color-line-strong) transparent;
 }
-
 *::-webkit-scrollbar {
-  width: 4px;
+  width: 7px;
+  height: 7px;
 }
-
 *::-webkit-scrollbar-track {
-  background: #0e1117;
+  background: transparent;
 }
-
 *::-webkit-scrollbar-thumb {
-  background-color: #374151;
-  border-radius: 2px;
+  background-color: var(--color-line-strong);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #3c4757;
+  background-clip: padding-box;
 }

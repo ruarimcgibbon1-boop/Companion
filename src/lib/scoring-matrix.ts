@@ -54,7 +54,14 @@ export interface ScoringContext {
 const WEIGHTS: Record<SetupType, ScoreBreakdown> = {
   //                     level pa  vol trend cat  rr  liq conf
   pullback:            w(20, 15, 13, 12, 8, 17, 10, 5),
+  momentum_pullback:   w(10, 18, 18, 18, 9, 15, 7, 5),  // trend/price-action heavy: a runner's first pullback, weak on fixed levels
   breakout:            w(22, 12, 18, 8, 9, 14, 12, 5),
+  opening_range_break: w(14, 14, 20, 15, 10, 14, 8, 5),
+  opening_drive:       w(10, 13, 22, 16, 12, 13, 9, 5),  // vol/trend-heavy: first-15-min gapper drive, no fixed level
+  premarket_breakout:  w(12, 13, 20, 14, 12, 14, 10, 5),
+  hod_break:           w(16, 14, 19, 16, 8, 13, 9, 5),
+  bull_flag:           w(14, 16, 18, 13, 8, 14, 12, 5),
+  break_of_structure:  w(16, 15, 17, 15, 8, 13, 11, 5),
   ema9_bounce:         w(16, 16, 18, 14, 6, 14, 10, 6),
   ema21_bounce:        w(18, 18, 12, 16, 6, 14, 10, 6),
   vwap_bounce:         w(22, 14, 14, 12, 6, 16, 11, 5),
@@ -107,9 +114,14 @@ export function scoreSetup(ctx: ScoringContext): ScoreResult {
   else if (rvol >= 2) volFill += 0.28
   else if (rvol >= 1) volFill += 0.15
   else if (ctx.relativeVolume == null) { risks.push('Relative volume unavailable') }
-  const wantsContraction = ctx.setupType === 'pullback' || ctx.setupType.includes('bounce')
+  // Bounces/pullbacks/flags should see selling dry up into the zone; breakouts and
+  // structure breaks should see volume EXPAND on the trigger bar.
+  const wantsContraction = ctx.setupType === 'pullback' || ctx.setupType === 'momentum_pullback' || ctx.setupType === 'bull_flag' || ctx.setupType.includes('bounce')
+  const wantsExpansion = ctx.setupType === 'breakout' || ctx.setupType === 'bull_flag' ||
+    ctx.setupType === 'break_of_structure' || ctx.setupType === 'vwap_reclaim' || ctx.setupType === 'level_reclaim' ||
+    ctx.setupType === 'opening_range_break' || ctx.setupType === 'opening_drive' || ctx.setupType === 'hod_break'
   if (wantsContraction && ctx.volumeContractsIntoZone) volFill += 0.3
-  if ((ctx.setupType === 'breakout' || ctx.setupType === 'vwap_reclaim' || ctx.setupType === 'level_reclaim') && ctx.volumeExpandsOnSignal) volFill += 0.3
+  if (wantsExpansion && ctx.volumeExpandsOnSignal) volFill += 0.3
   if (ctx.sustainedInterest) volFill += 0.15
   volFill = clamp01(volFill)
 

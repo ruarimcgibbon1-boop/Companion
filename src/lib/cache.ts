@@ -58,7 +58,9 @@ export const TTL = {
   CANDLES_5M: 60_000,      // 1 min
   CANDLES_DAILY: 300_000,  // 5 min
   PROFILE: 3_600_000,      // 1 hour
+  FLOAT: 21_600_000,       // 6 hours — float share counts change only on filings
   NEWS: 180_000,           // 3 min
+  PREMARKET_VOL: 300_000,  // 5 min — matches the 5-min bar granularity it's built from
   LEVELS: 60_000,          // 1 min
 }
 

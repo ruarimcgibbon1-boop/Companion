@@ -1,0 +1,4 @@
+{
+  "_comment": "Fidelity Priority 4 — the held-out validation ledger. scripts/backtest.ts appends an entry to `runs` every time an August 2026 (held-out) day is replayed (which requires VALIDATE=1 + VALIDATION_NOTE). Its purpose is that a held-out judgement can never quietly become training data: once August has been spent judging a candidate, it is on the record here. Empty = August is still fully held out.",
+  "runs": []
+}

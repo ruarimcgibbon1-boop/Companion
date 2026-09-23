@@ -2,14 +2,16 @@
 
 import { useState, useMemo } from 'react'
 import { useTradingStore } from '@/store/trading-store'
+import { useEodResolution } from '@/hooks/useEodResolution'
 import { dataAge } from '@/lib/market-hours'
 import { GRADE_DESCRIPTIONS } from '@/lib/scoring-matrix'
 import {
   SETUP_TYPE_LABELS, SETUP_STATE_LABELS,
-  type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType,
+  PATTERN_LABELS,
+  type DetectedSetup, type SetupGrade, type SetupState, type MonitorAlert, type SetupLog, type SetupType, type BuySignalRecord, type PatternHit,
 } from '@/types'
 
-type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'roadmap' | 'signals' | 'buylog' | 'review' | 'settings'
+type Tab = 'opportunities' | 'watchlist' | 'approaching' | 'patterns' | 'roadmap' | 'signals' | 'buylog' | 'review' | 'settings'
 
 const GRADE_COLOR: Record<SetupGrade, string> = {
   'A+': 'text-emerald-300 bg-emerald-900/40 border-emerald-700',
@@ -49,10 +51,12 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
 
   const watchlistCount = useTradingStore(s => s.watchlist.length)
   const buySignalCount = useTradingStore(s => s.buySignals.length)
+  const patternCount = useTradingStore(s => Object.values(s.symbolPatterns).reduce((n, p) => n + (p?.length ?? 0), 0))
   const TABS: { id: Tab; label: string; badge?: number }[] = [
     { id: 'opportunities', label: 'Opportunities' },
     { id: 'watchlist', label: `Watchlist${watchlistCount ? ` (${watchlistCount})` : ''}` },
     { id: 'approaching', label: 'Approaching' },
+    { id: 'patterns', label: `Patterns${patternCount ? ` (${patternCount})` : ''}` },
     { id: 'roadmap', label: 'Roadmap' },
     { id: 'signals', label: 'Signals', badge: unread },
     { id: 'buylog', label: `Buy Log${buySignalCount ? ` (${buySignalCount})` : ''}` },
@@ -92,6 +96,7 @@ export function OpportunitiesDrawer({ onClose }: { onClose: () => void }) {
         {tab === 'opportunities' && <OpportunitiesTab onPick={onClose} />}
         {tab === 'watchlist' && <WatchlistTab onPick={onClose} />}
         {tab === 'approaching' && <ApproachingTab onPick={onClose} />}
+        {tab === 'patterns' && <PatternsTab onPick={onClose} />}
         {tab === 'roadmap' && <RoadmapTab />}
         {tab === 'signals' && <SignalsTab onPick={onClose} />}
         {tab === 'buylog' && <BuyLogTab onPick={onClose} />}
@@ -519,6 +524,11 @@ function etTime(ts: number): string {
   return new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(ts))
 }
 
+/** ET calendar date, en-CA for a sortable YYYY-MM-DD. The trading day, not the local one. */
+function etDate(ts: number): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ts))
+}
+
 const OUTCOME_STYLE: Record<string, { label: string; cls: string }> = {
   target_hit: { label: 'Target hit', cls: 'text-emerald-300 bg-emerald-900/40' },
   invalidated: { label: 'Stopped', cls: 'text-red-300 bg-red-900/40' },
@@ -532,13 +542,16 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   const roadmaps = useTradingStore(s => s.roadmaps)
   const selectSymbol = useTradingStore(s => s.selectSymbol)
   const clear = useTradingStore(s => s.clearBuySignals)
+  const { resolveNow, status, lastResolved, pendingCount } = useEodResolution()
   const logById = useMemo(() => new Map(setupLogs.map(l => [l.id, l])), [setupLogs])
+  const pnl = useMemo(() => computeBuyPnl(buySignals), [buySignals])
 
   const exportCsv = () => {
-    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'outcome', 'mfe_pct', 'mae_pct']
+    const head = ['time_ET', 'symbol', 'setup', 'trigger', 'entry_low', 'entry_high', 'invalidation', 'stop', 'targets', 'score', 'grade', 'rr', 'price_at_signal', 'flagged', 'trend15m', 'dist_vwap_pct', 'dist_dayhigh_pct', 'rvol', 'hhll', 'atr_pct', 'outcome', 'mfe_pct', 'mae_pct', 'pnl_pct', 'pnl_closed']
+    const n1 = (v: number | null | undefined) => (v == null ? '' : v.toFixed(1))
     const rows = buySignals.map(b => {
       const log = logById.get(b.setupId)
-      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? ''].join(',')
+      return [etTime(b.timestamp), b.symbol, b.setupType, b.triggerPrice, b.entryLow, b.entryHigh, b.invalidation, b.stop, b.targets.join(' '), b.score, b.grade, b.rewardRisk ?? '', b.priceAtSignal, b.flagged ? 'flagged' : '', b.ctxTrend15m ?? '', n1(b.ctxDistVwapPct), n1(b.ctxDistDayHighPct), n1(b.ctxRelVol), b.ctxHigherHighsLows == null ? '' : (b.ctxHigherHighsLows ? 'HH' : 'no'), n1(b.ctxAtrPct), log?.outcome ?? 'open', log?.maxFavorablePct?.toFixed(1) ?? '', log?.maxAdversePct?.toFixed(1) ?? '', b.pnlPct == null ? '' : b.pnlPct.toFixed(2), b.pnlPct == null ? '' : (b.pnlFullyClosed === false ? 'open_at_close' : 'closed')].join(',')
     })
     const csv = [head.join(','), ...rows].join('\n')
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
@@ -550,12 +563,42 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
-        <span className="text-[11px] text-gray-500">{buySignals.length} buy signals logged · newest first · timestamps in ET</span>
+        <span className="text-[11px] text-gray-500">
+          {buySignals.length} buy signals logged · newest first · timestamps in ET
+          {status === 'done' && lastResolved > 0 && <span className="text-emerald-400"> · resolved {lastResolved}</span>}
+        </span>
         <div className="flex gap-2">
+          <button
+            onClick={() => resolveNow()}
+            disabled={status === 'running' || pendingCount === 0}
+            title="Replay closed-day tapes: resolve open outcomes and price the scaled-out P/L"
+            className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40"
+          >
+            {status === 'running' ? 'Resolving…' : `Resolve open${pendingCount ? ` (${pendingCount})` : ''}`}
+          </button>
           <button onClick={exportCsv} disabled={!buySignals.length} className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40">Export CSV</button>
           <button onClick={clear} disabled={!buySignals.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
         </div>
       </div>
+
+      {pnl.n > 0 && (
+        <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-900/30">
+          <div className="flex items-center gap-4 text-[11px]">
+            <span className="text-gray-500">Realized P/L <span className="text-gray-600">(½ T1 · ½ T2 · b/e stop)</span></span>
+            <span className={pnl.net >= 0 ? 'text-emerald-400' : 'text-red-400'}>Net <b>{pnl.net >= 0 ? '+' : ''}{pnl.net.toFixed(1)}%</b></span>
+            <span className={pnl.avg >= 0 ? 'text-emerald-400/90' : 'text-red-400/90'}>Avg {pnl.avg >= 0 ? '+' : ''}{pnl.avg.toFixed(2)}%/trade</span>
+            <span className="text-gray-400">Green {pnl.winRate}%</span>
+            <span className="text-gray-600">{pnl.n} priced{pnl.pending > 0 ? ` · ${pnl.pending} pending` : ''}</span>
+          </div>
+          {pnl.byType.length > 1 && (
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] text-gray-500">
+              {pnl.byType.map(t => (
+                <span key={t.label}>{t.label} <span className={t.net >= 0 ? 'text-emerald-400/80' : 'text-red-400/80'}>{t.net >= 0 ? '+' : ''}{t.net.toFixed(1)}%</span> <span className="text-gray-600">({t.n})</span></span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {buySignals.length === 0 ? (
         <div className="text-center text-gray-600 text-sm py-16">
@@ -585,7 +628,13 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
                 <span className="text-[11px] text-right text-emerald-400/90">{b.targets.slice(0, 2).map(t => `$${fmt(t)}`).join(' ') || '—'}</span>
                 <span className="text-[11px] text-right text-gray-300">{b.score}</span>
                 <div className="text-right">
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${oc.cls}`}>{oc.label}</span>
+                  {b.pnlPct != null ? (
+                    <span className={`text-[11px] font-semibold ${b.pnlPct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {b.pnlPct >= 0 ? '+' : ''}{b.pnlPct.toFixed(1)}%{b.pnlFullyClosed === false ? '*' : ''}
+                    </span>
+                  ) : (
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${oc.cls}`}>{oc.label}</span>
+                  )}
                   <div className="text-[10px] mt-0.5">
                     {log ? (
                       <span className="text-gray-500">+{log.maxFavorablePct.toFixed(1)}% / {log.maxAdversePct.toFixed(1)}%</span>
@@ -605,20 +654,169 @@ function BuyLogTab({ onPick }: { onPick: () => void }) {
 
 // ── Review ──────────────────────────────────────────────────────────────────
 
+function FunnelCard() {
+  const f = useTradingStore(s => s.monitorFunnel)
+  if (!f) return null
+  const st = f.byState
+  const arrow = <span className="text-gray-700">→</span>
+  return (
+    <div className="text-[11px] bg-gray-900/60 border border-gray-800 rounded-lg p-3">
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="font-semibold text-gray-400">Live signal funnel</span>
+        <span className="text-gray-600">latest sweep · {dataAge(f.timestamp)}</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-gray-300">
+        <span>{f.scanned} scanned</span>{arrow}
+        <span>{f.symbolsWithSetups} with setups</span>{arrow}
+        <span>{f.rawSetups} detected</span>{arrow}
+        <span className="text-gray-500">{f.tracked} tracked</span>{arrow}
+        <span className={f.triggered ? 'text-amber-300' : 'text-gray-500'}>{f.triggered} triggered</span>{arrow}
+        <span className={f.logged ? 'text-emerald-400 font-semibold' : 'text-gray-500'}>{f.logged} logged</span>
+      </div>
+      {f.triggered > 0 && f.logged < f.triggered && (
+        <div className="mt-1 text-[10px] text-gray-500">
+          Triggered but dropped: <span className="text-red-400/80">veto {f.droppedVeto}</span> · after-close {f.droppedSession} · low-vol {f.droppedVolume} · stand-down {f.droppedStandDown} · capped {f.droppedCapped} · dup {f.droppedDup}
+        </div>
+      )}
+      <div className="mt-1 text-[10px] text-gray-600">
+        States: identified {st.identified ?? 0} · approaching {st.approaching ?? 0} · at-level {st.at_level ?? 0} · confirming {st.confirming ?? 0} · triggered {st.triggered ?? 0}
+        {f.belowFloor > 0 ? ` · (${f.belowFloor} below floor)` : ''}
+      </div>
+    </div>
+  )
+}
+
+// ── Pattern Scan (top-10 gainers) ────────────────────────────────────────────
+
+const TOP_GAINERS_N = 15
+
+function PatternsTab({ onPick }: { onPick: () => void }) {
+  const scannerRows = useTradingStore(s => s.scannerRows)
+  const symbolPatterns = useTradingStore(s => s.symbolPatterns)
+  const patternLog = useTradingStore(s => s.patternLog)
+  const clearPatternLog = useTradingStore(s => s.clearPatternLog)
+  const selectSymbol = useTradingStore(s => s.selectSymbol)
+
+  // The day's top gainers = the scanner ranked by change, top N.
+  const top = useMemo(() =>
+    [...scannerRows].sort((a, b) => b.changePct - a.changePct).slice(0, TOP_GAINERS_N),
+    [scannerRows])
+  const liveRows = top
+    .map(g => ({ g, hits: (symbolPatterns[g.symbol] ?? []).slice().sort((a, b) => b.strength - a.strength) }))
+    .filter(r => r.hits.length > 0)
+
+  const exportCsv = () => {
+    // date_ET first: the log accumulates across sessions (the 2026-08-12 export had
+    // SEVEN days concatenated) and without a date the rows can't be split by day,
+    // which also made them impossible to resolve against the tape retrospectively.
+    const head = [
+      'date_ET', 'time_ET', 'symbol', 'pattern', 'strength', 'at_support', 'volume_confirmed',
+      'price', 'change_pct', 'rvol', 'outcome', 'mfe_pct', 'mae_pct',
+    ]
+    const rows = patternLog.map(r => [
+      etDate(r.timestamp), etTime(r.timestamp), r.symbol, r.pattern, r.strength,
+      r.atSupport ? 1 : 0, r.volumeConfirmed ? 1 : 0,
+      r.price, r.changePct.toFixed(1), r.rvol == null ? '' : r.rvol.toFixed(1),
+      r.outcome ?? 'open',
+      r.mfePct == null ? '' : r.mfePct.toFixed(2),
+      r.maePct == null ? '' : r.maePct.toFixed(2),
+    ].join(','))
+    const url = URL.createObjectURL(new Blob([[head.join(','), ...rows].join('\n')], { type: 'text/csv' }))
+    const a = document.createElement('a')
+    a.href = url; a.download = `pattern-log-${new Date().toISOString().slice(0, 10)}.csv`; a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
+        <span className="text-[11px] text-gray-500">
+          Candlestick scan · top {TOP_GAINERS_N} gainers · <span className="text-gray-400">{patternLog.length} logged</span>
+        </span>
+        <div className="flex gap-2">
+          <button onClick={exportCsv} disabled={!patternLog.length} className="text-[11px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 disabled:opacity-40">Export CSV</button>
+          <button onClick={clearPatternLog} disabled={!patternLog.length} className="text-[11px] text-gray-500 hover:text-red-400 disabled:opacity-40">Clear</button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        {/* Live now */}
+        <div className="px-4 pt-2.5 pb-1 text-[10px] uppercase tracking-wide text-gray-600">Live now</div>
+        {liveRows.length === 0 ? (
+          <div className="px-4 py-3 text-[11px] text-gray-600">No patterns on the top gainers this moment — they log below as they form.</div>
+        ) : (
+          <div className="divide-y divide-gray-800/60">
+            {liveRows.map(({ g, hits }) => (
+              <button key={g.symbol} onClick={() => { selectSymbol(g.symbol); onPick() }}
+                className="w-full text-left px-4 py-2 hover:bg-gray-800/40 flex items-start gap-3">
+                <div className="w-20 flex-shrink-0">
+                  <div className="text-xs font-bold text-white">{g.symbol}</div>
+                  <div className="text-[11px] font-mono text-green-400">+{g.changePct.toFixed(0)}%</div>
+                </div>
+                <div className="flex flex-wrap gap-1.5 min-w-0">{hits.map((h, i) => <PatternChip key={i} hit={h} />)}</div>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Accumulating log */}
+        <div className="px-4 pt-4 pb-1 text-[10px] uppercase tracking-wide text-gray-600">Logged history · newest first</div>
+        {patternLog.length === 0 ? (
+          <div className="px-4 py-3 text-[11px] text-gray-600">The background scan hasn&apos;t logged any patterns yet. It quietly records each hit on the top gainers so a which-patterns-pay dataset builds over time.</div>
+        ) : (
+          <div className="divide-y divide-gray-800/50">
+            {patternLog.slice(0, 100).map(r => (
+              <button key={r.id} onClick={() => { selectSymbol(r.symbol); onPick() }}
+                className="w-full text-left px-4 py-1.5 hover:bg-gray-800/40 grid grid-cols-[4rem_3.5rem_1fr_2.5rem] gap-2 items-center">
+                <span className="text-[10px] font-mono text-gray-500">{etTime(r.timestamp)}</span>
+                <span className="text-[11px] font-bold text-white">{r.symbol} <span className="font-mono text-[10px] text-green-400/80">+{r.changePct.toFixed(0)}%</span></span>
+                <span className="text-[11px] text-gray-300">{PATTERN_LABELS[r.pattern]} {r.atSupport && <span className="text-[9px] text-gray-500">@supp</span>} {r.volumeConfirmed && <span className="text-[9px] text-gray-500">·vol</span>}</span>
+                <span className={`text-[11px] font-mono text-right ${r.strength >= 75 ? 'text-emerald-400' : r.strength >= 55 ? 'text-yellow-400' : 'text-gray-500'}`}>{r.strength}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function PatternChip({ hit }: { hit: PatternHit }) {
+  const strong = hit.strength >= 75
+  const mid = hit.strength >= 55
+  const cls = strong ? 'text-emerald-300 bg-emerald-900/40 border-emerald-800'
+    : mid ? 'text-yellow-300 bg-yellow-900/30 border-yellow-900'
+    : 'text-gray-400 bg-gray-800/60 border-gray-700'
+  return (
+    <span className={`text-[11px] px-2 py-0.5 rounded border ${cls}`} title={`strength ${hit.strength}`}>
+      {PATTERN_LABELS[hit.pattern]}
+      <span className="font-mono text-[10px] opacity-80"> {hit.strength}</span>
+      {hit.atSupport && <span className="text-[9px] ml-1 opacity-70">@supp</span>}
+      {hit.volumeConfirmed && <span className="text-[9px] ml-0.5 opacity-70">·vol</span>}
+    </span>
+  )
+}
+
 function ReviewTab() {
   const logs = useTradingStore(s => s.setupLogs)
+  const funnel = useTradingStore(s => s.monitorFunnel)
   const stats = useMemo(() => computeReview(logs), [logs])
 
-  if (logs.length === 0) return <div className="text-center text-gray-600 text-sm py-16">No setups logged yet. As the engine identifies and tracks setups, their outcomes accumulate here for calibration.</div>
+  if (logs.length === 0 && !funnel) return <div className="text-center text-gray-600 text-sm py-16">No setups logged yet. As the engine identifies and tracks setups, their outcomes accumulate here for calibration.</div>
 
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4">
+      <FunnelCard />
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
-        <Stat label="Setups logged" value={String(stats.total)} />
+        <Stat label="Entered / tracked" value={`${stats.entered} / ${stats.total}`} />
         <Stat label="Resolved" value={String(stats.resolved)} />
         <Stat label="Hit T1" value={`${stats.winRate}%`} good />
         <Stat label="Avg MFE / MAE" value={`+${fmt(stats.avgMfe, 1)}% / ${fmt(stats.avgMae, 1)}%`} />
       </div>
+
+      <p className="text-[11px] text-gray-500">
+        Performance below is over <span className="text-gray-300">entered (triggered)</span> setups only — watches that never triggered are excluded, so per-type win-rates reflect trades you&apos;d actually take.
+      </p>
 
       <ReviewTable title="By setup type" rows={stats.byType} />
       <ReviewTable title="By score range" rows={stats.byScore} />
@@ -627,7 +825,7 @@ function ReviewTab() {
 
       <div className="text-[11px] text-gray-500 bg-gray-900/60 border border-gray-800 rounded-lg p-3">
         <p className="font-semibold text-gray-400 mb-1">Calibration read-out</p>
-        <p>False-breakout frequency: <span className="text-gray-300">{stats.falseBreakoutPct}%</span> of breakout setups invalidated after triggering.</p>
+        <p>False-breakout frequency: <span className="text-gray-300">{stats.falseBreakoutPct}%</span> of breakout entries invalidated after triggering.</p>
         <p>Most reliable setup type by T1 hit-rate: <span className="text-gray-300">{stats.bestType}</span>.</p>
         <p className="mt-1 text-gray-600">These outcomes are the basis for tuning the scoring weights from real results rather than assumptions.</p>
       </div>
@@ -669,15 +867,21 @@ function ReviewTable({ title, rows }: { title: string; rows: { label: string; n:
 
 interface Bucket { label: string; n: number; win: number; mfe: number; mae: number }
 function computeReview(logs: SetupLog[]) {
-  const resolved = logs.filter(l => l.outcome !== 'open')
-  const wins = logs.filter(l => l.outcome === 'target_hit')
+  // Performance is judged over ENTERED trades only. The log tracks every setup
+  // that clears the display floor — hundreds of watches (identified/approaching)
+  // per handful of real triggers — so counting all of them swamps every per-type
+  // win-rate with setups that were never bought. triggeredAt is set the moment a
+  // setup reaches the (non-vetoed) triggered state, i.e. the trades you'd take.
+  const entered = logs.filter(l => l.triggeredAt != null)
+  const resolved = entered.filter(l => l.outcome !== 'open')
+  const wins = entered.filter(l => l.outcome === 'target_hit')
   const winRate = resolved.length ? Math.round((wins.length / resolved.length) * 100) : 0
-  const avgMfe = avg(logs.map(l => l.maxFavorablePct))
-  const avgMae = avg(logs.map(l => l.maxAdversePct))
+  const avgMfe = avg(entered.map(l => l.maxFavorablePct))
+  const avgMae = avg(entered.map(l => l.maxAdversePct))
 
   const bucketize = (keyFn: (l: SetupLog) => string): Bucket[] => {
     const map = new Map<string, SetupLog[]>()
-    for (const l of logs) {
+    for (const l of entered) {
       const k = keyFn(l)
       if (!map.has(k)) map.set(k, [])
       map.get(k)!.push(l)
@@ -692,18 +896,18 @@ function computeReview(logs: SetupLog[]) {
   const byType = bucketize(l => SETUP_TYPE_LABELS[l.type])
   const byScore = bucketize(l => l.score >= 85 ? '85+' : l.score >= 75 ? '75–84' : l.score >= 65 ? '65–74' : '<65')
   const bySession = bucketize(l => l.sessionAtId)
-  const emaVwap = logs.filter(l => l.type.includes('ema') || l.type.includes('vwap'))
+  const emaVwap = entered.filter(l => l.type.includes('ema') || l.type.includes('vwap'))
   const byTest = [
     testBucket('First test', emaVwap.filter(l => l.testCount <= 1)),
     testBucket('Repeat test', emaVwap.filter(l => l.testCount >= 2)),
   ].filter(b => b.n > 0)
 
-  const breakouts = logs.filter(l => l.type === 'breakout' && l.triggeredAt)
+  const breakouts = entered.filter(l => l.type === 'breakout')
   const falseBreakouts = breakouts.filter(l => l.outcome === 'invalidated')
   const falseBreakoutPct = breakouts.length ? Math.round((falseBreakouts.length / breakouts.length) * 100) : 0
   const bestType = byType.filter(b => b.n >= 2).sort((a, b) => b.win - a.win)[0]?.label ?? '—'
 
-  return { total: logs.length, resolved: resolved.length, winRate, avgMfe, avgMae, byType, byScore, bySession, byTest, falseBreakoutPct, bestType }
+  return { total: logs.length, entered: entered.length, resolved: resolved.length, winRate, avgMfe, avgMae, byType, byScore, bySession, byTest, falseBreakoutPct, bestType }
 }
 function testBucket(label: string, ls: SetupLog[]): Bucket {
   const res = ls.filter(l => l.outcome !== 'open')
@@ -711,6 +915,25 @@ function testBucket(label: string, ls: SetupLog[]): Bucket {
   return { label, n: ls.length, win: res.length ? (w.length / res.length) * 100 : 0, mfe: avg(ls.map(l => l.maxFavorablePct)), mae: avg(ls.map(l => l.maxAdversePct)) }
 }
 function avg(xs: number[]): number { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0 }
+
+// Realized scaled-out P/L summary over the buy signals that have been priced.
+function computeBuyPnl(buys: BuySignalRecord[]) {
+  const priced = buys.filter(b => b.pnlPct != null)
+  const pending = buys.filter(b => b.pnlPct == null).length
+  const pcts = priced.map(b => b.pnlPct as number)
+  const net = pcts.reduce((a, b) => a + b, 0)
+  const wins = pcts.filter(p => p > 0).length
+  const byTypeMap = new Map<string, number[]>()
+  for (const b of priced) {
+    const k = SETUP_TYPE_LABELS[b.setupType]
+    if (!byTypeMap.has(k)) byTypeMap.set(k, [])
+    byTypeMap.get(k)!.push(b.pnlPct as number)
+  }
+  const byType = [...byTypeMap.entries()]
+    .map(([label, ps]) => ({ label, n: ps.length, net: ps.reduce((a, b) => a + b, 0), avg: avg(ps) }))
+    .sort((a, b) => b.net - a.net)
+  return { n: priced.length, pending, net, avg: avg(pcts), winRate: priced.length ? Math.round((wins / priced.length) * 100) : 0, byType }
+}
 
 // ── Settings ────────────────────────────────────────────────────────────────
 

@@ -4,7 +4,7 @@
  */
 
 import type { Candle, TechnicalData, SessionLevels, SupportResistanceZone } from '@/types'
-import { isPremarket, isRegularHours } from './market-hours'
+import { isPremarket, isRegularHours, etMinutesOfDay } from './market-hours'
 
 // ── Moving averages ────────────────────────────────────────────────────────
 
@@ -118,16 +118,36 @@ export function relativeVolume(
   return expectedAtThisPoint > 0 ? currentVolume / expectedAtThisPoint : null
 }
 
+/**
+ * Fraction of the 09:30–16:00 ET session elapsed — 0 before the open, 1 after
+ * the close. RVOL paces the day's volume against this, so it MUST be measured in
+ * ET: computing it off the host clock measured the *local* trading day, which on
+ * a London machine (BST, 5h ahead) read 0.77 at the 09:30 ET open and pinned to
+ * 1.0 from 11:00 ET onward. Morning RVOL therefore came out 10–20× too low —
+ * exactly when the momentum book trades — so the in-play gate (RVOL ≥ 2) and the
+ * runner extension cap (RVOL ≥ 5) were being asked of numbers that could not
+ * reach them. Before the open this is 0 and RVOL is null by design: there is no
+ * regular session to pace against yet (see `premarket-volume.ts` for the
+ * premarket measure).
+ */
+export function sessionFractionElapsed(ts: number = Date.now()): number {
+  const mins = etMinutesOfDay(ts)
+  const open = 9 * 60 + 30
+  const close = 16 * 60
+  return Math.min(Math.max((mins - open) / (close - open), 0), 1)
+}
+
 // ── Session levels ─────────────────────────────────────────────────────────
 
 export function calculateSessionLevels(
   intradayCandles: Candle[],
   dailyCandles: Candle[],
   livePrice?: number,
-  liveVolume?: number
+  liveVolume?: number,
+  nowTs: number = Date.now()   // simulated "now" for replay/backtest; defaults to live
 ): SessionLevels {
-  const now = Date.now() / 1000
-  const todayStart = getTodayStartUnix()
+  const now = nowTs / 1000
+  const todayStart = getTodayStartUnix(nowTs)
 
   const today = intradayCandles.filter(c => c.time >= todayStart)
   const premarket = today.filter(c => isPremarket(c.time * 1000))
@@ -151,10 +171,15 @@ export function calculateSessionLevels(
   const or15High = or15Candles.length ? Math.max(...or15Candles.map(c => c.high)) : null
   const or15Low = or15Candles.length ? Math.min(...or15Candles.map(c => c.low)) : null
 
+  // VWAP anchors to the active session: today's regular candles once the bell
+  // rings, otherwise today's premarket candles — so a premarket-anchored VWAP is
+  // available before the open instead of nothing (which was silently disabling
+  // every VWAP-based setup in premarket).
+  const vwapBase = regular.length ? regular : premarket
   // Incorporate live price tick into VWAP so it reflects current quote, not just last closed candle
-  const vwapCandles = (livePrice != null && liveVolume != null && liveVolume > 0 && regular.length)
-    ? [...regular, { time: Date.now() / 1000, open: livePrice, high: livePrice, low: livePrice, close: livePrice, volume: liveVolume }]
-    : regular
+  const vwapCandles = (livePrice != null && liveVolume != null && liveVolume > 0 && vwapBase.length)
+    ? [...vwapBase, { time: nowTs / 1000, open: livePrice, high: livePrice, low: livePrice, close: livePrice, volume: liveVolume }]
+    : vwapBase
   const vwapVal = vwapCandles.length ? vwap(vwapCandles) : null
 
   const prevDay = dailyCandles.length >= 2 ? dailyCandles[dailyCandles.length - 2] : null
@@ -182,9 +207,9 @@ export function calculateSessionLevels(
   }
 }
 
-function getTodayStartUnix(): number {
+function getTodayStartUnix(nowTs: number = Date.now()): number {
   // Midnight ET (not local/UTC) so candles are bucketed correctly regardless of server timezone
-  const now = new Date()
+  const now = new Date(nowTs)
   const etMidnight = new Date(
     new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/New_York',
@@ -202,19 +227,28 @@ export function calculateTechnical(
   currentVolume: number,
   avgVolume: number,
   sessionLevels: SessionLevels,
-  livePrice?: number   // live quote price — injected to bring EMAs/VWAP current
+  livePrice?: number,  // live quote price — injected to bring EMAs/VWAP current
+  nowTs: number = Date.now()   // simulated "now" for replay/backtest; defaults to live
 ): TechnicalData {
   const closes = intradayCandles.map(c => c.close)
-  const todayStart = getTodayStartUnix()
+  const todayStart = getTodayStartUnix(nowTs)
+
+  // Session-aware indicator frame. Regular-session candles drive EMAs/RSI/VWAP
+  // cross during and after regular hours (unchanged). Before the open, use
+  // TODAY's premarket candles (when there are enough to form the moving averages)
+  // so the indicators track the live premarket tape instead of anchoring to
+  // yesterday's close — the reason premarket setups sat pinned to stale levels.
   const regular = intradayCandles.filter(c => isRegularHours(c.time * 1000))
-  const regularCloses = regular.map(c => c.close)
+  const todayPremarket = intradayCandles.filter(c => c.time >= todayStart && isPremarket(c.time * 1000))
+  const frame = (isPremarket(nowTs) && todayPremarket.length >= 9) ? todayPremarket : regular
+  const frameCloses = frame.map(c => c.close)
 
   // If livePrice is newer than the last candle close, append it so indicators are current
   const lastClose = closes[closes.length - 1] ?? null
   const effectivePrice = livePrice ?? lastClose
   const closesWithLive = livePrice != null && livePrice !== lastClose
-    ? [...regularCloses, livePrice]
-    : regularCloses
+    ? [...frameCloses, livePrice]
+    : frameCloses
 
   const vwapVal = sessionLevels.vwap
   const currentPrice = effectivePrice
@@ -224,7 +258,9 @@ export function calculateTechnical(
       ? ((currentPrice - vwapVal) / vwapVal) * 100
       : null
 
-  const dayHigh = sessionLevels.regularHigh
+  // Before the open there is no regular-session high yet — fall back to the
+  // premarket high so extension/roadmap logic still has a session ceiling.
+  const dayHigh = sessionLevels.regularHigh ?? sessionLevels.premarketHigh
   const distanceFromDayHighPct =
     dayHigh && currentPrice
       ? ((currentPrice - dayHigh) / dayHigh) * 100
@@ -241,17 +277,7 @@ export function calculateTechnical(
   // ATR on intraday
   const atrVal = atr(intradayCandles.filter(c => c.time >= todayStart - 86400), 14)
 
-  // Session fraction
-  const nowEt = Date.now()
-  const marketOpen = new Date()
-  marketOpen.setHours(9, 30, 0, 0)
-  const marketClose = new Date()
-  marketClose.setHours(16, 0, 0, 0)
-  const totalMs = marketClose.getTime() - marketOpen.getTime()
-  const elapsedMs = nowEt - marketOpen.getTime()
-  const fraction = Math.min(Math.max(elapsedMs / totalMs, 0), 1)
-
-  const rvol = relativeVolume(currentVolume, avgVolume, fraction)
+  const rvol = relativeVolume(currentVolume, avgVolume, sessionFractionElapsed(nowTs))
 
   // Volume trend
   const recentCandles = intradayCandles.slice(-6)
@@ -276,12 +302,12 @@ export function calculateTechnical(
   const hhhl = isHigherHighsLows(highs, lows)
   const lhll = isLowerHighsLows(highs, lows)
 
-  // VWAP cross count
-  const vwapSer = vwapSeries(regular)
+  // VWAP cross count — over the active session frame (premarket before the open)
+  const vwapSer = vwapSeries(frame)
   let crosses = 0
-  for (let i = 1; i < regular.length && i < vwapSer.length; i++) {
-    const prevAbove = regular[i - 1].close > vwapSer[i - 1]
-    const currAbove = regular[i].close > vwapSer[i]
+  for (let i = 1; i < frame.length && i < vwapSer.length; i++) {
+    const prevAbove = frame[i - 1].close > vwapSer[i - 1]
+    const currAbove = frame[i].close > vwapSer[i]
     if (prevAbove !== currAbove) crosses++
   }
 

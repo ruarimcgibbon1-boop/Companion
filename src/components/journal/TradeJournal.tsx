@@ -2,6 +2,8 @@
 
 import { useState, useMemo } from 'react'
 import { useTradingStore } from '@/store/trading-store'
+import { useBrokerTrades } from '@/hooks/useBrokerTrades'
+import type { BrokerTradeView } from '@/lib/execution/trades-view'
 import type { Position, TradeTag } from '@/types'
 
 // ── Stats helpers ──────────────────────────────────────────────────────────
@@ -394,6 +396,114 @@ function StatsPanel({ stats, trades }: { stats: Stats; trades: Position[] }) {
   )
 }
 
+// ── Broker-linked trades (Companion PAPER trades from the execution ledger) ─
+// Read-only. P&L shown here is `trade.realizedPnl` verbatim from the ledger —
+// never recomputed in this component. Every row is `brokerLink: 'linked'`;
+// there is no path for an externally-opened Alpaca position to reach this
+// list (see trades-view.ts), so no provenance is ever fabricated here.
+
+// Passive status indicators, not buttons: no border box, no hover/click styling
+// of their own (the row itself is the click target, for expand/collapse — these
+// are read-only labels riding along on it).
+const JOURNAL_RECON_META: Record<BrokerTradeView['reconciliationStatus'], { label: string; dot: string; text: string }> = {
+  verified:      { label: 'Verified',      dot: 'bg-green-500/70',  text: 'text-green-400/90' },
+  pending:       { label: 'Pending',       dot: 'bg-gray-500/70',   text: 'text-gray-500' },
+  discrepancy:   { label: 'Discrepancy',   dot: 'bg-red-500/70',    text: 'text-red-400/90' },
+  manual_review: { label: 'Manual review', dot: 'bg-yellow-500/70', text: 'text-yellow-400/90' },
+}
+
+function BrokerTradeRow({ t }: { t: BrokerTradeView }) {
+  const [expanded, setExpanded] = useState(false)
+  const recon = JOURNAL_RECON_META[t.reconciliationStatus]
+  const pnl = t.realizedPnl
+  const isOpen = t.state === 'open' || t.state === 'pending_entry'
+
+  return (
+    <div className="border-b border-gray-800/60">
+      <div
+        onClick={() => setExpanded(v => !v)}
+        className="grid grid-cols-[6rem_5rem_4rem_4rem_9rem_1fr] gap-2 px-4 py-2 text-xs cursor-pointer hover:bg-gray-800/30 transition-colors"
+      >
+        <span className="text-gray-400">{fmtDate(t.createdAt)} <span className="text-gray-600">{fmtTime(t.createdAt)}</span></span>
+        <span className="font-bold text-white">{t.symbol}</span>
+        <span className="text-gray-500 truncate">{t.setupType}</span>
+        <span className={`font-mono font-semibold ${isOpen ? 'text-blue-400' : pnl == null ? 'text-gray-600' : pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+          {isOpen ? 'OPEN' : pnl == null ? '—' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`}
+        </span>
+        <span className="flex items-center gap-1.5 text-[10px] whitespace-nowrap">
+          <span className="inline-flex items-center gap-1 text-blue-400/80" title="Broker-linked Companion trade">
+            <span className="w-1 h-1 rounded-full bg-blue-400/70" aria-hidden="true" />
+            Linked
+          </span>
+          <span className="text-gray-700">·</span>
+          <span className={`inline-flex items-center gap-1 ${recon.text}`} title={`Reconciliation: ${recon.label.toLowerCase()}`}>
+            <span className={`w-1 h-1 rounded-full ${recon.dot}`} aria-hidden="true" />
+            {recon.label}
+          </span>
+        </span>
+        <span className="ml-auto text-gray-600">{expanded ? '▲' : '▼'}</span>
+      </div>
+      {expanded && (
+        <div className="px-4 pb-3 text-[11px] text-gray-500 space-y-1.5 bg-gray-900/30">
+          <div className="flex justify-between"><span className="text-gray-600">Trade ID</span><span className="font-mono text-gray-300">{t.tradeId}</span></div>
+          <div className="flex justify-between"><span className="text-gray-600">Signal / Setup</span><span className="font-mono text-gray-300">{t.signalId} / {t.setupId}</span></div>
+          <div className="flex justify-between">
+            <span className="text-gray-600">Entry order</span>
+            <span className="font-mono text-gray-300">
+              {t.entryOrderId ?? '—'}{t.entryFillPrice != null ? ` @ $${t.entryFillPrice.toFixed(2)}` : ''}
+            </span>
+          </div>
+          {t.exits.length > 0 && (
+            <div>
+              <div className="text-gray-600 mb-0.5">Exit fills</div>
+              {t.exits.map((e, i) => (
+                <div key={i} className="flex justify-between pl-2">
+                  <span className="text-gray-500">{e.reason} · {e.qty} sh · {e.orderId ?? 'no order id'}</span>
+                  <span className="font-mono text-gray-300">{e.fillPrice != null ? `$${e.fillPrice.toFixed(2)}` : '—'}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {t.executionWarnings.length > 0 && (
+            <div className="text-yellow-500/90">{t.executionWarnings.join(' · ')}</div>
+          )}
+          <div className="text-gray-700">Reconciliation: {recon.label.toLowerCase()} · fully closed: {t.fullyClosed ? 'yes' : 'no'}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BrokerTradesSection() {
+  const broker = useBrokerTrades()
+
+  return (
+    <div className="border-t border-gray-800">
+      <div className="flex items-center gap-2 px-5 py-2.5">
+        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Broker-Linked Trades</h2>
+        <span className="text-[10px] text-gray-600">Alpaca PAPER · Companion-originated</span>
+        {broker.counts && <span className="text-[10px] text-gray-600 ml-auto">{broker.counts.total} trades</span>}
+      </div>
+      {broker.loading && broker.trades.length === 0 && (
+        <div className="px-5 pb-3 text-xs text-gray-600">Loading ledger…</div>
+      )}
+      {broker.error && (
+        <div className="px-5 pb-3 text-xs text-red-400/90">
+          Ledger unavailable — {broker.error}. {broker.trades.length > 0 ? 'Showing last known trades.' : ''}
+        </div>
+      )}
+      {!broker.loading && !broker.error && broker.trades.length === 0 && (
+        <div className="px-5 pb-3 text-xs text-gray-600">No Companion-originated PAPER trades in the ledger yet.</div>
+      )}
+      {broker.trades.length > 0 && (
+        <div className="max-h-56 overflow-y-auto">
+          {broker.trades.map(t => <BrokerTradeRow key={t.tradeId} t={t} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main Journal ───────────────────────────────────────────────────────────
 
 type FilterMode = 'all' | 'open' | 'wins' | 'losses' | 'today'
@@ -492,6 +602,14 @@ export function TradeJournal({ onClose }: { onClose: () => void }) {
             <TradeDetail key={selected.id} pos={selected} />
           </div>
         )}
+      </div>
+
+      {/* Broker-linked history — kept separate from the manual/local table above:
+          different data model (execution ledger vs Zustand Position), and this
+          keeps the Journal focused on trade history rather than becoming an
+          Alpaca account dashboard. */}
+      <div className="flex-shrink-0 max-h-64 overflow-hidden flex flex-col">
+        <BrokerTradesSection />
       </div>
     </div>
   )

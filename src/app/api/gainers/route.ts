@@ -1,10 +1,14 @@
 import { NextResponse } from 'next/server'
-import { getTopGainers, getMostActive, getBatchQuotes, getStockNews } from '@/lib/fmp-client'
+import { getTopGainers, getMostActive, getBatchQuotes, getStockNews, getPressReleases, getFloatShares, getDailyCandles, getExtendedIntradayCandles, getIntradayCandles } from '@/lib/fmp-client'
 import { getYFQuote, getYFScreener, getYFTrending, getYFCandles } from '@/lib/yahoo-client'
 import { cached, TTL, cache } from '@/lib/cache'
-import { processNews } from '@/lib/news-engine'
+import { processNews, getBestCatalystSummary } from '@/lib/news-engine'
 import type { ScannerRow, ScannerFilters, BadgeType, Badge } from '@/types'
-import { getSessionType, isPremarket } from '@/lib/market-hours'
+import { getSessionType, isPremarket, parseEtTimestampSec } from '@/lib/market-hours'
+import { sessionFractionElapsed } from '@/lib/technical'
+import { premarketVolumeProfile, etDateNow, etHHMMNow } from '@/lib/premarket-volume'
+import { getWebullGainers, type WebullRankType } from '@/lib/webull-client'
+import { readMomentum, compareByMomentum } from '@/lib/momentum-rank'
 
 const EXCLUDED_TERMS = [
   'etf', 'fund', 'trust', 'warrant', 'right ', 'unit ', 'preferred', 'pref',
@@ -41,16 +45,98 @@ function assignBadges(row: {
   return badges
 }
 
-// Fraction of the 9:30–16:00 ET regular session elapsed (clamped 0.05–1) so
-// relative volume is time-of-day adjusted rather than compared to a full day.
-function sessionFractionElapsed(): number {
-  const et = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())
-  const [h, m] = et.split(':').map(Number)
-  const mins = h * 60 + m
-  const open = 9 * 60 + 30, close = 16 * 60
-  if (mins >= close) return 1
-  if (mins <= open) return 0.05   // premarket — compare against a small slice of the day
-  return Math.max(0.05, (mins - open) / (close - open))
+// Fraction of the regular session elapsed, floored at 0.05 so an early-session or
+// premarket row is compared against a small slice of a day rather than dividing by
+// ~zero. The unclamped ET-correct calculation lives in technical.ts — one source of
+// truth, since RVOL means the same thing in the scanner and in the signal engine.
+function scannerSessionFraction(): number {
+  return Math.max(sessionFractionElapsed(), 0.05)
+}
+
+/**
+ * Fill in the RVOL the primary sources can't supply.
+ *
+ * Every one of the day's real movers showed "—": FMP's /quote no longer returns
+ * `averageVolume` at all (the field is absent from the response, verified
+ * 2026-08-03), and Yahoo's day_gainers screener — the only source that does carry
+ * an average — has a size floor that excludes exactly the sub-$300M names that gap
+ * 100%+. So the rows with no baseline were the rows we most wanted to rank.
+ *
+ * Regular hours: derive the 20-day average from daily candles (the same fallback
+ * the monitor already uses) off the shared `daily:` cache key.
+ *
+ * Premarket: the day-pace calculation does not apply, and the candle feed reports
+ * premarket volume as 0, so use the real premarket measure — today's premarket
+ * volume vs this name's own typical premarket volume by this time of day. Shares
+ * the `pmvol:` cache key with the monitor, so the column now reads the same number
+ * the premarket signal gate is judging.
+ *
+ * Runs on the ranked rows only (≤30) and never overwrites a value we already have.
+ */
+async function backfillRelativeVolume(rows: ScannerRow[], inPremarket: boolean): Promise<void> {
+  await Promise.allSettled(rows.map(async r => {
+    if (inPremarket) {
+      const profile = await cached(`pmvol:${r.symbol}`, TTL.PREMARKET_VOL, async () => {
+        const candles = await getExtendedIntradayCandles(r.symbol)
+        if (candles.length === 0) return null
+        return premarketVolumeProfile(candles, { todayEt: etDateNow(), throughHHMM: etHHMMNow() })
+      })
+      if (!profile) return
+      if (profile.relativeVolume != null) r.relativeVolume = profile.relativeVolume
+      // Only trust the number when the feed actually captured the tape. A tiny
+      // "measured" reading (HYFM's 55 premarket shares) is missing coverage, not
+      // thin liquidity — writing it here would let the premarket volume floor drop
+      // the very rockets we want to surface. When unmeasured, leave premarketVolume
+      // null (unknown) so the row survives and is ranked on price/change instead.
+      if (profile.measured && profile.todayVolume > 0) {
+        r.premarketVolume = profile.todayVolume
+        if (r.volume === 0) r.volume = profile.todayVolume
+      }
+      return
+    }
+    if (r.relativeVolume != null || r.volume <= 0) return
+    const daily = await cached(`daily:${r.symbol}`, TTL.CANDLES_DAILY, () => getDailyCandles(r.symbol))
+    if (daily.length < 5) return
+    const recent = daily.slice(-20)
+    const avgVol = recent.reduce((s, c) => s + c.volume, 0) / recent.length
+    if (avgVol > 0) r.relativeVolume = r.volume / (avgVol * scannerSessionFraction())
+  }))
+}
+
+/**
+ * How wide a candidate pool the momentum pass re-ranks. Day-change order is the
+ * thing we're correcting, so the pool must be big enough to contain names that are
+ * mid-leg but not yet near the top of the day-change list.
+ */
+const MOMENTUM_POOL_SIZE = 60
+
+/**
+ * Attach the "is it moving NOW" reading to each candidate.
+ *
+ * Shares the 5-min candle cache with the monitor, so this doesn't double-hit the
+ * feed. Fails OPEN per row: a name whose tape we can't fetch keeps a null score and
+ * falls back to day-change ordering rather than being buried for missing data.
+ */
+async function attachMomentum(rows: ScannerRow[], inPremarket: boolean): Promise<void> {
+  const now = Date.now()
+  await Promise.allSettled(rows.map(async r => {
+    try {
+      // Premarket needs the extended feed; regular hours the ordinary 5-min tape.
+      const candles = inPremarket
+        ? await cached(`xcandles5m:${r.symbol}`, TTL.CANDLES_5M, () => getExtendedIntradayCandles(r.symbol))
+        : await cached(`candles5m:${r.symbol}`, TTL.CANDLES_5M, () => getIntradayCandles(r.symbol, '5min'))
+      const normalized = candles.map(c => ({
+        time: parseEtTimestampSec(c.date),
+        open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+      })).filter(c => Number.isFinite(c.time))
+      const m = readMomentum(normalized, r.price, now)
+      r.rocPct = m.rocPct
+      r.offHighPct = m.offHighPct
+      r.momentumScore = m.score
+    } catch {
+      r.momentumScore = null   // fail open — ranked on day change instead
+    }
+  }))
 }
 
 // Real premarket price for a symbol. Yahoo's meta.preMarketPrice is unreliable
@@ -122,24 +208,38 @@ export async function GET(request: Request) {
       cache.delete('yfActives')
       cache.delete('yfTrending')
       cache.delete('batchQuotes:gainers')
+      cache.delete('webullGainers:preMarket')
+      cache.delete('webullGainers:afterMarket')
+      cache.delete('webullGainers:1d')
     }
 
     // Universe strategy:
     // - Regular hours: Yahoo Finance day_gainers + most_actives (real-time, no auth)
     //   supplemented by FMP biggest-gainers for any symbols YF misses.
     // - Premarket: FMP biggest-gainers + most-active merged, then YF quote per symbol for gap%.
-    const [yfGainers, yfSmallCap, yfActives, yfTrendingSyms, fmpGainers, fmpMostActive] = await Promise.all([
+    // Webull is the ONLY source that surfaces fresh premarket rockets — FMP's
+    // biggest-gainers lags to the prior session and doesn't carry sub-$1 low-floats
+    // at all (QNME/ELPW had no FMP quote 2026-08-04), Yahoo's screeners are RTH +
+    // size-floored. Webull's own premarket board returned exactly the day's movers.
+    // Public ranking endpoint, no login; fails soft to [] so the scanner survives if
+    // Webull is unreachable. Rank tracks the session.
+    const webullRank: WebullRankType = inPremarket ? 'preMarket' : sessionType === 'afterhours' ? 'afterMarket' : '1d'
+
+    const [yfGainers, yfSmallCap, yfActives, yfTrendingSyms, fmpGainers, fmpMostActive, webullGainers] = await Promise.all([
       !inPremarket ? cached('yfGainers', TTL.GAINERS, () => getYFScreener('day_gainers', 50)).catch(() => []) : Promise.resolve([]),
       !inPremarket ? cached('yfSmallCap', TTL.GAINERS, () => getYFScreener('small_cap_gainers', 25)).catch(() => []) : Promise.resolve([]),
       !inPremarket ? cached('yfActives', TTL.GAINERS, () => getYFScreener('most_actives', 50)).catch(() => []) : Promise.resolve([]),
       cached('yfTrending', TTL.GAINERS, () => getYFTrending(40)).catch(() => [] as string[]),
       cached('gainers', TTL.GAINERS, getTopGainers),
       cached('mostActive', TTL.GAINERS, getMostActive),
+      cached(`webullGainers:${webullRank}`, TTL.GAINERS, () => getWebullGainers(webullRank)).catch(() => []),
     ])
 
     // Fetch YF quotes for trending symbols not already covered by screeners
     // (trending gives symbols only; we need price/change% from quote)
-    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfAvgVolume?: number | null; yfMarketCap?: number | null }
+    // wb* fields carry Webull's own price/change so a name no other feed covers
+    // (the sub-$1 rockets) still has real numbers to display and rank on.
+    type UniverseEntry = { symbol: string; name?: string; price?: number; changesPercentage?: number | string; exchange?: string; yfChangePct?: number; yfVolume?: number; yfAvgVolume?: number | null; yfMarketCap?: number | null; wbPrice?: number | null; wbChangePct?: number; webull?: boolean }
 
     const screenerSymbols = new Set([...yfGainers, ...yfSmallCap, ...yfActives].map(r => r.symbol))
     const trendingOnly = (yfTrendingSyms as string[]).filter(s => !screenerSymbols.has(s))
@@ -181,7 +281,21 @@ export async function GET(request: Request) {
     }))
     const fmpRows: UniverseEntry[] = [...fmpGainers, ...fmpMostActive]
 
-    const universe = [...yfRows, ...trendingRows, ...fmpRows].filter(g => {
+    const webullRows: UniverseEntry[] = webullGainers.map(w => ({
+      symbol: w.symbol,
+      name: '',
+      price: w.price ?? undefined,
+      changesPercentage: w.changePct,
+      exchange: w.exchange,
+      wbPrice: w.price,
+      wbChangePct: w.changePct,
+      webull: true,
+    }))
+
+    // Webull first so its fresh premarket movers seed the universe; FMP/Yahoo rows
+    // for the same symbol are deduped out but their richer data is re-joined by the
+    // per-symbol quote/candle fetches below.
+    const universe = [...webullRows, ...yfRows, ...trendingRows, ...fmpRows].filter(g => {
       if (!g.symbol || seen.has(g.symbol)) return false
       seen.add(g.symbol)
       if (filters.commonStocksOnly && isExcluded(g.name ?? '', g.symbol, g.exchange)) return false
@@ -215,15 +329,26 @@ export async function GET(request: Request) {
       }
     }
 
-    // News for top 8 only
-    const newsMap = new Map<string, string>()
+    // Catalyst is fetched AFTER ranking (below) — only for the rows we actually
+    // display — so every visible mover gets a news lookup, not just the first 8.
+
+    // Float — a core "in play" dimension (low float = violent moves). Fetched from
+    // FMP shares-float, cached 6h since it changes only on filings. Some micro-caps
+    // return glitchy tiny values (e.g. INLF reported 4,263 shares); treat anything
+    // under 10k as bad data (null) rather than a fake ultra-low-float flag.
+    const floatMap = new Map<string, number | null>()
     await Promise.allSettled(
-      symbols.slice(0, 8).map(async sym => {
-        const news = await cached(`news:${sym}`, TTL.NEWS, () => getStockNews(sym, 5))
-        const processed = processNews(news, sym)
-        if (processed.length > 0) newsMap.set(sym, processed[0].quality)
+      symbols.map(async sym => {
+        floatMap.set(sym, await cached(`floatShares:${sym}`, TTL.FLOAT, () => getFloatShares(sym)))
       })
     )
+
+    // Premarket volume is inherently lower — relax the floor to 5% of normal.
+    const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume
+    // Premarket: allow sub-$1 gappers (the day's low-float rockets — QNME $0.31,
+    // ELPW $0.10 — live below the $1 default floor). Highest-risk/thinnest names, by
+    // explicit choice. RTH keeps the normal floor.
+    const effectiveMinPrice = inPremarket ? Math.min(filters.minPrice, 0.05) : filters.minPrice
 
     const rows: ScannerRow[] = universe
       .map((g: UniverseEntry, i: number) => {
@@ -255,6 +380,13 @@ export async function GET(request: Request) {
           price = g.price
           changePct = g.yfChangePct
           prevClose = q?.previousClose ?? 0
+        } else if (g.webull && !q?.price && !(pm?.price)) {
+          // Webull-discovered name that no other feed covers (the sub-$1 rockets):
+          // use Webull's own price/change so it still displays and ranks instead of
+          // being dropped for a missing FMP/Yahoo quote.
+          price = g.wbPrice ?? 0
+          changePct = g.wbChangePct ?? 0
+          prevClose = price > 0 && changePct > -100 ? price / (1 + changePct / 100) : 0
         } else {
           // FMP-only row: use quote data
           price = q?.price ?? g.price ?? 0
@@ -264,26 +396,50 @@ export async function GET(request: Request) {
             : (q?.changePercentage ?? Number(g.changesPercentage ?? 0))
         }
 
-        const volume = pm?.volume ?? g.yfVolume ?? q?.volume ?? 0
+        // Webull is the premarket discovery authority for thin names. When the
+        // FMP/Yahoo enrichment disagrees and would drop a name Webull flags as a real
+        // gainer, trust Webull's own price/change. ELPW (2026-08-04): Yahoo's
+        // premarket path read $0.18 vs a stale $0.175 prevClose = +2.7% and the
+        // gainer filter dropped it, while FMP AND Webull agreed it was $0.10 / +67%.
+        // Only overrides UP to a real gainer — a higher fresh gap (RAIN via Yahoo,
+        // +111% > Webull's +97%) is left alone.
+        if (g.webull && g.wbChangePct != null && g.wbPrice && g.wbChangePct >= filters.minChangePct && g.wbChangePct > changePct) {
+          price = g.wbPrice
+          changePct = g.wbChangePct
+          prevClose = changePct > -100 ? price / (1 + changePct / 100) : prevClose
+        }
+
+        // NOTE: `||` not `??` on purpose. The premarket candle sum comes back as 0
+        // (the Yahoo feed returns premarket bars with price but no volume), and `??`
+        // would treat that 0 as a real value — pinning every scanner row to vol 0 and
+        // rvol null, which silently broke the MinVol and High-RVOL filters. A zero
+        // here is always a data gap, so fall through to the quote's volume.
+        const volume = pm?.volume || g.yfVolume || q?.volume || 0
         // Prefer YF screener's 3-month average daily volume; fall back to FMP quote's.
         const avgVol = (g.yfAvgVolume && g.yfAvgVolume > 0) ? g.yfAvgVolume : (q?.averageVolume ?? 0)
         // Session-adjusted relative volume: today's volume vs the normal pace by this time.
-        const rvol = avgVol > 0 ? volume / (avgVol * sessionFractionElapsed()) : null
+        const rvol = avgVol > 0 ? volume / (avgVol * scannerSessionFraction()) : null
 
-        // Premarket volume is inherently lower — relax filter to 5% of normal
-        const effectiveMinVolume = inPremarket ? filters.minVolume * 0.05 : filters.minVolume
 
-        if (price < filters.minPrice || price > filters.maxPrice) return null
+        if (price < effectiveMinPrice || price > filters.maxPrice) return null
         // During premarket only show upside gappers (positive change)
         const absPct = Math.abs(changePct)
         if (absPct < filters.minChangePct || absPct > filters.maxChangePct) return null
         if (inPremarket && changePct <= 0) return null  // skip stocks gapping down in premarket scanner
-        if (volume > 0 && volume < effectiveMinVolume) return null
+        // Volume floor: RTH only. In premarket the `volume` here is often a stale
+        // regular-session fallback (RAIN's 20k FMP volume tripped the floor and
+        // dropped a +110% gapper) — premarket volume is measured later in the
+        // backfill and screened there on the real number.
+        if (!inPremarket && volume > 0 && volume < effectiveMinVolume) return null
         if (filters.minRelativeVolume > 0 && rvol !== null && rvol < filters.minRelativeVolume) return null
 
-        const catalystLabel = (newsMap.get(g.symbol) ?? 'No Recent Catalyst Found') as ScannerRow['catalystLabel']
-        const badges = assignBadges({ relativeVolume: rvol, changePct: absPct, catalystCategory: '', catalystLabel, float: null })
+        const float = floatMap.get(g.symbol) ?? null
+        // Only exclude on maxFloat when we actually know the float — never drop a
+        // name for missing data.
+        if (filters.maxFloat != null && float != null && float > filters.maxFloat) return null
 
+        // Catalyst + badges are attached after ranking (see below), so leave
+        // placeholders here.
         const premarketChange = pm ? pm.price - prevClose : null
         const premarketChangePct = pm && prevClose > 0 ? ((pm.price - prevClose) / prevClose) * 100 : null
 
@@ -295,14 +451,14 @@ export async function GET(request: Request) {
           changePct: inPremarket ? (premarketChangePct ?? changePct) : changePct,
           volume,
           relativeVolume: rvol,
-          float: null as number | null,
+          float,
           marketCap: g.yfMarketCap ?? q?.marketCap ?? null,
           exchange: g.exchange ?? '',
-          catalystLabel,
+          catalystLabel: 'No Recent Catalyst Found' as const,
           catalystCategory: 'No Catalyst' as const,
           setupScore: 50,
           status: 'Developing' as const,
-          badges,
+          badges: [] as Badge[],
           lastUpdate: Date.now(),
           premarketChangePct,
           premarketChange,
@@ -314,11 +470,59 @@ export async function GET(request: Request) {
         } as ScannerRow
       })
       .filter((r): r is NonNullable<typeof r> => r !== null)
+      // Pre-rank on day change only to pick a CANDIDATE POOL — deliberately wider
+      // than maxResults, because the whole point of the momentum pass below is that
+      // day-change order is wrong. A name mid-leg can sit well down this list.
       .sort((a, b) => b.changePct - a.changePct)
-      .slice(0, filters.maxResults)
+      .slice(0, MOMENTUM_POOL_SIZE)
+
+    // Re-rank on how each name is moving NOW. See momentum-rank.ts: ranking by
+    // change-from-close surfaces names AFTER their move, at which point the
+    // anti-fade gate correctly refuses them — 9 of 12 top gainers on 2026-08-12
+    // were already >5% off their session high, and 46 setups on them triggered 0.
+    await attachMomentum(rows, inPremarket)
+    rows.sort(compareByMomentum)
+    rows.splice(filters.maxResults)
+    rows.forEach((r, i) => { r.rank = i + 1 })
+
+    // RVOL backfill for the ranked rows only — before badges, which read it.
+    await backfillRelativeVolume(rows, inPremarket)
+    // Re-apply the volume floors now that the previously-unknown rows have numbers.
+    // The pass during mapping can only drop a row whose RVOL was already known, so
+    // without this a High-RVOL filter still let every baseline-less name through —
+    // and in premarket every row arrived with volume 0 (feed gap), so nothing could
+    // be screened on volume at all. Rows still lacking a measurement are kept: never
+    // drop a name for missing data.
+    const ranked = rows
+      .filter(r => filters.minRelativeVolume <= 0 || r.relativeVolume == null || r.relativeVolume >= filters.minRelativeVolume)
+      .filter(r => !inPremarket || r.premarketVolume == null || r.premarketVolume >= effectiveMinVolume)
       .map((r, i) => ({ ...r, rank: i + 1 }))
 
-    return NextResponse.json({ rows, sessionType, timestamp: Date.now() })
+    // Catalyst enrichment for the ranked rows only. Merge press-releases with the
+    // news feed (PR first — the original, freshest wire) so a gapper's actual
+    // headline drives the label, and derive the real category + quality via
+    // getBestCatalystSummary. Cached 3 min per symbol.
+    await Promise.allSettled(
+      ranked.map(async r => {
+        const [pr, news] = await Promise.all([
+          cached(`pr:${r.symbol}`, TTL.NEWS, () => getPressReleases(r.symbol, 8)),
+          cached(`news:${r.symbol}`, TTL.NEWS, () => getStockNews(r.symbol, 8)),
+        ])
+        const processed = processNews([...pr, ...news], r.symbol)
+        const c = getBestCatalystSummary(processed)
+        r.catalystLabel = c.quality
+        r.catalystCategory = c.category
+        r.badges = assignBadges({
+          relativeVolume: r.relativeVolume,
+          changePct: Math.abs(r.changePct),
+          catalystCategory: c.category,
+          catalystLabel: c.quality,
+          float: r.float,
+        })
+      })
+    )
+
+    return NextResponse.json({ rows: ranked, sessionType, timestamp: Date.now() })
   } catch (err) {
     console.error('gainers route error:', err)
     return NextResponse.json({ error: 'Failed to fetch gainers' }, { status: 500 })

@@ -18,6 +18,7 @@ import type {
 import { scoreSetup, type ScoringContext } from './scoring-matrix'
 import { approachThresholdPct } from './adaptive-threshold'
 import { deriveSignal } from './signals'
+import { isPremarket, type SessionType } from './market-hours'
 
 export interface DetectionContext {
   symbol: string
@@ -30,6 +31,9 @@ export interface DetectionContext {
   hasCatalyst: boolean
   spreadPct: number | null
   changePct: number
+  session: SessionType       // premarket detectors gate on this
+  minutesSinceOpen: number | null  // minutes past the 09:30 open (null outside RTH); gates the opening lockout
+  float: number | null       // shares float (null when unknown); feeds the in-play gate
 }
 
 // ── Small candle utilities ──────────────────────────────────────────────────
@@ -60,6 +64,23 @@ function makingLowerHighs(candles: Candle[]): boolean {
   return highs[highs.length - 1] < highs[0]
 }
 
+// The confirmation entry every momentum trader teaches (Warrior micro-pullback,
+// Kev "wait for a buyer to step in"): don't buy the dip itself — buy the FIRST
+// candle that takes out the pullback's high after a 2–3 bar digestion. That flips
+// the entry from "price is back near the level" (catching a falling knife) to
+// "buyers have proven they're back". Requires: a real pullback in the recent bars,
+// then the current bar breaking above it and closing in its upper half.
+function newHighAfterPullback(candles: Candle[]): boolean {
+  const r = lastN(candles, 5)
+  if (r.length < 4) return false
+  const cur = r[r.length - 1]
+  const pb = r.slice(0, -1).slice(-3)                 // the up-to-3-bar pullback before `cur`
+  const pbHigh = Math.max(...pb.map(c => c.high))
+  const pulledBack = pb.some(c => c.close < c.open) || pb[pb.length - 1].low < pb[0].low
+  const closedStrong = cur.close >= cur.open // a green confirmation bar, not an upper-wick rejection
+  return pulledBack && cur.high > pbHigh && closedStrong
+}
+
 function volumeContracting(candles: Candle[]): boolean {
   const recent = lastN(candles, 6)
   if (recent.length < 4) return false
@@ -68,12 +89,621 @@ function volumeContracting(candles: Candle[]): boolean {
   return secondHalf < firstHalf * 0.9
 }
 
-function volumeExpanding(candles: Candle[]): boolean {
-  const recent = lastN(candles, 20)
-  if (recent.length < 5) return false
-  const avg = recent.reduce((s, c) => s + c.volume, 0) / recent.length
+// Volume confirmation — the single gate on EVERY momentum trigger, so its
+// calibration sets breadth across the whole stack. "Expanding" means the break
+// bar carries more volume than the bars IMMEDIATELY before it. The old 20-bar
+// average penalised CONTINUATION breaks: mid-trend that average is already
+// inflated by the move, so a real thrust rarely cleared 1.3× it and HOD/BOS
+// triggers starved (2026-07-23: only 3 setups all day). Compare to the recent
+// lull at a lower multiple instead — still rejects a break on fading/dead
+// volume, but admits the sustained-volume continuation we kept missing.
+const VOLUME_EXPANSION_MULT = 1.2
+const VOLUME_EXPANSION_LOOKBACK = 8
+export function volumeExpanding(candles: Candle[]): boolean {
+  const recent = lastN(candles, VOLUME_EXPANSION_LOOKBACK)
+  if (recent.length < 4) return false
   const last = recent[recent.length - 1]
-  return last.volume > avg * 1.3
+  const prior = recent.slice(0, -1)
+  const avg = prior.reduce((s, c) => s + c.volume, 0) / prior.length
+  return avg > 0 && last.volume > avg * VOLUME_EXPANSION_MULT
+}
+
+// The Yahoo feed returns PREMARKET 1-min bars with price but volume: 0 (a DATA
+// GAP, not "no volume"). Every momentum trigger gates on volumeExpanding, which is
+// always false on zero volume — so nothing could ever trigger before the open
+// (2026-08-03: 51 premarket setups, 0 triggered). When there's no usable volume
+// data, confirm the trigger on the price break alone; require expansion only when
+// volume actually exists (so RTH behaviour is unchanged).
+function hasVolumeData(candles: Candle[]): boolean {
+  return lastN(candles, VOLUME_EXPANSION_LOOKBACK).some(c => c.volume > 0)
+}
+function volumeConfirmsTrigger(candles: Candle[]): boolean {
+  return volumeExpanding(candles) || !hasVolumeData(candles)
+}
+
+// ── Long-bounce quality gates (from the 2026-07-06/07 trade review) ──────────
+// Buying "bounces" into a stock that has already rolled over off its session
+// high (CLRO 10.5 after a 9→12 run; JLHL 4.8 after topping 5.5; FISV 54.8 off
+// the top) produced the worst clusters of losers. Veto the *trigger* in those
+// conditions — the setup stays visible as a watch but won't log a BUY.
+// ≥5% below the session high on lower highs = rolling over. Tightened from 8%
+// after 2026-07-09, where several "bought the top" losers (SDOT after its blow-off,
+// etc.) sat 5–10% off the high and rolled but slipped the looser gate.
+const ROLLOVER_OFF_HIGH_PCT = 0.05
+// A stop tighter than this is noise on a low-float and gets shaken out before
+// the thesis plays (SEER's 0.6% scalp). We floor stop width — never tighten.
+// (Bounce/pullback setups only; strength entries use the pivot stop below.)
+const MIN_STOP_PCT = 0.015
+// Strength-entry stop model. When you enter on a CONFIRMED break/reclaim (a new
+// high), the stop belongs at the breakout pivot — ~a volatility unit under the
+// ACTUAL fill — not at the far base low. On a chased fill (price ran past the
+// trigger) the base-low stop balloons risk into a sub-0.1R trade that the R/R
+// gate then benches (NVEC 2026-07-23: fill 130.60, base stop 126.15 → 0.1R).
+const STOP_ATR_MULT = 1.3        // pivot stop sits ~1.3 ATR under the fill
+
+/**
+ * ABSOLUTE STOP-WIDTH FLOOR, scaled to session friction (raised from a flat 0.4%
+ * on 2026-08-12).
+ *
+ * A stop must be several times the round-trip cost of the trade or the arithmetic
+ * cannot work. Friction is 0.15%/side in regular hours and 0.5%/side premarket
+ * (see SLIPPAGE_RTH / SLIPPAGE_EXTENDED in eod-resolver.ts), i.e. 0.3% and 1.0%
+ * round trip. The old 0.4% floor sat AT or BELOW that in every session, so a
+ * "stopped out" trade lost far more than 1R before price moved at all.
+ *
+ * Measured on 2026-08-12's 29 signals:
+ *   losing trades: mean stop 1.76%, mean loss -2.49%  =  -1.85R, not -1R
+ *   QMCO's 0.4% stop lost 1.39% — -3.48R on a move of under half a percent
+ * By bucket, net R:
+ *   stop <1%   13 signals  1W/12L  -13.5R
+ *   stop 1-2%   6 signals  1W/5L    -7.6R
+ *   stop 2-4%   5 signals  2W/2L    +0.2R
+ *   stop 4%+    5 signals  2W/3L    +0.1R
+ * Everything under 2% lost; two thirds of the book was under 2%, and it accounted
+ * for the entire day's -20.8R. The trades that worked (both BIVI entries at 2.7%
+ * and 4.2%, RMCF at 8.9%) all carried room.
+ *
+ * ~5x round-trip cost each side of the open. This does not tighten anything: it
+ * only ever widens a degenerate stop, and a setup whose R/R can't survive the
+ * wider stop is refused by the R/R gate — which is the intended outcome, because
+ * that trade was never playable.
+ */
+const MIN_STOP_FLOOR_RTH_PCT = 0.015        // 1.5% — 5x the 0.3% RTH round trip
+const MIN_STOP_FLOOR_EXTENDED_PCT = 0.03    // 3.0% — 3x the 1.0% premarket round trip
+
+function minStopFloorPct(session: SessionType): number {
+  return session === 'regular' ? MIN_STOP_FLOOR_RTH_PCT : MIN_STOP_FLOOR_EXTENDED_PCT
+}
+// The setups you enter on strength — the stop trails up to the pivot for these.
+// Mean-reversion bounces keep their structural stop under the level they bounce from.
+const STRENGTH_ENTRY_TYPES: SetupType[] = [
+  'breakout', 'bull_flag', 'break_of_structure', 'opening_range_break', 'opening_drive',
+  'vwap_reclaim', 'level_reclaim',
+]
+// Anti-fade gate (2026-08-04 CSV, 70 signals / 27% win). A "breakout" fired well
+// BELOW the session high is not a breakout — it's a bounce on a name that already
+// topped and faded. That day, breaks >10% off the high won 20% vs 37% near the
+// high, and the generic breakout/BOS detectors (46+13 signals, ~20% win) were the
+// entire firehose. So a chase-family break can't fire when price sits more than
+// MAX_BELOW_HIGH_PCT under the session high. The early-momentum winners
+// (premarket_breakout, opening_drive, ORB, HOD) are NOT in this set — they fire at
+// or near the high by construction and are the setups that actually pay.
+const ANTI_FADE_TYPES: SetupType[] = ['breakout', 'break_of_structure']
+// Tightened 8%→5% after the 20-day FMP replay (2026-08-05): the −5%-to−8%-off-high
+// band bled (−1.01%/trade) while entries within 5% of the high carried the book, so
+// a chase-family break that fires 5%+ under the session high is now vetoed.
+const MAX_BELOW_HIGH_PCT = 5
+// A target only a few basis points beyond the fill is noise, not a target: it
+// tanks R/R and books phantom "wins" (KUST/MWC/INM 2026-07-22). The first RATED
+// target must clear a meaningful reward — ≥ this fraction of the risk, a % of
+// price, or a volatility unit, whichever is largest — so trivial levels are
+// skipped for the measured move behind them.
+// The 0.4% price floor was far too small for this book: on 2026-07-31 AMCX's ORB
+// rated T1 at 11.57 off an 11.50 fill (+0.6% — seven cents), and half a scale-out
+// at +0.6% cannot pay for the losers. These are momentum names running 20–300% in
+// a day; the thesis is low-win/high-payoff, so a first target must be worth
+// taking. ATR does the scaling — 1 volatility unit on a 6%-ATR runner is ~6%.
+// ── SPACE gate (2026-08-12) ──────────────────────────────────────────────────
+//
+// "BREAKOUT LEVEL → OPEN PRICE SPACE → NEXT SUPPLY AREA." Room to the next
+// resistance is the variable this engine never measured, and its absence shows up
+// as a specific defect: the target floor below (MIN_T1_REWARD_*) SKIPS a level
+// that sits closer than the minimum reward and rates a further one as T1. So a
+// setup with genuine supply 0.5% overhead isn't refused — it's handed a
+// manufactured 2% target that makes its R/R look tradeable, and price stalls into
+// the level we pretended wasn't there.
+//
+// The gate asks the question the ladder can't: how far to the next REAL supply,
+// measured in units of the risk we're taking? Below MIN_SPACE_R there isn't
+// enough room to make even 1R before price meets sellers, so the trade is refused
+// outright rather than re-targeted.
+//
+// Fails OPEN: no level overhead means open space (the best case), never a veto.
+// A level under SPACE_LEVEL_MIN_STRENGTH is noise and must not block a trade —
+// same threshold the breakout detectors already use to decide what counts as
+// resistance worth reacting to.
+// SWEPT 2026-08-12. Enabled at 0.5R; 1.0R was too tight.
+//
+//   baseline (cull 4)  113 signals  5.9/day  40% win  +0.345R  net +38.9R
+//   MIN_SPACE_R 1.0     75 signals  4.2/day  42% win  +0.500R  net +37.5R  WORSE
+//   MIN_SPACE_R 0.5     91 signals  4.8/day  44% win  +0.569R  net +51.8R  BETTER
+//
+// READ THE MECHANISM CAREFULLY, because it is not the one this gate was built on.
+// Decomposed at 0.5R, in R:
+//   kept     n=71  net +35.4R  avg +0.499R
+//   DROPPED  n=42  net  +2.2R  avg +0.052R   <- ~ZERO, not negative
+//   NEW      n=20  net +16.4R  avg +0.818R
+// The refused trades are not losers, they are WORTHLESS. The gain comes from the
+// 20 signals that backfilled the per-symbol cap and dedup slots those trades had
+// been occupying. So the real cost of a no-room setup is opportunity cost: the
+// cap (MAX_LOGS_PER_SYMBOL) and the 45-min dedup window are a fixed budget, and
+// spending them on zero-expectancy trades crowds out better ones.
+//
+// At 1.0R the same gate ALSO removed genuinely profitable trades, which is why
+// net R fell despite avg/trade rising — the "better average by trading less" trap.
+//
+// CAVEAT: the +16.4R rides on 20 backfilled signals, and the same 20 appear in
+// both runs — one draw, not two confirmations. Re-check when more days exist.
+// 0 disables. The replay also UNDERSTATES this gate: it fills at the level with
+// no spread, so it never charges the friction of grinding out of a stalled trade.
+const MIN_SPACE_R = envNum('MIN_SPACE_R', 0.5)
+const SPACE_LEVEL_MIN_STRENGTH = 45
+
+// ── ACCEPTANCE (2026-08-12) ──────────────────────────────────────────────────
+//
+// "A trader who defines breakout as 'one cent above resistance' is vulnerable
+// because penny stocks frequently overshoot levels due to spread, stop orders,
+// thin liquidity, and momentum market orders. The real question is: did the market
+// ACCEPT above the level?"
+//
+// That is our trade. `triggeredRaw` fires the instant price crosses, so we buy the
+// print and never require the hold — and 12 of 18 executed paper trades were
+// stopped out INSIDE the bar they entered while the names went on to run (CELZ
+// +37.6% the same day). That is the failed-breakout wick, bought.
+//
+// ENABLED at 1 on 2026-08-15 on LIVE evidence, not the replay. Two independent
+// live samples show the entry-bar death this targets: 12 of 18 executed paper
+// trades (2026-08-07/08-10) and 6 of 9 signals on 2026-08-14 stopped out INSIDE
+// their entry bar, MFE 0.00R — bought the wick, price failed back, then in the
+// clearest cases ran without us (ONFO +53.6%, VWAV +34.4% after stopping us out
+// on 08-14). Critically this survived the 2026-08-12 timezone fix, so the clock
+// was NOT its cause.
+//
+// The replay cannot judge this: it fills on a completed-bar close and so never
+// buys the wick in the first place. That is exactly why it ships on live evidence
+// and off by env (ACCEPTANCE_BARS=0) rather than a backtest verdict.
+const ACCEPTANCE_BARS = envNum('ACCEPTANCE_BARS', 1)
+
+/**
+ * Has the market closed above `level` on the last `bars` candles?
+ *
+ * Acceptance is behaviour, not elapsed time — "a stock can spend five minutes
+ * above resistance with no demand" — so this asks for closes, not duration.
+ *
+ * Returns TRUE when there isn't enough tape to judge: unknown must never block a
+ * trade (the 2026-07-20 silent-`[]` trap that killed every premarket setup).
+ */
+export function closedAboveLevel(candles: Candle[], level: number, bars: number): boolean {
+  if (bars <= 0) return true
+  if (!(level > 0)) return true
+  const recent = lastN(candles, bars)
+  if (recent.length < bars) return true
+  return recent.every(c => c.close > level)
+}
+
+/**
+ * Genuine acceptance above `level`, for the trigger gate.
+ *
+ * THE SUBTLETY THAT MAKES OR BREAKS THIS: every trigger already keys on
+ * `candles[candles.length - 1].close > level` (the "lastCandle" in each detector).
+ * LIVE, that last element is the FORMING 5-min bar, whose `close` is the current
+ * print — so a mid-bar wick through the level fires the trigger, and re-checking
+ * that same bar would just re-confirm the wick. That is the failed-breakout buy.
+ *
+ * So acceptance must look at the last COMPLETED bar — we drop the forming bar
+ * before checking. With bars=1 that means: a full bar has closed above the level,
+ * not merely that price is above it right now.
+ *
+ * (In the replay the "current" bar is a completed historical bar, so this asks for
+ * TWO consecutive completed closes there — stricter, but coherent. The replay
+ * cannot see the wick problem anyway; it always fills on a completed-bar close.)
+ */
+export function acceptedAbove(candles: Candle[], level: number, bars: number): boolean {
+  if (bars <= 0) return true
+  return closedAboveLevel(candles.slice(0, -1), level, bars)
+}
+
+export interface SpaceRead {
+  /** Nearest meaningful supply beyond the fill, or null when the way is open. */
+  nextSupply: number | null
+  /** Distance to it as % of the fill. */
+  pct: number | null
+  /** Distance to it in R — how much of the risk we can earn before meeting sellers. */
+  r: number | null
+}
+
+/**
+ * Room from the entry fill to the next meaningful level in the trade direction.
+ * `riskDist` is the stop distance in price terms.
+ */
+export function spaceToNextSupply(
+  levels: KeyLevel[],
+  entryFill: number,
+  riskDist: number,
+  direction: 'long' | 'short',
+): SpaceRead {
+  const none: SpaceRead = { nextSupply: null, pct: null, r: null }
+  if (!(entryFill > 0)) return none
+  const forward = direction === 'long' ? levelsAbove(levels, entryFill) : levelsBelow(levels, entryFill)
+  const supply = forward.find(l => l.strength >= SPACE_LEVEL_MIN_STRENGTH)
+  if (!supply) return none                       // open space — fail open
+  const dist = Math.abs(supply.midpoint - entryFill)
+  return {
+    nextSupply: supply.midpoint,
+    pct: (dist / entryFill) * 100,
+    r: riskDist > 0 ? dist / riskDist : null,
+  }
+}
+
+// T1's distance from the fill, as a multiple of risk. Swept 2026-08-12 — see below.
+//
+// At 0.8 the first target lands ~1R away, half books there, ~1% round-trip friction
+// takes a third of that, and the breakeven stop then strangles the runner. Result on
+// 2026-08-13: 11 winners averaging +0.64R against 10 losers at -1.20R, which needs a
+// 65% win rate to break even. We got 52%.
+//
+// FGI is the case in one row: entry 8.30, T1 8.70 (+4.8%, ~1R), stock ran ~100%.
+// We booked +1.06R. The stop was right; the target was not.
+// Swept on the 20-day replay 2026-08-12 (with cull 4 + SPACE 0.5R + stop floor):
+//   0.8   92 signals  4.8/day  43% win  +0.549R  net  +50.5R
+//   1.5  117          6.2      43%      +0.565R  net  +66.1R
+//   2.0  124          6.5      43%      +0.757R  net  +93.9R   <- shipped
+//   2.5  127          6.7      41%      +0.819R  net +104.0R
+//
+// Decomposed 0.8 -> 2.0, in R — the first change this week where every component
+// agrees rather than the headline riding on lucky backfills:
+//   the SAME 83 trades   +51.7R -> +65.1R  (win 46%->44%: pay accuracy, gain size)
+//   42 NEW (were R/R-gated)      +28.8R    avg +0.685R, in line with the book
+//   9 DROPPED                     -1.2R    correctly removed
+// The new trades were never bad — they were badly TARGETED. A near T1 made their
+// rated R/R fail the bestRR>=1.5 gate.
+//
+// 2.5 scores higher and is deliberately NOT taken. The curve is monotonic across
+// the whole range, so that is the edge of the test range rather than an optimum,
+// and two biases grow with the threshold: the scale-out model marks unsold
+// remainder to the CLOSE (wider targets => more mark-to-close, which flatters),
+// and the synthetic +10% runner leg substitutes for a real level more often
+// (4% of signals at 2.0, 7% at 2.5). Re-sweep past 2.5 before going further.
+const MIN_T1_REWARD_R = envNum('MIN_T1_REWARD_R', 2.0)
+const MIN_T1_REWARD_PCT = 0.02
+const MIN_T1_REWARD_ATR_MULT = 1.0
+// Targets that sit on top of each other are one target wearing three hats — the
+// old 0.3% dedup let T1/T2/T3 land inside a single 1% band, so scaling out at
+// each was really one exit. Keep them a real move apart (or half a volatility
+// unit, whichever is wider).
+const TARGET_SPACING_PCT = 0.015
+const TARGET_SPACING_ATR_MULT = 0.5
+// The runner leg. Level stacks are dense near price and thin out fast, so a
+// level-derived ladder often tops out a few % up and we exit a 40% move at +3%.
+// When the name is volatile enough for it to be a realistic day's reach (10%
+// within RUNNER_TARGET_ATR_MULT ATR — true of the gainer universe, false of a
+// sleepy large cap), extend the ladder to a 10% runner. This is where the payoff
+// asymmetry the book needs actually comes from.
+const RUNNER_TARGET_PCT = 0.10
+const RUNNER_TARGET_ATR_MULT = 3
+// A long "bounce" whose price has already run well above its entry zone is a
+// chase, not a bounce: the zone is unfillable and entering at the trigger means
+// a wide stop for a tiny first target. Don't let it fire a BUY. (2026-07-08's
+// runnable triggers sat 0.6–2.4% above the zone; the dead 8–10% chases — PRME
+// EMA21, ELTX pullback — get dropped.)
+const MAX_TRIGGER_EXTENSION_PCT = 0.04
+// Genuine runners (the day's top gainers) blow through the break level faster than
+// a bar can confirm, landing >4% past it — so the flat cap made us refuse exactly
+// the moves we most want (CYCU/NUWE 2026-07-30). Widen the cap for a strength entry
+// on a real runner (high RVOL + high ATR + big day move) so it can still trigger a
+// bit further past the level. This IS more chasing — the slippage haircut keeps the
+// measured P/L honest, and momentum_pullback still catches what runs past even this.
+const MAX_TRIGGER_EXTENSION_MOMENTUM = 0.09
+const RUNNER_MIN_RVOL = 5
+const RUNNER_MIN_ATR_PCT = 3
+const RUNNER_MIN_CHANGE_PCT = 20
+// A "runner" must still be near its high. A name deep below the day high has already
+// faded — its break is a dead-cat, not a run — so it must NOT get the wider chase
+// cap (CUPR −44% off high / FCUV −32% kept dropping, 2026-07-31). Within this % of
+// the day high = still running; further off = faded, back to the strict 4% cap.
+const RUNNER_MAX_OFF_HIGH_PCT = 8
+
+// ── Leg-maturity gate (2026-08-11) ───────────────────────────────────────────
+//
+// Evidence, from resolving all 18 executed paper trades against the 5-min tape:
+// 12 of 18 were stopped out INSIDE the bar they entered (MFE +0.00% — never a tick
+// in our favour), and several of those names then ran hard the same day (CELZ
+// +37.6%, AUUD +16.1%, EVGN +12.5%, VATE +10.8%). So discovery was right and entry
+// timing was wrong. Segmenting by what was true at entry:
+//   • bought at the top of the 10-bar range (rangePos ≥ 0.98): 4/4 died in bar 1
+//   • leg already ran ≥5% off its 10-bar low:                  9/12 died, avg −$264
+//   • prior bar closed red (no green streak):                 10/12 died, avg −$279
+//   • prior bars green (streak ≥ 2):                           1/6 died, avg −$138
+//
+// `maxTriggerExtension` above already caps how far past the TRIGGER LEVEL price has
+// run. It says nothing about how far the LEG has run — AUUD entered 82% above its
+// 10-bar low while sitting right on its trigger, and passed cleanly. This gate
+// closes that hole: it measures maturity of the move, not distance past the level.
+//
+// SWEPT AND REJECTED (2026-08-11). Left in, OFF, so the negative result is not
+// re-discovered. On the 20-day replay, versus a 151-signal / +0.55%-per-trade /
+// +83.5%-net baseline:
+//   cap 40%: 147 signals, +0.60%/trade, net +88.8%  <- looks better, ISN'T
+//   cap 25%: 140 signals, +0.60%/trade, net +84.1%  <- same illusion
+//   cap 20%: 135 signals, +0.39%/trade, net +52.2%  <- the truth once it binds
+// The first two only looked neutral because a veto RESHUFFLES the book rather
+// than subsetting it: a setup that never reaches `triggered` leaves per-symbol
+// cap slots and dedup windows unspent, which backfills different later signals.
+// Diffing the signal lists, cap-40 DROPPED 7 signals worth +23.9% (avg +3.42%)
+// and gained 3 that the baseline never fired, worth +29.2%. The apparent edge was
+// three lottery tickets. Lesson for any future gate: never read a summary line as
+// "baseline minus the bad trades" — diff the signal lists.
+//
+// The threshold was deliberately not fitted to the 18 live trades: a tight cap
+// would have blocked STKH's 09:31 breakout, already +12.5% off its 09:30 low and
+// then good for +90%.
+//   MAX_LEG_RUNUP_PCT=20 npx tsx scripts/backtest.ts   # to re-run the experiment
+// Infinity disables the gate, which is the shipped behaviour.
+// ── Thesis cut: quarantined triggers (2026-08-11) ────────────────────────────
+//
+// These detectors still RUN and stay visible as watch items — they just cannot
+// reach `triggered`, so they log no BUY and place no order. Quarantine rather than
+// deletion keeps them on screen for the trader's own discretion and keeps the
+// recall harness able to measure them.
+//
+// Chosen from the 20-day FMP replay (151 signals) scored in R (P/L ÷ stop width),
+// which is the right metric because the live executor sizes by fixed dollar risk —
+// raw % flatters wide stops. Per-setup net R:
+//   opening_range_break  51  +0.277R  +14.1R   ← 52% of all profit
+//   opening_drive        15  +0.898R  +13.5R   ← best per trade
+//   break_of_structure   27  +0.207R   +5.6R
+//   hod_break             9  +0.144R   +1.3R
+//   momentum_pullback    24  -0.063R   -1.5R   ← +19% in raw %, NEGATIVE in R
+//   pullback              4  -0.409R   -1.6R
+//   ema21_bounce          1  -1.043R   -1.0R
+//   premarket_breakout   17  -0.607R  -10.3R   ← worst by a distance
+// VERIFIED by a full replay run, not by filtering the baseline's signal list:
+//   baseline  151 signals  7.5/day  40% win  +0.179R/trade  net +27.1R  (+83.5%)
+//   cull 4    113 signals  5.7/day  40% win  +0.345R/trade  net +38.9R  (+101.2%)
+// Avg loss also improves (-3.47% -> -2.83%) with win rate unchanged, so this is a
+// real change in the book's composition rather than a survivorship artifact.
+//
+// Filtering the baseline CSV predicted 105 signals and +41.6R; the true run came in
+// at 113 and +38.9R because 11 signals backfilled into cap/dedup slots freed by the
+// quarantined types, and those 11 were -5.1R. That gap IS the reshuffle effect — a
+// veto redistributes the book, it does not subtract from it. Always verify a gate
+// with a real run.
+//
+// Cutting further RAISES avg/trade but LOWERS net R — over-filtering. hod_break and
+// break_of_structure stay for that reason. Same trap on an RVOL>=5 filter: avg/trade
+// +0.179R -> +0.283R while removing 79 signals worth +9.2R. Better average, less money.
+//
+// NOTE this is not a retreat from premarket, which is one of the best sessions in
+// the book (33 non-premarket_breakout premarket signals: 63% win, +0.415R, +13.7R,
+// led by break_of_structure at +0.706R). It is the premarket_breakout DETECTOR that
+// loses — corroborated live (SPCF + AUUD on 2026-08-10) and by an earlier 0/7 replay.
+//
+// Restore any of them by editing this set; CULL_ENABLED=0 disables the cut wholesale
+// for an A/B run.
+export const TRIGGERS_QUARANTINED = new Set<SetupType>(
+  envNum('CULL_ENABLED', 1) === 0 ? [] : [
+    'premarket_breakout',
+    'momentum_pullback',
+    'pullback',
+    'ema21_bounce',
+  ],
+)
+
+const LEG_LOOKBACK_BARS = 10
+const MAX_LEG_RUNUP_PCT = envNum('MAX_LEG_RUNUP_PCT', Infinity)
+// Require the move to still be pushing: at least this many consecutive up-closes
+// immediately before the trigger. 0 disables.
+const MIN_GREEN_STREAK = envNum('MIN_GREEN_STREAK', 0)
+
+/** Env override that is inert in the browser (Next replaces `process.env.X` with undefined). */
+function envNum(key: string, fallback: number): number {
+  const raw = typeof process !== 'undefined' && process.env ? process.env[key] : undefined
+  if (raw == null || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/**
+ * How far the current leg has already run: trigger price vs the lowest low of the
+ * last `LEG_LOOKBACK_BARS` bars. Null when there isn't enough tape to judge —
+ * callers must fail OPEN on null, never treat "unknown" as "over-extended" (the
+ * silent-`[]` trap that killed every premarket setup on 2026-07-20).
+ */
+export function legRunUpPct(candles: Candle[], price: number, lookback = LEG_LOOKBACK_BARS): number | null {
+  const recent = lastN(candles, lookback)
+  if (recent.length < 3 || !(price > 0)) return null
+  let lo = Infinity
+  for (const c of recent) if (c.low > 0 && c.low < lo) lo = c.low
+  if (!Number.isFinite(lo) || lo <= 0) return null
+  return ((price - lo) / lo) * 100
+}
+
+/** Consecutive up-closes immediately before the current (forming) bar. */
+export function greenStreak(candles: Candle[], lookback = LEG_LOOKBACK_BARS): number {
+  const recent = lastN(candles, lookback)
+  let n = 0
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].close > recent[i].open) n++
+    else break
+  }
+  return n
+}
+
+function maxTriggerExtension(ctx: DetectionContext, type: SetupType): number {
+  if (!STRENGTH_ENTRY_TYPES.includes(type)) return MAX_TRIGGER_EXTENSION_PCT
+  const t = ctx.technical
+  const rvol = t.relativeVolume ?? 0
+  const atrPct = t.atr != null && ctx.price > 0 ? (t.atr / ctx.price) * 100 : 0
+  const offHigh = t.distanceFromDayHighPct ?? -99 // negative = below the day high
+  const nearHigh = offHigh > -RUNNER_MAX_OFF_HIGH_PCT
+  const runner = rvol >= RUNNER_MIN_RVOL && atrPct >= RUNNER_MIN_ATR_PCT &&
+    Math.abs(ctx.changePct) >= RUNNER_MIN_CHANGE_PCT && nearHigh
+  return runner ? MAX_TRIGGER_EXTENSION_MOMENTUM : MAX_TRIGGER_EXTENSION_PCT
+}
+// Sum of the last 5 bars' dollar volume below which a name is untradeable. Low
+// by design: it screens out dead tickers (few-hundred-share bars) without
+// touching genuine low-float runners, which clear it many times over.
+const MIN_RECENT_DOLLAR_VOL = 50_000
+
+function sessionHigh(candles: Candle[]): number {
+  let h = 0
+  for (const c of candles) if (c.high > h) h = c.high
+  return h
+}
+
+/** Last few candles carving lower highs on a net-lower close = a down-leg, not a healthy higher-low pullback. */
+export function rollingOver(candles: Candle[]): boolean {
+  const r = lastN(candles, 4)
+  if (r.length < 4) return false
+  const lowerHighs = r[3].high < r[1].high && r[2].high <= r[1].high
+  const netDown = r[3].close < r[0].close
+  return lowerHighs && netDown
+}
+
+/** Fraction below the session high (positive when below). Prefers the session-correct
+ *  technical reading (regular high, or premarket high before the open); falls back to a
+ *  candle scan only when that's unavailable. */
+function offSessionHighPct(ctx: DetectionContext): number | null {
+  const d = ctx.technical.distanceFromDayHighPct
+  if (d != null) return -d / 100
+  const hi = sessionHigh(ctx.candles)
+  return hi > 0 ? (hi - ctx.price) / hi : null
+}
+
+/** Fractal swing pivots over a candle window: a high/low with `k` lower/higher bars on each side. */
+function pivots(cs: Candle[], k: number): { highs: { i: number; price: number }[]; lows: { i: number; price: number }[] } {
+  const highs: { i: number; price: number }[] = []
+  const lows: { i: number; price: number }[] = []
+  for (let i = k; i < cs.length - k; i++) {
+    let isHigh = true, isLow = true
+    for (let j = i - k; j <= i + k; j++) {
+      if (j === i) continue
+      if (cs[j].high >= cs[i].high) isHigh = false
+      if (cs[j].low <= cs[i].low) isLow = false
+    }
+    if (isHigh) highs.push({ i, price: cs[i].high })
+    if (isLow) lows.push({ i, price: cs[i].low })
+  }
+  return { highs, lows }
+}
+
+// The off-high distance that counts as "rolled over" scales with the name's own
+// volatility: a high-ATR momentum name (2026-07-10 JZXN, atr ~7%) that pulls
+// back <1.5 ATR is just breathing, not rolling over — the fixed 5% gate wrongly
+// flagged its winners. A quiet name still trips at the 5% floor.
+const ROLLOVER_MIN_ATR = 1.5
+
+// The first minutes of RTH are a whipsaw graveyard for bounce entries: price is
+// finding its footing, VWAP/EMAs are noisy, and "bounces" get shaken out before
+// any real move. 2026-07-15's first 15 minutes were 3 wins / 10 losses (net
+// −12.6%, nearly the whole day's damage), while the day's best trade (NVVE +6.4%)
+// came at 09:47, just past the window. So lock OUT bounce *triggers* (they stay
+// visible as watches) for the opening window — the open belongs to breakouts, not
+// dip-buys. Momentum detectors (ORB/HOD/breakout) are unaffected.
+const OPEN_BOUNCE_LOCKOUT_MIN = 15
+
+function openBounceLockout(ctx: DetectionContext): boolean {
+  return ctx.session === 'regular' && ctx.minutesSinceOpen != null && ctx.minutesSinceOpen < OPEN_BOUNCE_LOCKOUT_MIN
+}
+
+// ── Bounce quality gates ─────────────────────────────────────────────────────
+// Bounces only pay on names that are actually MOVING. 2026-07-20 review (29
+// de-duplicated trades): ATR ≥3% won 75% (+4.10%/trade) while ATR <1.5% won 50%
+// but bled −0.67%/trade; price hugging VWAP (<2% away) won just 36% (−1.19%/
+// trade) versus 75% for names well clear of it. Published practice says the same
+// thing two ways — a "dead stock" in a tight range has too few participants to
+// respect the level, and a name crossing VWAP repeatedly has no trend at all, so
+// VWAP becomes a noise zone rather than a bounce zone. Both are chop; chop is
+// where this strategy bleeds.
+// The ATR floor was a blunt PROXY for "is this name actually moving?" — and on
+// low-volatility days it starved the book (2026-07-22 fired ~3 trades; 13/15
+// gainers were ATR-blocked midday). Now that the real "in play" dimensions are on
+// the signal path (RVOL + float + catalyst, per Warrior/Kev/Poarch), the ATR floor
+// drops to a thin backstop that only rejects a genuinely dead range, and the
+// in-play gate below does the real filtering.
+const BOUNCE_MIN_ATR_PCT = 0.010   // volatility backstop only (was 1.5%)
+const BOUNCE_MAX_VWAP_CROSSES = 3  // >3 crosses = chop day, don't buy dips
+
+function bounceQualityFail(ctx: DetectionContext): boolean {
+  const { price, technical: t } = ctx
+  const atrFrac = t.atr != null && price > 0 ? t.atr / price : null
+  if (atrFrac != null && atrFrac < BOUNCE_MIN_ATR_PCT) return true
+  if (t.vwapCrossCount > BOUNCE_MAX_VWAP_CROSSES) return true
+  return false
+}
+
+// ── In-play gate (Warrior/Kev/Poarch: only trade names actually in play) ─────
+// A name is "in play" when there's real participation AND/OR a clear reason to
+// move. Deliberately lenient — any single strong tell passes — so it filters the
+// dead drifters without starving the book. RVOL is the proven discriminator
+// (2026-07-20: RVOL≥5 won 60%, RVOL 1–2 won 33%); float + catalyst + gap are the
+// corroborating pillars. Never blocks on missing data.
+const IN_PLAY_MIN_RVOL = 2            // strong participation clears the gate outright
+const IN_PLAY_MIN_GAP_PCT = 5         // a 5%+ mover is in play even on a soft RVOL reading
+const IN_PLAY_FLOAT_CEILING = 20_000_000
+const IN_PLAY_LOWFLOAT_MIN_RVOL = 1   // low floats move on less volume — normal pace is enough
+
+function inPlay(ctx: DetectionContext): boolean {
+  const rvol = ctx.technical.relativeVolume
+  if (rvol != null && rvol >= IN_PLAY_MIN_RVOL) return true
+  if (ctx.hasCatalyst) return true
+  if (Math.abs(ctx.changePct) >= IN_PLAY_MIN_GAP_PCT) return true
+  if (ctx.float != null && ctx.float < IN_PLAY_FLOAT_CEILING &&
+      (rvol == null || rvol >= IN_PLAY_LOWFLOAT_MIN_RVOL)) return true
+  // No participation signal at all and no data to judge on → don't block.
+  if (rvol == null && ctx.float == null) return true
+  return false
+}
+
+/** Every reason a long *bounce* trigger should be suppressed (setup stays visible). */
+function bounceBlocked(ctx: DetectionContext): boolean {
+  return openBounceLockout(ctx) || bounceQualityFail(ctx) || !inPlay(ctx)
+}
+
+/** Volume dried up INTO the pullback — measured excluding the trigger bar, so a
+ *  big confirming bar doesn't mask the contraction that preceded it. */
+function volumeContractingBefore(candles: Candle[]): boolean {
+  return volumeContracting(candles.slice(0, -1))
+}
+
+// 2026-07-20: ema9_bounce was the worst performer by a wide margin — 25% win,
+// −3.80%/trade — and it failed precisely on the high-RVOL, high-ATR pumps the
+// gates above would still pass (ADVB rvol 18 lost −3.9%, ZYBT rvol 25 lost −8.0%).
+// Published practice agrees: the 9 EMA whips on small-cap news pumps because price
+// slices it every other candle. Quarantine its TRIGGERS — the setup stays visible
+// as a watch and keeps logging state, so we can keep measuring it. Flip to re-enable.
+const EMA9_BOUNCE_TRIGGERS_ENABLED = false
+
+// Past this multiple of the (already ATR-scaled) threshold, price is deep enough
+// off the high that the 4-bar rollingOver() confirmation becomes redundant — and,
+// worse, brittle: a single green bounce candle flips its net-down test and de-arms
+// the veto even as the name keeps bleeding. 2026-07-13 BRAI spiked to 11.33 on a
+// rejection wick then fell straight to 6.42; its worst late entries fired at ~17%
+// off that high (−5.7% / −4.5%) but a green print had cleared the flag. 1.5× keeps
+// the quiet-name floor at 7.5% (won't clip a clean shallow first pullback) while
+// flagging BRAI-style falling knives from ~16% down regardless of the last candle.
+const ROLLOVER_DEEP_MULT = 1.5
+
+/** Veto a long *bounce* trigger when price has already rolled over well off the session high. */
+export function longBounceRolledOver(ctx: DetectionContext): boolean {
+  const offHigh = offSessionHighPct(ctx)
+  if (offHigh == null) return false
+  const atrFrac = ctx.technical.atr != null && ctx.price > 0 ? ctx.technical.atr / ctx.price : null
+  const threshold = atrFrac != null
+    ? Math.max(ROLLOVER_OFF_HIGH_PCT, atrFrac * ROLLOVER_MIN_ATR)
+    : ROLLOVER_OFF_HIGH_PCT
+  if (offHigh <= threshold) return false
+  return offHigh > threshold * ROLLOVER_DEEP_MULT || rollingOver(ctx.candles)
 }
 
 function cleanCandlesInto(candles: Candle[], direction: SetupDirection): boolean {
@@ -136,6 +766,10 @@ interface BuildArgs {
   confirming: boolean
   notes: string
   risks?: string[]
+  /** When active, suppress the `triggered` state (no BUY logged) and surface the reason. */
+  vetoTrigger?: { active: boolean; reason: string }
+  /** Synthetic targets (e.g. measured moves) merged with level-based targets — for breakouts to new highs that have no levels overhead. */
+  extraTargets?: number[]
 }
 
 function buildSetup(args: BuildArgs): DetectedSetup {
@@ -146,11 +780,89 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   // Targets from ranked levels in the trade direction.
   const forward = direction === 'long' ? levelsAbove(levels, price) : levelsBelow(levels, price)
   const entryRef = direction === 'long' ? zoneUpper : zoneLower
-  const stopRef = invalidation
-  const targets: SetupTarget[] = forward.slice(0, 3).map((l, i) => ({
-    price: l.midpoint,
-    label: `T${i + 1}${l.sourceLabels[0] ? ` (${l.sourceLabels[0]})` : ''}`,
-    rewardRisk: rr(entryRef, stopRef, l.midpoint),
+
+  // Where you'd actually fill entering ON the trigger (buy the reclaim), never
+  // below current price for a long. Strong movers never come back to the zone,
+  // so a resting limit misses them — the real entry is here.
+  const entryFill = direction === 'long' ? Math.max(zoneUpper, price) : Math.min(zoneLower, price)
+
+  // Stop placement. Strength entries (breaks/reclaims confirmed by a new high)
+  // trail the stop up to the breakout pivot — ~STOP_ATR_MULT ATR under the ACTUAL
+  // fill — so a chased fill doesn't inherit the far base-low stop and a 0.1R trade.
+  // We only ever TIGHTEN toward the pivot; never loosen past the structural
+  // invalidation. Bounces keep their structural stop (with the legacy noise floor).
+  const sessionFloorPct = minStopFloorPct(ctx.session)
+  let stopRef = invalidation
+  if (STRENGTH_ENTRY_TYPES.includes(type)) {
+    const atr = t.atr != null && t.atr > 0 ? t.atr : entryFill * sessionFloorPct
+    const stopDist = Math.max(atr * STOP_ATR_MULT, entryFill * sessionFloorPct)
+    const pivotStop = direction === 'long' ? entryFill - stopDist : entryFill + stopDist
+    stopRef = direction === 'long' ? Math.max(invalidation, pivotStop) : Math.min(invalidation, pivotStop)
+  } else {
+    // Minimum stop-width floor: widen a degenerate sub-MIN_STOP_PCT stop so we never
+    // emit a scalp that noise stops out (SEER 0.6%, 2026-07-06). Only ever widens.
+    const minStopDist = price * MIN_STOP_PCT
+    if (direction === 'long' && entryRef - stopRef < minStopDist) stopRef = entryRef - minStopDist
+    else if (direction === 'short' && stopRef - entryRef < minStopDist) stopRef = entryRef + minStopDist
+  }
+
+  // FINAL floor, applied to every branch: no setup may leave here with a stop
+  // narrower than session friction can support. The strength branch could still
+  // land under it when `invalidation` sat tighter than the pivot, and the bounce
+  // branch used a flat 1.5% that is too tight for premarket's 1% round trip.
+  // Widens only — a trade whose R/R cannot survive the wider stop is then refused
+  // by the R/R gate, which is correct: it was never playable.
+  const floorDist = entryFill * sessionFloorPct
+  if (direction === 'long' && entryFill - stopRef < floorDist) stopRef = entryFill - floorDist
+  else if (direction === 'short' && stopRef - entryFill < floorDist) stopRef = entryFill + floorDist
+
+  const riskDist = Math.abs(entryFill - stopRef)
+
+  // Candidate targets: ranked levels in the trade direction, plus any synthetic
+  // targets (measured moves) supplied by momentum setups. Keep those genuinely
+  // beyond price, nearest-first, deduped within 0.3%.
+  const cand: { price: number; label: string }[] = [
+    ...forward.map(l => ({ price: l.midpoint, label: l.sourceLabels[0] ?? '' })),
+    ...(args.extraTargets ?? []).map(p => ({ price: p, label: 'measured move' })),
+  ]
+  const dirLong = direction === 'long'
+  // Targets must sit beyond the ACTUAL entry fill, not the current price. entryFill
+  // can be above price (a level-based zone the trigger closed through), so filtering
+  // on price let a "target" land between price and the fill — i.e. BELOW the entry.
+  // 2026-07-22 KUST/MWC/INM each logged a first target under their fill (negative
+  // rr), and one even booked a phantom +1.2% "win" hitting a target below entry.
+  // The first rated target must clear a meaningful reward beyond the fill (see
+  // MIN_T1_REWARD_R) — a level a few bps away is noise that tanks R/R and books
+  // phantom wins. Skip those in favour of the measured move behind them.
+  const atrAbs = t.atr != null && t.atr > 0 ? t.atr : 0
+  const minReward = Math.max(
+    riskDist * MIN_T1_REWARD_R,
+    entryFill * MIN_T1_REWARD_PCT,
+    atrAbs * MIN_T1_REWARD_ATR_MULT,
+  )
+  const targetFloor = dirLong ? entryFill + minReward : entryFill - minReward
+  const spacing = Math.max(entryFill * TARGET_SPACING_PCT, atrAbs * TARGET_SPACING_ATR_MULT)
+  const picked: { price: number; label: string }[] = []
+  for (const o of cand
+    .filter(o => dirLong ? o.price > targetFloor : o.price < targetFloor)
+    .sort((a, b) => dirLong ? a.price - b.price : b.price - a.price)) {
+    if (!picked.some(p => Math.abs(p.price - o.price) < spacing)) picked.push(o)
+  }
+  // Extend to the runner leg when a 10% move is a realistic reach for this name's
+  // volatility and the levels above don't already carry us there.
+  const ladder = picked.slice(0, 3)
+  const runnerPrice = dirLong ? entryFill * (1 + RUNNER_TARGET_PCT) : entryFill * (1 - RUNNER_TARGET_PCT)
+  const runnerReachable = atrAbs > 0 && entryFill * RUNNER_TARGET_PCT <= atrAbs * RUNNER_TARGET_ATR_MULT
+  const top = ladder[ladder.length - 1]
+  const ladderReachesRunner = top != null && (dirLong ? top.price >= runnerPrice : top.price <= runnerPrice)
+  if (runnerReachable && !ladderReachesRunner) {
+    if (ladder.length >= 3) ladder.length = 2   // keep the last rung for the runner
+    ladder.push({ price: runnerPrice, label: `${Math.round(RUNNER_TARGET_PCT * 100)}% runner` })
+  }
+  const targets: SetupTarget[] = ladder.map((o, i) => ({
+    price: o.price,
+    label: `T${i + 1}${o.label ? ` (${o.label})` : ''}`,
+    rewardRisk: rr(entryFill, stopRef, o.price),
   }))
   const bestRR = targets.length ? targets[0].rewardRisk : null
 
@@ -199,9 +911,46 @@ function buildSetup(args: BuildArgs): DetectedSetup {
   const approachThreshold = approachThresholdPct({ price, technical: t, candles: ctx.candles, spreadPct: ctx.spreadPct })
 
   // Observed (instantaneous) state from geometry + evidence.
+  // A vetoed trigger cannot advance to `triggered` (so it logs no BUY) but stays visible.
+  // Anti-fade: drop a chase-family break fired too far under the session high (see
+  // ANTI_FADE_TYPES). It stays visible as a watch; it just can't log a BUY.
+  const distFromHigh = t.distanceFromDayHighPct   // negative = below the high
+  const fadedChase = ANTI_FADE_TYPES.includes(type) && distFromHigh != null && distFromHigh < -MAX_BELOW_HIGH_PCT
+  // Leg-maturity veto (see LEG_LOOKBACK_BARS block). Longs only: this is about
+  // buying a move that has already gone, which has no short-side mirror here.
+  // Fails OPEN when the tape is too short to measure.
+  const runUp = direction === 'long' ? legRunUpPct(ctx.candles, price) : null
+  const lateInLeg = runUp != null && runUp > MAX_LEG_RUNUP_PCT
+  const unconfirmed = direction === 'long' && MIN_GREEN_STREAK > 0 &&
+    greenStreak(ctx.candles) < MIN_GREEN_STREAK
+  // Thesis cut: quarantined types stay visible but can never log a BUY.
+  const quarantined = TRIGGERS_QUARANTINED.has(type)
+  // SPACE: refuse a trade that meets real supply before it can earn 1R. Note this
+  // is measured against the LEVELS, independently of the target ladder — the
+  // ladder's reward floor can skip a nearby level and rate a further one as T1,
+  // which is exactly how a no-room setup used to look tradeable.
+  const space = spaceToNextSupply(levels, entryFill, riskDist, direction)
+  const noRoom = space.r != null && space.r < MIN_SPACE_R
+  const vetoed = (args.vetoTrigger?.active ?? false) || fadedChase || lateInLeg ||
+    unconfirmed || quarantined || noRoom
+  // ACCEPTANCE gates the TRIGGER, not quality. An un-accepted break has not really
+  // triggered — a wick through the level is not a breakout — so it reads as
+  // at_level, NOT as triggered-then-vetoed. Kept out of `vetoed`/`qualityVetoed`,
+  // which stay reserved for genuine quality problems (fade, rollover, no room).
+  // Strength entries only; a bounce claims acceptance above nothing.
+  const unaccepted = direction === 'long' && STRENGTH_ENTRY_TYPES.includes(type) &&
+    !acceptedAbove(ctx.candles, zoneUpper, ACCEPTANCE_BARS)
+  // An over-extended long bounce is a chase, not a fillable trigger — drop it
+  // entirely. The cap widens for a strength entry on a genuine runner (see
+  // maxTriggerExtension) so the day's top gainers aren't refused for running fast.
+  const maxExt = maxTriggerExtension(ctx, type)
+  const extended = direction === 'long'
+    ? price > zoneUpper * (1 + maxExt)
+    : price < zoneLower * (1 - maxExt)
+  const rawTrigger = args.triggered && !extended && !unaccepted
   const inZone = price >= zoneLower && price <= zoneUpper
   let state: SetupState
-  if (args.triggered) state = 'triggered'
+  if (rawTrigger && !vetoed) state = 'triggered'
   else if (inZone && args.confirming) state = 'confirming'
   else if (inZone) state = 'at_level'
   else if (Math.abs(distanceToZonePct) <= approachThreshold) state = 'approaching'
@@ -219,6 +968,9 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     type,
     direction,
     state,
+    triggeredRaw: rawTrigger,
+    qualityVetoed: vetoed,
+    entryFill,
     score: total,
     grade,
     breakdown,
@@ -227,7 +979,7 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     zoneMidpoint,
     rationale,
     confirmation,
-    invalidation,
+    invalidation: stopRef,
     stopReference: stopRef,
     targets,
     rewardRisk: bestRR,
@@ -238,7 +990,11 @@ function buildSetup(args: BuildArgs): DetectedSetup {
     approachThresholdPct: approachThreshold,
     testCount,
     confidence: Math.round((total + (level?.strength ?? 40)) / 2),
-    risks: [...new Set([...(args.risks ?? []), ...scoreRisks])],
+    risks: [...new Set([
+      ...(args.risks ?? []),
+      ...(vetoed && args.vetoTrigger ? [args.vetoTrigger.reason] : []),
+      ...scoreRisks,
+    ])],
     keyRisks: scoreRisks.slice(0, 3),
     notes: args.notes,
     nextIfHolds: nextForward,
@@ -274,7 +1030,7 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const confirming = makingHigherLows(candles) && volumeContracting(candles)
   const reclaim = lastCandle ? lastCandle.close > zoneUpper : false
-  const triggered = reclaim && volumeExpanding(candles) && makingHigherLows(candles)
+  const triggered = reclaim && volumeConfirmsTrigger(candles) && newHighAfterPullback(candles) && !bounceBlocked(ctx)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) +
     (volumeContracting(candles) ? 1 : 0) +
@@ -299,8 +1055,94 @@ function detectPullback(ctx: DetectionContext): DetectedSetup | null {
     confirmationSignals: signals,
     triggered,
     confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over well off the session high — bounce may be a falling knife' },
     notes: `${depth[0].toUpperCase() + depth.slice(1)} pullback. Prioritise controlled selling; avoid buying large red candles.`,
     risks: t.lowerHighsLows ? ['Lower highs/lows forming — pullback may become a trend reversal'] : [],
+  })
+}
+
+// The first-pullback continuation entry on a RUNNER. The biggest gainers move
+// parabolically — you can't catch the initial vertical break without chasing past
+// the extension cap (CYCU +495%, 2026-07-30). The tradeable entry is the FIRST
+// orderly pullback: a strong in-play name that ran, digested a few bars off its
+// high while holding VWAP, then makes a new high off the dip. Entering the reclaim
+// sits right at the pullback high (not extended), stop under the higher-low → good
+// R/R on a name that's already proven it can run. Gated hard to strong uptrends so
+// it never becomes a knife-catcher; the rollover veto drops it once the pullback
+// turns into a reversal.
+const MOMENTUM_PULLBACK_MIN_CHANGE = 10   // ≥ this % on the day = a genuine runner
+const MOMENTUM_PULLBACK_MAX_DEPTH = 0.10  // pullback no deeper than this off the high (first pullback, not a rollover)
+// Cap the stop distance. On a hyper-ATR name the 3-bar pullback low can sit far
+// below the entry from one wild wick (ZEO 2026-07-31: pbLow 26% under entry → a
+// −26.8% trade), even when price is only a few % off the high. Never let the stop
+// exceed this % below the reclaim — a tighter stop stops out more on wild names,
+// but caps the per-trade loss instead of blowing up the book on one candle.
+const MOMENTUM_PULLBACK_MAX_STOP_PCT = 0.08
+
+function detectMomentumPullback(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles, sessionLevels: sl } = ctx
+  const vwap = sl.vwap
+  if (vwap == null) return null
+
+  // Only strong, in-play runners holding trend — not a generic dip.
+  if (!inPlay(ctx)) return null
+  if (t.trend5m === 'down') return null
+  if (price < vwap) return null
+  if (t.higherHighsLows !== true) return null
+  if (ctx.changePct < MOMENTUM_PULLBACK_MIN_CHANGE) return null
+
+  if (candles.length < 6) return null
+  const prior = candles.slice(0, -1)              // everything before the current (breakout) bar
+  const recentHigh = Math.max(...lastN(prior, 12).map(c => c.high)) // the run high being reclaimed
+  const pbBars = lastN(prior, 3)                  // the digestion bars before the reclaim
+  if (pbBars.length < 2) return null
+  const pbHigh = Math.max(...pbBars.map(c => c.high)) // the reclaim / trigger level
+  const pbLow = Math.min(...pbBars.map(c => c.low))   // the higher-low we stop under
+
+  // Shallow, controlled pullback off the high — not a deep give-back / rollover.
+  const offHigh = recentHigh > 0 ? (recentHigh - price) / recentHigh : 1
+  if (offHigh > MOMENTUM_PULLBACK_MAX_DEPTH) return null
+  if (price <= pbLow) return null
+
+  const atr = t.atr ?? price * 0.01
+  const zoneUpper = pbHigh
+  const zoneLower = pbLow
+  // Stop under the pullback low, but never further than MAX_STOP_PCT below the reclaim.
+  const rawInvalidation = pbLow - Math.max(atr * 0.5, price * 0.005)
+  const invalidation = Math.max(rawInvalidation, pbHigh * (1 - MOMENTUM_PULLBACK_MAX_STOP_PCT))
+
+  const triggered = newHighAfterPullback(candles) && volumeConfirmsTrigger(candles) && price >= pbHigh
+  const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(candles)
+  const rvol = t.relativeVolume ?? 0
+  const signals =
+    (newHighAfterPullback(candles) ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
+    (rvol >= 2 ? 1 : 0) + (price > vwap ? 1 : 0)
+
+  // Targets: reclaim the prior high, then the measured continuation (the run height).
+  const runHeight = Math.max(recentHigh - pbLow, price * 0.01)
+  const extraTargets = [recentHigh, recentHigh + runHeight]
+
+  return buildSetup({
+    ctx, type: 'momentum_pullback', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `First pullback on a runner (+${ctx.changePct.toFixed(0)}% day, RVOL ${rvol.toFixed(1)}×) — digesting ${(offHigh * 100).toFixed(1)}% off the high $${recentHigh.toFixed(2)}, holding VWAP. Enter the reclaim of $${pbHigh.toFixed(2)}.`,
+    confirmation: [
+      `Reclaim of the pullback high $${pbHigh.toFixed(2)} — first new high off the dip`,
+      'Selling volume dried up into the pullback',
+      'Still holding above VWAP — trend intact',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeContractsIntoZone: volumeContracting(candles),
+      volumeExpandsOnSignal: volumeExpanding(candles),
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Pullback rolled over well off the high — continuation may have failed' },
+    extraTargets,
+    notes: 'First-pullback continuation on a strong intraday runner. Stop under the pullback low; targets the prior high then the measured continuation.',
   })
 }
 
@@ -317,7 +1159,7 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const tightening = makingHigherLows(candles) && res.midpoint - price < (t.atr ?? price * 0.02)
   const closedAbove = lastCandle ? lastCandle.close > res.upper : false
-  const triggered = closedAbove && volumeExpanding(candles)
+  const triggered = closedAbove && volumeConfirmsTrigger(candles)
   const confirming = (price >= zoneLower && price <= zoneUpper) && tightening
   const signals =
     (tightening ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) + (closedAbove ? 1 : 0)
@@ -342,6 +1184,336 @@ function detectBreakout(ctx: DetectionContext): DetectedSetup | null {
   })
 }
 
+// Premarket breakout. The day's biggest movers usually set up before 09:30: a
+// name gapping on a catalyst that pushes through its premarket high while holding
+// premarket VWAP is the earliest read on a runner. This fires ONLY in premarket
+// (RTH hands off to the ORB detector at the open) and demands a real gap + a VWAP
+// hold, so it flags the in-play gappers and stays quiet on names drifting on air.
+// Premarket access thresholds — loosened 2026-07-29 to arm more early gappers
+// (was gap 4% / coil 3%). The PM-VWAP hold below is kept as the quality gate, so
+// this widens breadth without re-admitting fading names. NOTE: premarket fills are
+// thin — treat the resulting P/L with a slippage haircut, not at face value.
+const PREMARKET_MIN_GAP_PCT = 2    // gap vs prior close to count as "in play" (was 4)
+const PREMARKET_MAX_COIL_PCT = 0.05 // prior bars must have based within this % of the PM high (was 0.03)
+// Premarket "in play" is judged by PRICE, with volume as a bonus — not the other
+// way round. The reason is data: the day's biggest premarket rockets are exactly
+// the names our volume feed can't see (2026-08-03 FMP had 55 premarket shares for
+// HYFM, which gapped $0.54→$3.44 and was traded heavily — the user took 5 green
+// trades on it while Companion, gating on that 55-share reading, never surfaced
+// it). A hard volume gate blocks precisely the trades we want. The reliable
+// premarket signal is price — Yahoo carries the full premarket price path even
+// when it reports volume 0 — so a name is in play premarket when EITHER measured
+// RVOL confirms a genuine surge (when the feed does have the tape — UPC was 597×
+// on 2026-08-03) OR price shows a real top-gainer move: a big gap AND/OR a wide
+// premarket range (it is actually trading, not a flat gap-and-sit dud). This
+// serves both halves of the brief — it catches HYFM/DFNS (big movers with no
+// usable volume) and still rejects the low-gap names that "don't move".
+const PREMARKET_MIN_RVOL = 3         // measured surge that confirms in-play on its own
+const PREMARKET_STRONG_GAP_PCT = 15  // a gap this large IS the top-gainer profile
+const PREMARKET_MIN_RANGE_PCT = 10   // premarket high→low swing proving the name trades
+
+function detectPremarketBreakout(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, sessionLevels: sl, candles, session } = ctx
+  if (session !== 'premarket') return null
+  const pmHigh = sl.premarketHigh
+  const prevClose = sl.previousClose
+  if (pmHigh == null || prevClose == null || prevClose <= 0 || candles.length < 4) return null
+
+  // Real gapper in play, and holding above premarket VWAP (buyers in control).
+  const gapPct = ((price - prevClose) / prevClose) * 100
+  if (gapPct < PREMARKET_MIN_GAP_PCT) return null
+  const vwap = sl.vwap
+  if (vwap != null && price < vwap) return null
+
+  // Anti-spike: a premarket "breakout" that's a single print tagging the high from
+  // far below (thin book) doesn't hold into the open. But there are TWO healthy
+  // shapes into a break, not one: price COILED near the high (a base), OR it's
+  // climbing on HIGHER LOWS (a steady continuation). Require either — that still
+  // rejects the spike-from-nowhere while letting the many gappers that grind up to
+  // new premarket highs fire (they were the ones we were missing before the open).
+  const priorHigh = Math.max(...candles.slice(0, -1).map(c => c.high))
+  const coiled = (pmHigh - priorHigh) / pmHigh <= PREMARKET_MAX_COIL_PCT
+  const continuation = makingHigherLows(candles)
+  if (!coiled && !continuation) return null
+
+  // Break level = the premarket high formed BEFORE the current bar. sl.premarketHigh
+  // includes the forming bar, so `close > pmHigh` can never be true — a bar's close
+  // can't exceed a high that includes itself. That made the trigger unsatisfiable in
+  // the live pipeline (it only ever "fired" in tests that hardcode pmHigh below the
+  // price), so a genuine break of the premarket high never registered. Clear the
+  // PRIOR premarket bars' high instead. Fall back to pmHigh when there aren't enough
+  // premarket bars to have a prior (keeps hardcoded-level unit tests valid).
+  const pmCandles = candles.filter(c => isPremarket(c.time * 1000))
+  const breakLevel = pmCandles.length >= 2
+    ? Math.max(...pmCandles.slice(0, -1).map(c => c.high))
+    : pmHigh
+  const band = (t.atr ?? price * 0.01) * 0.3
+  const zoneUpper = breakLevel
+  const zoneLower = breakLevel - Math.max(band, price * 0.006)
+  const invalidation = breakLevel - Math.max((t.atr ?? price * 0.01) * 0.5, price * 0.01)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
+  const rvol = t.relativeVolume
+  // In play by volume (a measured surge, when the feed has the tape) OR by price (a
+  // real top-gainer move the feed can't see). See the constants above for why price
+  // leads. The price arm needs a genuine gap or evidence the name is actually
+  // trading a range — a wide premarket swing — so a flat low-gap dud fails both.
+  const pmLow = sl.premarketLow
+  const rangePct = pmLow != null && pmLow > 0 ? ((pmHigh - pmLow) / pmLow) * 100 : 0
+  const volumeConfirmed = rvol != null && rvol >= PREMARKET_MIN_RVOL
+  const movingByPrice = gapPct >= PREMARKET_STRONG_GAP_PCT || rangePct >= PREMARKET_MIN_RANGE_PCT
+  const inPlay = volumeConfirmed || movingByPrice
+  const triggered = closedAbove && price > breakLevel && inPlay
+  const confirming = price >= zoneLower && price <= zoneUpper
+  const pdh = sl.previousDayHigh
+  const signals =
+    (closedAbove ? 1 : 0) + (inPlay ? 1 : 0) +
+    (vwap != null && price > vwap ? 1 : 0) + (pdh != null && price > pdh ? 1 : 0)
+
+  // Targets: prior-day high (the classic gap target) then measured moves off the break.
+  const range = Math.max((t.atr ?? price * 0.02) * 2, price * 0.02)
+  const extraTargets: number[] = []
+  if (pdh != null && pdh > price * 1.002) extraTargets.push(pdh)
+  extraTargets.push(breakLevel + range, breakLevel + range * 2)
+
+  return buildSetup({
+    ctx, type: 'premarket_breakout', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Premarket breakout — gapped +${gapPct.toFixed(0)}% (range ${rangePct.toFixed(0)}%) and pushing through the premarket high $${pmHigh.toFixed(2)}${vwap != null ? `, holding above PM VWAP $${vwap.toFixed(2)}` : ''}. ${rvol != null ? `Premarket RVOL ${rvol.toFixed(1)}×.` : 'Premarket volume not covered by the feed — in play on price.'}`,
+    confirmation: [
+      `Candle CLOSE above the premarket high $${pmHigh.toFixed(2)}`,
+      'Price holding the gap and near the highs (buyers still in control)',
+      'Holds the gap and PM VWAP into the 09:30 open',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeConfirmed,
+      unusualVolume: (rvol ?? 0) > PREMARKET_MIN_RVOL,
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: 'Premarket: thin liquidity and wide spreads — size down and expect slippage. Strongest when it holds the gap into the open.',
+    risks: [
+      'Premarket liquidity is thin — fills and stops are unreliable',
+      ...(rvol == null ? ['Premarket volume not covered by the data feed — participation unverified, judged on price'] : []),
+      ...(rvol != null && rvol < PREMARKET_MIN_RVOL * 2 ? ['Premarket volume only modestly above normal — the gap may fade at the open'] : []),
+    ],
+  })
+}
+
+// Opening-range break / gap-and-go. The biggest movers declare themselves early:
+// an in-play, gapped name that holds above VWAP and breaks its opening-range high
+// on expanding volume runs to multiple targets (2026-07-14's winners — LEDS 09:35,
+// FCEL/EDBL/YYGH on their opening pushes — were all this shape, yet no detector
+// targeted it; we only had dip-buyers). The go/no-go filter is the lesson from the
+// losers: a gapper is a "go" ONLY while it holds VWAP. NXTC/SHPH had already lost
+// VWAP when we bought their "bounce" and knifed — this detector never fires there.
+// The opening drive — the first 10% move of the day, before an opening range even
+// exists. ORB can't fire until or5High is set (~09:35) and by 09:45 it switches to
+// the wider 15-min range, so a name that tops early (NUWE peaked 09:40, 2026-07-30)
+// is missed. This covers 09:30–09:45: a gapper in play driving through its premarket
+// high (or prior-day high) on the open push, holding VWAP. Hands off to ORB after.
+const OPENING_DRIVE_WINDOW_MIN = 15
+
+function detectOpeningDrive(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, sessionLevels: sl, candles, session } = ctx
+  if (session !== 'regular') return null
+  if (ctx.minutesSinceOpen == null || ctx.minutesSinceOpen >= OPENING_DRIVE_WINDOW_MIN) return null
+
+  const vwap = sl.vwap
+  if (!inPlay(ctx)) return null
+  if (ctx.changePct <= 0) return null           // green on the day
+  if (vwap != null && price < vwap) return null  // holding VWAP
+  if (t.trend5m === 'down') return null
+
+  // The level a fresh gapper must clear to keep running: its premarket high, else PDH.
+  const pmHigh = sl.premarketHigh
+  const pdh = sl.previousDayHigh
+  const breakLevel = pmHigh ?? pdh
+  if (breakLevel == null) return null
+  if (price > breakLevel * 1.05) return null     // already well past → a chase, not the drive
+
+  const atr = t.atr ?? price * 0.01
+  const band = atr * 0.3
+  const zoneUpper = breakLevel
+  const zoneLower = breakLevel - Math.max(band, price * 0.004)
+  const invalidation = breakLevel - Math.max(atr * 0.5, price * 0.008)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
+  const rvol = t.relativeVolume ?? 0
+  const volOk = volumeConfirmsTrigger(candles) || rvol >= 2
+  const triggered = closedAbove && price > breakLevel && volOk
+  const confirming = price >= zoneLower && price <= zoneUpper
+  const signals =
+    (closedAbove ? 1 : 0) + (volOk ? 1 : 0) +
+    (vwap != null && price > vwap ? 1 : 0) + (pdh != null && price > pdh ? 1 : 0)
+
+  const range = Math.max(atr * 2, price * 0.02)
+  const extraTargets: number[] = []
+  if (pdh != null && breakLevel === pmHigh && pdh > price * 1.002) extraTargets.push(pdh)
+  extraTargets.push(breakLevel + range, breakLevel + range * 2)
+
+  return buildSetup({
+    ctx, type: 'opening_drive', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Opening drive — first 15 min, breaking the ${pmHigh != null ? 'premarket high' : 'prior-day high'} $${breakLevel.toFixed(2)} on the open push${vwap != null ? `, holding VWAP $${vwap.toFixed(2)}` : ''}. RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle close above $${breakLevel.toFixed(2)} on the opening drive`,
+      'Volume expanding on the push',
+      'Holding above VWAP — no failed open',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: { volumeExpandsOnSignal: volumeExpanding(candles), unusualVolume: rvol > 3 },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: 'First-15-minute opening drive through the premarket / prior-day high — catches the early move before an opening range exists. Hands off to the ORB detector after.',
+  })
+}
+
+function detectOpeningRangeBreak(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, sessionLevels: sl, candles } = ctx
+  const vwap = sl.vwap
+  const orHigh = sl.or15High ?? sl.or5High
+  const orLow = sl.or15High != null ? sl.or15Low : sl.or5Low
+  if (orHigh == null || vwap == null) return null
+
+  // Go/no-go: bullish and in control. Green on the day, holding above VWAP, and
+  // the 5-min trend not rolling over. Any of these failing = a fade, not a go.
+  if (price < vwap) return null
+  if (t.trend5m === 'down') return null
+  if (ctx.changePct <= 0) return null
+
+  // Break level = the opening-range high, unless the premarket high sits just
+  // above it (a gapper that held into the open) — then the PM high is the real
+  // resistance whose break confirms continuation.
+  const pmHigh = sl.premarketHigh
+  const breakLevel = pmHigh != null && pmHigh > orHigh && pmHigh < price * 1.03 ? pmHigh : orHigh
+  const band = (t.atr ?? price * 0.01) * 0.3
+  const zoneUpper = breakLevel
+  const zoneLower = breakLevel - Math.max(band, price * 0.003)
+  const invalidation = breakLevel - Math.max((t.atr ?? price * 0.01) * 0.5, price * 0.005)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > breakLevel : false
+  const triggered = closedAbove && price > zoneUpper && volumeConfirmsTrigger(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
+  const rvol = t.relativeVolume ?? 0
+  const signals =
+    (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
+    (rvol >= 2 ? 1 : 0) + (price > vwap ? 1 : 0)
+
+  // Measured-move targets for a break into clean air (new HOD, no levels overhead):
+  // project the opening-range height above the break, 1× and 2×.
+  const orRange = orLow != null ? Math.max(orHigh - orLow, price * 0.01) : price * 0.02
+  const extraTargets = [breakLevel + orRange, breakLevel + orRange * 2]
+  const gapped = sl.previousClose != null && sl.openingPrint != null && sl.openingPrint > sl.previousClose * 1.02
+
+  return buildSetup({
+    ctx, type: 'opening_range_break', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Opening-range break${gapped ? ' (gap-and-go)' : ''} — holding above VWAP ($${vwap.toFixed(2)}) and breaking the ${sl.or15High != null ? '15' : '5'}-min range high ($${breakLevel.toFixed(2)}). RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle CLOSE above $${breakLevel.toFixed(2)} (not an intrabar tag)`,
+      'Volume expands on the break (≥1.3× recent average)',
+      'Holds above VWAP — no failed break back under it',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      unusualVolume: rvol > 3,
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: gapped
+      ? 'Gap-and-go: strongest when it never loses VWAP. First break has the cleanest odds.'
+      : 'Intraday range break — best early; demand volume and a VWAP hold.',
+    risks: rvol < 1.5 ? ['Light relative volume — breakout may not sustain'] : [],
+  })
+}
+
+// High-of-day break continuation. On a trend day a strong name makes a LADDER of
+// new highs — each break of the prior HOD after a tight base is a continuation
+// thrust. We only ever caught these on the pullback (and the ORB catches just the
+// first push), so the mid-trend breaks were missed entirely (HODO laddered
+// 1.25→1.85 on 2026-07-14 and we only got its dips). The tight-base requirement
+// doubles as the anti-blow-off filter: a vertical climax spike has no base under
+// its high, so it never qualifies — we break WITH the trend, not into the top tick.
+function detectHodBreak(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles } = ctx
+  if (candles.length < 6) return null
+  if (t.trend5m === 'down') return null
+
+  // The HOD to break = highest high EXCLUDING the current bar, so a push to a new
+  // high is a genuine break rather than just the running max.
+  const prior = candles.slice(0, -1)
+  const hod = Math.max(...prior.map(c => c.high))
+  if (!(hod > 0)) return null
+
+  // Require a tight base sitting just under the HOD — price coiled below the high,
+  // not a vertical run into it (a chase) or a blow-off spike (which has no base).
+  const atrFrac = (t.atr ?? price * 0.01) / price
+  const base = lastN(prior, 4)
+  const baseHigh = Math.max(...base.map(c => c.high))
+  const baseLow = Math.min(...base.map(c => c.low))
+  const tightBase = baseHigh > 0 && (baseHigh - baseLow) / baseHigh < Math.max(0.025, atrFrac * 1.5)
+  const baseNearHod = (hod - baseHigh) / hod < 0.02
+  if (!tightBase || !baseNearHod) return null
+
+  const band = (t.atr ?? price * 0.01) * 0.3
+  const zoneUpper = hod
+  const zoneLower = hod - Math.max(band, price * 0.004)
+  const invalidation = baseLow - Math.max((t.atr ?? price * 0.01) * 0.4, price * 0.004)
+
+  const lastCandle = candles[candles.length - 1]
+  const closedAbove = lastCandle ? lastCandle.close > hod : false
+  const rvol = t.relativeVolume ?? 0
+  const triggered = closedAbove && price > hod && volumeConfirmsTrigger(candles) && makingHigherLows(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
+  const signals =
+    (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) +
+    (rvol >= 2 ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
+
+  // Measured-move targets: the base height projected above the break (a new HOD
+  // breaks into clean air with no levels overhead).
+  const baseRange = Math.max(baseHigh - baseLow, price * 0.01)
+  const extraTargets = [hod + baseRange, hod + baseRange * 2]
+
+  return buildSetup({
+    ctx, type: 'hod_break', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `High-of-day break — tight base under $${hod.toFixed(2)} then a push through it. Trend ${t.trend15m}, RVOL ${rvol.toFixed(1)}×.`,
+    confirmation: [
+      `Candle CLOSE above the HOD $${hod.toFixed(2)} (not an intrabar tag)`,
+      'Volume expands on the break bar',
+      'Base holds — no failed break back under it',
+    ],
+    invalidation,
+    testCount: 0,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      constructiveConsolidation: true,
+      unusualVolume: rvol > 3,
+    },
+    confirmationSignals: signals,
+    triggered,
+    confirming,
+    extraTargets,
+    notes: 'Continuation: buy the break with the trend, trail under each new base. Skips vertical blow-offs (no base).',
+    risks: rvol < 1.5 ? ['Light relative volume — new-high break may fail'] : [],
+  })
+}
+
 function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): DetectedSetup | null {
   const { price, technical: t, candles } = ctx
   const ema = which === 'ema9' ? t.ema9 : t.ema20
@@ -358,7 +1530,9 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
   const lastCandle = candles[candles.length - 1]
   const holding = lastCandle ? lastCandle.close > ema : false
   const confirming = (price >= zoneLower && price <= zoneUpper) && makingHigherLows(candles)
-  const triggered = holding && volumeExpanding(candles) && makingHigherLows(candles) && price > zoneUpper
+  const triggered = holding && volumeConfirmsTrigger(candles) && newHighAfterPullback(candles) &&
+    price > zoneUpper && !bounceBlocked(ctx) &&
+    (which === 'ema9' ? EMA9_BOUNCE_TRIGGERS_ENABLED : true)
   const signals =
     (makingHigherLows(candles) ? 1 : 0) + (holding ? 1 : 0) + (volumeContracting(candles) ? 1 : 0)
 
@@ -384,6 +1558,7 @@ function detectEmaBounce(ctx: DetectionContext, which: 'ema9' | 'ema21'): Detect
     confirmationSignals: signals,
     triggered,
     confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over well off the session high — bounce may be a falling knife' },
     notes: tests >= 3 ? `${label} tested ${tests}× — support weakening, reduce size.` : `Clean ${label} test — momentum reference intact.`,
     risks: tests >= 3 ? [`${label} tested ${tests}× — each retest weakens it`] : [],
   })
@@ -405,6 +1580,15 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   const zoneLower = vwap - band
   const zoneUpper = vwap + band
   const above = price >= vwap
+  // A VWAP *bounce* only makes sense in an intraday uptrend. Alone among the
+  // long-bounce detectors, detectVwap had no trend filter, so it fired on any
+  // name near VWAP — including ones that had topped and were fading straight
+  // through it. 2026-07-14 was 53/54 vwap_bounces and most losers were exactly
+  // this: a "bounce" bought into a 5-min downtrend (GLOO/LHAI/NXTC/TRNR/SOBR/…).
+  // Match the guard every sibling has (detectEmaBounce/detectPullback). The
+  // reclaim-from-below subtype keeps its own volume-expansion gate, so only the
+  // above-VWAP bounce is filtered here.
+  if (above && t.trend5m === 'down') return null
   const type: SetupType = above ? 'vwap_bounce' : 'vwap_reclaim'
   const direction: SetupDirection = 'long'
   const invalidation = above ? zoneLower - band : vwap - band * 2
@@ -413,9 +1597,15 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
   const lastCandle = candles[candles.length - 1]
   const reclaimed = lastCandle ? lastCandle.close > vwap : false
   const confirming = Math.abs(price - vwap) / vwap < (band / vwap) && makingHigherLows(candles)
-  const triggered = above
-    ? reclaimed && makingHigherLows(candles) && volumeContracting(candles) && price > zoneUpper
-    : reclaimed && volumeExpanding(candles) && price > vwap
+  // The above-VWAP bounce previously asked only that volume CONTRACT into the
+  // zone — never that it confirm on the way out. Published practice is explicit
+  // that both halves are required: volume dries up on the pullback AND spikes on
+  // the bounce candle; without the surge it's a false signal. (The reclaim case
+  // already demanded expansion.)
+  const triggered = (above
+    ? reclaimed && newHighAfterPullback(candles) && volumeContractingBefore(candles) &&
+      volumeConfirmsTrigger(candles) && price > zoneUpper
+    : reclaimed && newHighAfterPullback(candles) && volumeConfirmsTrigger(candles) && price > vwap) && !bounceBlocked(ctx)
   const signals =
     (reclaimed ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0) +
     (above ? (volumeContracting(candles) ? 1 : 0) : (volumeExpanding(candles) ? 1 : 0))
@@ -432,14 +1622,129 @@ function detectVwap(ctx: DetectionContext): DetectedSetup | null {
     invalidation,
     testCount: tests,
     scoringOverrides: {
-      volumeContractsIntoZone: above && volumeContracting(candles),
-      volumeExpandsOnSignal: !above && volumeExpanding(candles),
+      volumeContractsIntoZone: above && volumeContractingBefore(candles),
+      volumeExpandsOnSignal: volumeExpanding(candles),
     },
     confirmationSignals: signals,
     triggered,
     confirming,
+    vetoTrigger: { active: longBounceRolledOver(ctx), reason: 'Rolled over well off the session high — bounce may be a falling knife' },
     notes: tests > 4 ? 'VWAP crossed many times — choppy, treat reclaims sceptically.' : 'Respecting VWAP so far this session.',
     risks: tests > 4 ? ['VWAP whipsawed repeatedly — low reliability'] : [],
+  })
+}
+
+function detectBullFlag(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles } = ctx
+  if (candles.length < 12) return null
+  if (t.trend5m === 'down') return null
+
+  const win = lastN(candles, 14)
+  const flagLen = 5
+  if (win.length < flagLen + 5) return null
+  const flag = win.slice(-flagLen)
+  const pole = win.slice(0, win.length - flagLen)
+
+  const poleLow = Math.min(...pole.map(c => c.low))
+  const poleHigh = Math.max(...pole.map(c => c.high))
+  const poleH = poleHigh - poleLow
+  const atrPct = (t.atr ?? price * 0.01) / price
+  // Need a real impulse: ≥5% or ≥3 ATR, and the high must come AFTER the low (up-pole).
+  if (poleH / poleLow < Math.max(0.05, atrPct * 3)) return null
+  const lowI = pole.reduce((bi, c, i, a) => (c.low < a[bi].low ? i : bi), 0)
+  const highI = pole.reduce((bi, c, i, a) => (c.high > a[bi].high ? i : bi), 0)
+  if (highI <= lowI) return null
+
+  const flagHigh = Math.max(...flag.map(c => c.high))
+  const flagLow = Math.min(...flag.map(c => c.low))
+  const retrace = (poleHigh - flagLow) / poleH          // how deep the flag pulled back
+  if (retrace > 0.55) return null                        // too deep → not a flag, a reversal
+  if (flagHigh - flagLow > poleH * 0.6) return null       // flag not tight enough
+  if (price < flagLow) return null                        // broke down out of the flag
+
+  const band = (t.atr ?? price * 0.01) * 0.2
+  const zoneLower = flagHigh - band
+  const zoneUpper = flagHigh + band
+  const invalidation = flagLow - Math.max(band, price * 0.004)
+
+  const last = candles[candles.length - 1]
+  const closedAbove = last.close > flagHigh
+  const triggered = closedAbove && volumeConfirmsTrigger(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && volumeContracting(flag)
+  const signals = (volumeContracting(flag) ? 1 : 0) + (closedAbove ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
+
+  return buildSetup({
+    ctx, type: 'bull_flag', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Bull flag — ${(poleH / poleLow * 100).toFixed(0)}% pole then a tight ${flagLen}-bar flag holding ${(100 - retrace * 100).toFixed(0)}% of the move. Break of $${flagHigh.toFixed(2)} continues it.`,
+    confirmation: [
+      `Break + hold above the flag high $${flagHigh.toFixed(2)}`,
+      'Volume expands on the breakout bar',
+      `Flag stays above its low $${flagLow.toFixed(2)}`,
+    ],
+    invalidation, testCount: 0,
+    scoringOverrides: {
+      volumeContractsIntoZone: volumeContracting(flag),
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      constructiveConsolidation: true,
+    },
+    confirmationSignals: signals, triggered, confirming,
+    extraTargets: [flagHigh + poleH, flagHigh + poleH * 1.618],   // 1× and 1.618× measured moves
+    notes: 'Momentum continuation — enter the break, not the drift down the flag.',
+    risks: retrace > 0.4 ? ['Deeper flag — momentum cooling, size down'] : [],
+  })
+}
+
+function detectBreakOfStructure(ctx: DetectionContext): DetectedSetup | null {
+  const { price, technical: t, candles } = ctx
+  if (candles.length < 14) return null
+  if (t.trend5m === 'down') return null
+
+  const win = lastN(candles, 22)
+  const { highs, lows } = pivots(win, 2)
+  if (highs.length < 2 || lows.length < 1) return null
+
+  const lastSwingHigh = highs[highs.length - 1].price
+  const priorSwingHigh = highs[highs.length - 2].price
+  const lastSwingLow = lows[lows.length - 1].price
+  // Continuation only: an uptrend of rising swing highs, a recent higher low intact.
+  if (lastSwingHigh <= priorSwingHigh) return null
+  if (!makingHigherLows(candles)) return null
+  if (price < lastSwingLow) return null                       // structure already broken down
+  const distToSwing = (lastSwingHigh - price) / price
+  if (distToSwing > 0.03) return null                          // too far below the break level to be a trigger
+
+  const band = (t.atr ?? price * 0.01) * 0.25
+  const zoneLower = lastSwingHigh - band
+  const zoneUpper = lastSwingHigh + band
+  const invalidation = lastSwingLow - Math.max(band, price * 0.004)
+
+  const last = candles[candles.length - 1]
+  const closedAbove = last.close > lastSwingHigh
+  const triggered = closedAbove && volumeConfirmsTrigger(candles) && makingHigherLows(candles)
+  const confirming = price >= zoneLower && price <= zoneUpper && makingHigherLows(candles)
+  const signals = (closedAbove ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0) + (makingHigherLows(candles) ? 1 : 0)
+
+  const range = lastSwingHigh - lastSwingLow
+
+  return buildSetup({
+    ctx, type: 'break_of_structure', direction: 'long',
+    zoneLower, zoneUpper,
+    rationale: `Break of structure — higher swing highs ($${priorSwingHigh.toFixed(2)} → $${lastSwingHigh.toFixed(2)}) over a higher low $${lastSwingLow.toFixed(2)}. Reclaiming $${lastSwingHigh.toFixed(2)} continues the trend.`,
+    confirmation: [
+      `Break of the prior swing high $${lastSwingHigh.toFixed(2)} on a close`,
+      'Volume expands on the break',
+      `Holds the higher low $${lastSwingLow.toFixed(2)} on any retest`,
+    ],
+    invalidation, testCount: highs.length,
+    scoringOverrides: {
+      volumeExpandsOnSignal: volumeExpanding(candles),
+      structureIntact: makingHigherLows(candles),
+    },
+    confirmationSignals: signals, triggered, confirming,
+    extraTargets: [lastSwingHigh + range, lastSwingHigh + range * 1.618],
+    notes: 'Trend continuation — buy the break of structure, invalid on loss of the higher low.',
+    risks: [],
   })
 }
 
@@ -456,7 +1761,7 @@ function detectRejection(ctx: DetectionContext): DetectedSetup | null {
   const zoneLower = res.lower
   const zoneUpper = res.upper
   const invalidation = res.upper + band * 1.5
-  const triggered = lastCandle ? lastCandle.close < res.lower && volumeExpanding(candles) : false
+  const triggered = lastCandle ? lastCandle.close < res.lower && volumeConfirmsTrigger(candles) : false
   const confirming = makingLowerHighs(candles)
   const signals = (rejecting ? 1 : 0) + (makingLowerHighs(candles) ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0)
 
@@ -488,7 +1793,7 @@ function detectBreakdown(ctx: DetectionContext): DetectedSetup | null {
 
   const lastCandle = candles[candles.length - 1]
   const lostLevel = lastCandle ? lastCandle.close < sup.lower : false
-  const triggered = lostLevel && volumeExpanding(candles)
+  const triggered = lostLevel && volumeConfirmsTrigger(candles)
   const confirming = makingLowerHighs(candles) && price <= zoneUpper
   const signals = (lostLevel ? 1 : 0) + (makingLowerHighs(candles) ? 1 : 0) + (volumeExpanding(candles) ? 1 : 0)
 
@@ -523,9 +1828,45 @@ function ordinal(n: number): string {
 
 export function detectSetups(ctx: DetectionContext): DetectedSetup[] {
   if (ctx.price <= 0 || ctx.candles.length === 0) return []
+  // Data-integrity gate: if the quote price disagrees wildly with the candle
+  // tape, the two feeds are out of sync and every signal built on it is garbage
+  // (2026-07-10: DCX/IOTR/HAO/ELAB logged entries 11–47% outside the day's
+  // actual range). Only the egregious cases are blocked (>10%), so a genuine
+  // fast breakout tick above recent highs still trades.
+  const recent = lastN(ctx.candles, 20)
+  if (recent.length >= 5) {
+    const hi = Math.max(...recent.map(c => c.high))
+    const lo = Math.min(...recent.map(c => c.low))
+    if (hi > 0 && (ctx.price > hi * 1.1 || ctx.price < lo * 0.9)) return []
+  }
+  // Liquidity floor: a name printing a few hundred shares a bar can't be filled,
+  // so a "signal" on it is noise that only pollutes the log. 2026-07-14 logged
+  // entries on WFF/AMPGZ/DCX/late-EDBL (recent $-vol well under $30k) that no one
+  // could trade. Require a small floor of recent dollar volume. Set deliberately
+  // low — real movers (even thin low-floats) clear it by orders of magnitude
+  // ($5M+ over 5 bars), so this only removes the truly dead, never a runner.
+  const liq = lastN(ctx.candles, 5)
+  if (liq.length >= 5) {
+    // Some feeds (notably Yahoo premarket) return bars with price but volume 0.
+    // That's a DATA GAP, not illiquidity — gating on it silently blocked every
+    // setup on every symbol in premarket, which is why premarket_breakout could
+    // never fire. Only apply the floor when we actually have volume data.
+    const shareVol = liq.reduce((s, c) => s + c.volume, 0)
+    if (shareVol > 0) {
+      const dollarVol = liq.reduce((s, c) => s + c.volume * c.close, 0)
+      if (dollarVol < MIN_RECENT_DOLLAR_VOL) return []
+    }
+  }
   const out: (DetectedSetup | null)[] = [
     detectPullback(ctx),
+    detectMomentumPullback(ctx),
     detectBreakout(ctx),
+    detectPremarketBreakout(ctx),
+    detectOpeningDrive(ctx),
+    detectOpeningRangeBreak(ctx),
+    detectHodBreak(ctx),
+    detectBullFlag(ctx),
+    detectBreakOfStructure(ctx),
     detectEmaBounce(ctx, 'ema9'),
     detectEmaBounce(ctx, 'ema21'),
     detectVwap(ctx),

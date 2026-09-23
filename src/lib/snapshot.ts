@@ -3,6 +3,7 @@
  */
 
 import type { TickerSnapshot, CompanyProfile, DataQuality, ShortAvailability } from '@/types'
+import { parseEtTimestampSec } from '@/lib/market-hours'
 import { getQuote, getIntradayCandles, getDailyCandles, getProfile, getStockNews, getPressReleases, getSharesFloat } from './fmp-client'
 import { getYFCandles, getYFQuote } from './yahoo-client'
 import { calculateSessionLevels, calculateTechnical, calculateSupportResistance } from './technical'
@@ -16,7 +17,7 @@ import type { Candle } from '@/types'
 
 function toCandles(raw: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>): Candle[] {
   return raw.map(c => ({
-    time: Math.floor(new Date(c.date).getTime() / 1000),
+    time: parseEtTimestampSec(c.date),
     open: c.open,
     high: c.high,
     low: c.low,
