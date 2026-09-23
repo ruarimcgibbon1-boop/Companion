@@ -3,8 +3,9 @@
 import { useState } from 'react'
 import { useTradingStore } from '@/store/trading-store'
 import { usePositionTracker } from '@/hooks/usePositionTracker'
-import { useBrokerPositions } from '@/hooks/useBrokerPositions'
+import { useBrokerAccount } from '@/hooks/useBrokerAccount'
 import { dataAge } from '@/lib/market-hours'
+import type { BrokerPositionsState } from '@/hooks/useBrokerPositions'
 import type { BrokerPositionView, ReconciliationStatus } from '@/lib/execution/positions-view'
 import type { Position, PositionDirection, TrailingStopMode, PositionTarget } from '@/types'
 
@@ -596,11 +597,80 @@ function BrokerPositionRow({ pos }: { pos: BrokerPositionView }) {
 
 // ── Main Component ─────────────────────────────────────────────────────────
 
-export function PositionTracker() {
+/** Top summary bar: connection state, open count, unrealised P&L, account equity/buying power. */
+function PositionsSummaryBar({
+  brokerCount,
+  brokerPnl,
+  manualOpenCount,
+  broker,
+  syncLabel,
+}: {
+  brokerCount: number
+  brokerPnl: number
+  manualOpenCount: number
+  broker: BrokerPositionsState
+  syncLabel: string | null
+}) {
+  const account = useBrokerAccount()
+
+  const connLabel = broker.error
+    ? 'UNAVAILABLE'
+    : broker.stale
+      ? 'STALE'
+      : broker.loading && broker.lastSuccessAt == null
+        ? 'CONNECTING'
+        : 'CONNECTED'
+  const connCls = broker.error
+    ? 'text-bear ring-bear/30 bg-bear/10'
+    : broker.stale
+      ? 'text-warn ring-warn/30 bg-warn/10'
+      : broker.loading && broker.lastSuccessAt == null
+        ? 'text-ink-mute ring-line-strong bg-raised'
+        : 'text-bull ring-bull/30 bg-bull/10'
+
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-5 gap-3 px-5 py-4 border-b border-line flex-shrink-0">
+      <div>
+        <div className="eyebrow mb-1">Alpaca Paper</div>
+        <span className={`text-xs font-semibold px-2 py-0.5 rounded ring-1 ring-inset ${connCls}`}>{connLabel}</span>
+        {syncLabel && <div className="text-[10px] text-ink-faint mt-1">synced {syncLabel}</div>}
+      </div>
+      <div>
+        <div className="eyebrow mb-1">Open Positions</div>
+        <div className="text-base tnum font-semibold text-ink">{brokerCount + manualOpenCount}</div>
+        <div className="text-[10px] text-ink-faint">{brokerCount} broker · {manualOpenCount} manual</div>
+      </div>
+      <div>
+        <div className="eyebrow mb-1">Unrealised P&amp;L</div>
+        <div className={`text-base tnum font-semibold ${brokerPnl >= 0 ? 'text-bull' : 'text-bear'}`}>
+          {brokerCount > 0 ? `${brokerPnl >= 0 ? '+' : ''}$${brokerPnl.toFixed(2)}` : '—'}
+        </div>
+      </div>
+      <div>
+        <div className="eyebrow mb-1">Equity</div>
+        <div className="text-base tnum font-semibold text-ink-soft">
+          {account.account ? `$${account.account.equity.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : account.error ? '—' : '…'}
+        </div>
+      </div>
+      <div>
+        <div className="eyebrow mb-1">Buying Power</div>
+        <div className="text-base tnum font-semibold text-ink-soft">
+          {account.account ? `$${account.account.buyingPower.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : account.error ? '—' : '…'}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * `broker` is owned by the nearest common parent (TopBar) and passed down —
+ * this avoids a second, independent useBrokerPositions() poll loop running
+ * alongside the one that drives the TopBar's own "Positions" badge. See
+ * TopBar.tsx for the single instantiation.
+ */
+export function PositionTracker({ broker, onClose }: { broker: BrokerPositionsState; onClose: () => void }) {
   usePositionTracker()
   const { positions, snapshot, selectedSymbol } = useTradingStore()
-  const broker = useBrokerPositions()
-  const [open, setOpen] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
 
   // Manual/local tracker positions (existing behaviour, retained).
@@ -614,22 +684,13 @@ export function PositionTracker() {
   const brokerCount = brokerPositions.length
 
   const hasAnything = brokerCount > 0 || positions.length > 0
-
-  // Collapsed blotter summary line.
   const syncLabel = broker.lastSuccessAt != null ? dataAge(broker.lastSuccessAt) : null
-  const feedDotCls = broker.error
-    ? 'bg-bear'
-    : broker.stale
-      ? 'bg-warn'
-      : broker.loading && broker.lastSuccessAt == null
-        ? 'bg-ink-faint animate-pulse'
-        : 'bg-bull'
 
   return (
-    <>
+    <div className="fixed inset-0 z-50 bg-[#080b10] flex flex-col overflow-hidden" data-testid="positions-drawer">
       {/* Add position modal */}
       {showAdd && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}>
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowAdd(false) }}>
           <AddPositionForm
             defaultSymbol={selectedSymbol ?? ''}
             defaultEntry={snapshot?.quote?.price}
@@ -638,99 +699,90 @@ export function PositionTracker() {
         </div>
       )}
 
-      {/* Bottom bar */}
-      <div className="flex-shrink-0 border-t border-line bg-bar">
-        {/* Header row — compact blotter summary */}
-        <div
-          className="flex items-center gap-2.5 px-4 py-2 cursor-pointer select-none"
-          onClick={() => setOpen(o => !o)}
-        >
-          <span className="eyebrow">Positions</span>
-          <span className={`w-1.5 h-1.5 rounded-full ${feedDotCls}`} />
-          <span className="text-[10px] tnum text-ink-soft font-semibold">
-            {brokerCount} OPEN
-          </span>
-          {brokerCount > 0 && (
-            <span className={`text-xs tnum font-semibold ${brokerPnl >= 0 ? 'text-bull' : 'text-bear'}`}>
-              {brokerPnl >= 0 ? '+' : ''}${brokerPnl.toFixed(2)}
-            </span>
-          )}
-          <span className="text-[10px] text-ink-mute">ALPACA</span>
-          {broker.error ? (
-            <span className="text-[10px] text-bear">
-              unavailable{syncLabel ? ` — last synced ${syncLabel}` : ''}
-            </span>
-          ) : (
-            <span className={`text-[10px] ${broker.stale ? 'text-warn' : 'text-ink-faint'}`}>
-              {syncLabel ? `synced ${syncLabel}` : broker.loading ? 'connecting…' : ''}
-            </span>
-          )}
-
+      {/* Top bar */}
+      <div className="flex items-center justify-between px-5 py-3 border-b border-line flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <h1 className="text-sm font-bold text-ink tracking-wide">POSITIONS</h1>
+          <span className="text-xs text-ink-mute">{brokerCount} broker · {openPositions.length} manual open</span>
+        </div>
+        <div className="flex items-center gap-2">
           <button
-            onClick={e => { e.stopPropagation(); setShowAdd(true) }}
-            className="ring-focus ml-auto text-xs px-2.5 py-1 rounded-md bg-accent hover:bg-accent-hi text-white font-semibold transition-colors"
+            onClick={() => setShowAdd(true)}
+            className="ring-focus text-xs px-2.5 py-1.5 rounded-md bg-accent hover:bg-accent-hi text-white font-semibold transition-colors"
           >
             + Add
           </button>
-          <span className="text-ink-mute text-xs ml-1">{open ? '▼' : '▲'}</span>
+          <button onClick={onClose} className="text-ink-mute hover:text-ink text-lg px-2 transition-colors">✕</button>
         </div>
+      </div>
 
-        {open && (
-          <div className="px-3 pb-3 max-h-72 overflow-y-auto space-y-2">
-            {/* ── Broker positions (Alpaca) ── */}
-            {brokerCount > 0 && (
-              <>
-                <div className="flex items-center gap-2">
-                  <div className="eyebrow pt-0.5">Alpaca — Broker</div>
-                  {broker.stale && !broker.error && (
-                    <span className="text-[10px] text-warn">stale</span>
-                  )}
-                </div>
-                {brokerPositions.map(p => <BrokerPositionRow key={`${p.symbol}-${p.tradeId ?? 'ext'}`} pos={p} />)}
-              </>
-            )}
+      {/* Summary */}
+      <PositionsSummaryBar
+        brokerCount={brokerCount}
+        brokerPnl={brokerPnl}
+        manualOpenCount={openPositions.length}
+        broker={broker}
+        syncLabel={syncLabel}
+      />
 
-            {/* Broker feed empty/offline states — never conflate error with flat. */}
-            {brokerCount === 0 && (
-              broker.error ? (
-                <div className="text-xs text-bear/90">
-                  Alpaca positions unavailable{syncLabel ? ` — last synced ${syncLabel}` : ''}. Showing last known state.
-                </div>
-              ) : broker.loading && broker.lastSuccessAt == null ? (
-                <div className="text-xs text-ink-mute">Connecting to Alpaca…</div>
-              ) : broker.brokerFlat ? (
-                <div className="text-xs text-ink-mute">No open Alpaca positions.</div>
-              ) : null
-            )}
-
-            {/* ── Manual tracker (local) ── */}
-            {(openPositions.length > 0 || closedPositions.length > 0) && (
-              <div className="eyebrow pt-1.5">Manual Tracker — Local</div>
-            )}
-            {openPositions.length > 0 && (
-              <div className="flex items-center gap-2 pb-0.5">
-                <span className="text-[10px] text-ink-mute tnum">{openPositions.length} open</span>
-                <span className={`text-[10px] tnum ${manualPnl >= 0 ? 'text-bull' : 'text-bear'}`}>
-                  {manualPnl >= 0 ? '+' : ''}${manualPnl.toFixed(2)} unrealised
-                </span>
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-2">
+        {/* ── Broker positions (Alpaca) — the focused broker-position view ── */}
+        <div className="flex items-center gap-2">
+          <div className="eyebrow pt-0.5">Alpaca — Broker (PAPER)</div>
+          {broker.stale && !broker.error && (
+            <span className="text-[10px] text-warn">stale</span>
+          )}
+        </div>
+        {brokerCount > 0 && (
+          <div className="space-y-2 pb-2">
+            {brokerPositions.map(p => <BrokerPositionRow key={`${p.symbol}-${p.tradeId ?? 'ext'}`} pos={p} />)}
+          </div>
+        )}
+        {brokerCount === 0 && (
+          <div className="pb-2">
+            {broker.error ? (
+              <div className="text-xs text-bear/90">
+                Alpaca positions unavailable{syncLabel ? ` — last synced ${syncLabel}` : ''}. Showing last known state.
               </div>
-            )}
-            {openPositions.map(p => <PositionCard key={p.id} pos={p} />)}
-            {closedPositions.length > 0 && (
-              <>
-                <div className="eyebrow pt-1">Closed / Stopped</div>
-                {closedPositions.slice(0, 5).map(p => <PositionCard key={p.id} pos={p} />)}
-              </>
-            )}
+            ) : broker.loading && broker.lastSuccessAt == null ? (
+              <div className="text-xs text-ink-mute">Connecting to Alpaca…</div>
+            ) : broker.brokerFlat ? (
+              <div className="text-xs text-ink-mute">Alpaca connected — no open PAPER positions.</div>
+            ) : null}
+          </div>
+        )}
 
-            {!hasAnything && !broker.loading && (
-              <div className="text-xs text-ink-mute">
-                No open positions. Companion daemon trades appear here automatically; hit <span className="text-ink-soft">+ Add</span> to track one by hand.
-              </div>
-            )}
+        {/* ── Manual tracker (local) ── */}
+        {(openPositions.length > 0 || closedPositions.length > 0) && (
+          <div className="eyebrow pt-3">Manual Tracker — Local</div>
+        )}
+        {openPositions.length > 0 && (
+          <div className="flex items-center gap-2 pb-0.5">
+            <span className="text-[10px] text-ink-mute tnum">{openPositions.length} open</span>
+            <span className={`text-[10px] tnum ${manualPnl >= 0 ? 'text-bull' : 'text-bear'}`}>
+              {manualPnl >= 0 ? '+' : ''}${manualPnl.toFixed(2)} unrealised
+            </span>
+          </div>
+        )}
+        <div className="space-y-2">
+          {openPositions.map(p => <PositionCard key={p.id} pos={p} />)}
+        </div>
+        {closedPositions.length > 0 && (
+          <>
+            <div className="eyebrow pt-3">Closed / Stopped</div>
+            <div className="space-y-2">
+              {closedPositions.slice(0, 5).map(p => <PositionCard key={p.id} pos={p} />)}
+            </div>
+          </>
+        )}
+
+        {!hasAnything && !broker.loading && (
+          <div className="text-xs text-ink-mute pt-2">
+            No open positions. Companion daemon trades appear here automatically; hit <span className="text-ink-soft">+ Add</span> to track one by hand.
           </div>
         )}
       </div>
-    </>
+    </div>
   )
 }

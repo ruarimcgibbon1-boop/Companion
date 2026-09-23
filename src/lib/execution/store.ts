@@ -102,6 +102,25 @@ export function loadTrades(day = etDayKey()): PaperTrade[] {
   }
 }
 
+/**
+ * Ledger trades across the last `daysBack` ET calendar days (inclusive of
+ * today), for the Journal's broker-linked history. Each day's file is scoped
+ * to that day already (`loadTrades`); this just unions them and de-dupes by
+ * trade id in case an active trade legitimately appears in more than one
+ * day's file (see `scopeToTradingDay`).
+ *
+ * Read-only, best-effort per day — a missing/corrupt day's file yields no
+ * rows for that day rather than failing the whole read.
+ */
+export function loadRecentTrades(daysBack = 7, from: number = Date.now()): PaperTrade[] {
+  const seen = new Map<string, PaperTrade>()
+  for (let i = 0; i < daysBack; i++) {
+    const day = etDayKey(from - i * 24 * 60 * 60 * 1000)
+    for (const t of loadTrades(day)) seen.set(t.id, t)
+  }
+  return [...seen.values()]
+}
+
 export function saveTrades(trades: PaperTrade[], day = etDayKey()): void {
   try {
     writeFileSync(tradesFile(day), JSON.stringify(scopeToTradingDay(trades, day), null, 2))

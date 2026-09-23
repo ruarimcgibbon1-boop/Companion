@@ -6,8 +6,10 @@ import { AlertsDrawer } from './AlertsDrawer'
 import { TradeJournal } from '@/components/journal/TradeJournal'
 import { OpportunitiesDrawer } from '@/components/opportunities/OpportunitiesDrawer'
 import { ContinuationDrawer } from '@/components/continuation/ContinuationDrawer'
+import { PositionTracker } from '@/components/positions/PositionTracker'
 import { useMonitor } from '@/hooks/useMonitor'
 import { useEodResolution } from '@/hooks/useEodResolution'
+import { useBrokerPositions } from '@/hooks/useBrokerPositions'
 import { useTradingStore } from '@/store/trading-store'
 
 export function TopBar() {
@@ -18,6 +20,7 @@ export function TopBar() {
   const [journalOpen, setJournalOpen] = useState(false)
   const [oppsOpen, setOppsOpen] = useState(false)
   const [contOpen, setContOpen] = useState(false)
+  const [positionsOpen, setPositionsOpen] = useState(false)
 
   // Always-on monitoring engine — runs app-wide, independent of the selected ticker.
   useMonitor()
@@ -26,6 +29,15 @@ export function TopBar() {
   useEodResolution({ auto: true })
   const setupCount = useTradingStore(s => s.monitoredSetups.filter(su => su.score >= 75).length)
   const unreadSignals = useTradingStore(s => s.monitorAlerts.filter(a => !a.read).length)
+
+  // Single instantiation of the broker-position poll for the whole dashboard —
+  // TopBar's own "Positions" badge and the drawer (PositionTracker) both read
+  // from this one hook call rather than each running their own poll loop.
+  const broker = useBrokerPositions()
+  const manualOpenCount = useTradingStore(
+    s => s.positions.filter(p => p.status !== 'closed' && p.status !== 'stopped').length,
+  )
+  const openPositionsCount = broker.positions.length + manualOpenCount
 
   useEffect(() => {
     const update = () => {
@@ -88,6 +100,15 @@ export function TopBar() {
           🎯 Continuation
         </button>
         <button
+          onClick={() => setPositionsOpen(true)}
+          className="ring-focus relative text-xs px-2.5 py-1.5 rounded-md border border-line-strong text-ink-soft hover:text-ink hover:border-ink-mute hover:bg-white/5 transition-colors font-medium"
+        >
+          Positions
+          {openPositionsCount > 0 && (
+            <span className="ml-1.5 text-[10px] px-1.5 py-px rounded-full bg-accent text-white font-semibold tnum">{openPositionsCount}</span>
+          )}
+        </button>
+        <button
           onClick={() => setJournalOpen(true)}
           className="ring-focus text-xs px-2.5 py-1.5 rounded-md border border-line-strong text-ink-soft hover:text-ink hover:border-ink-mute hover:bg-white/5 transition-colors font-medium"
         >
@@ -98,6 +119,7 @@ export function TopBar() {
       {journalOpen && <TradeJournal onClose={() => setJournalOpen(false)} />}
       {oppsOpen && <OpportunitiesDrawer onClose={() => setOppsOpen(false)} />}
       {contOpen && <ContinuationDrawer onClose={() => setContOpen(false)} />}
+      {positionsOpen && <PositionTracker broker={broker} onClose={() => setPositionsOpen(false)} />}
     </header>
   )
 }
