@@ -39,6 +39,17 @@ import type { ObserverLoop } from '@/lib/execution/observer-loop'
 // nothing here is imported BACK by BASE (setup-detectors.ts/buy-log.ts/
 // monitor.ts), and nothing in this experiment touches the broker/executor.
 import { observeQualityOnlyFromDecision, FreshnessTracker, JournalWriter, buildProvenance, resolvePendingCandidates, type ObserverContext } from '@/lib/experiments/quality-only'
+// PROSPECTIVE_DISCOVERY_CAPTURE — read-only, additive capture of the causal
+// path GAINERS ROUTE UNIVERSE -> DAEMON EXECUTION UNIVERSE -> MONITOR ->
+// SETUP -> BASE DECISION. See src/lib/research/universe-journal.ts for the
+// full module doc (the four-universes framing, what this cannot reconstruct,
+// and why JournalWriter is reused via a structural cast). Wholly separate
+// from QUALITY_ONLY: its own journal file, its own schema, never reads or
+// writes QUALITY_ONLY_JOURNAL_FILE/QUALITY_ONLY_MARKER_FILE.
+import {
+  buildSweepRecords, attachSetupDecision, appendSweepBatch,
+  type RouteUniverseRow, type SweepEnvelope, type SymbolRecord,
+} from '@/lib/research/universe-journal'
 
 // Capture the dirty-producer override from the INHERITED launch environment, BEFORE
 // loadEnvLocal() runs — otherwise a stale `ALLOW_DIRTY_PRODUCER=1` left in .env.local
@@ -247,16 +258,66 @@ function recordArbitration(row: Record<string, unknown>, now: number): void {
   try { appendFileSync(arbitrationFile(etDayKey(now)), JSON.stringify(row) + '\n') } catch { /* audit trail is best-effort */ }
 }
 
-async function fetchUniverse(): Promise<string[]> {
+/**
+ * PROSPECTIVE_DISCOVERY_CAPTURE — this is a return-type WIDENING, not a new
+ * fetch. `/api/gainers`'s JSON body already carries `rank` (the route's own
+ * momentum-ranked position), `momentumScore` (its sort metric), `changePct`,
+ * `price`, `volume`, and `relativeVolume` on every row; this function used to
+ * discard everything but `symbol`. It now also returns `routeRows` (every
+ * row the route returned, before this daemon's own re-sort/truncation) and
+ * `routeComputedAt` (the route's own `timestamp` field), so the capture
+ * observer in `sweep()` can record both what the route returned AND what
+ * this daemon's rerank/truncation kept vs dropped. The one existing caller
+ * (`sweep()`) is updated to pull `.symbols` where it only ever needed the
+ * plain string list — daemon behavior (which symbols get watched/alerted) is
+ * byte-for-byte unchanged.
+ */
+interface FetchUniverseResult {
+  /** Unchanged behavior: the daemon's own re-sort by raw changePct,
+   *  truncated to TOP_GAINERS_UNIVERSE — this is what `sweep()` watches. */
+  symbols: string[]
+  /** Every row the route returned this sweep, reduced to discovery-relevant
+   *  fields — see RouteUniverseRow's doc for the exact field provenance. */
+  routeRows: RouteUniverseRow[]
+  routeComputedAt: number | null
+}
+
+async function fetchUniverse(): Promise<FetchUniverseResult> {
   const params = new URLSearchParams({
     minChangePct: '3', minPrice: '0.1', maxPrice: '300', minVolume: '500000', minRvol: '1.5', maxResults: '30',
   })
   const res = await fetch(`${BASE}/api/gainers?${params}`)
   if (!res.ok) throw new Error(`gainers HTTP ${res.status}`)
-  const data = await res.json() as { rows?: { symbol: string; changePct: number }[] }
-  return (data.rows ?? [])
+  const data = await res.json() as {
+    rows?: {
+      symbol: string; changePct: number; rank?: number; momentumScore?: number | null
+      price?: number; volume?: number; relativeVolume?: number | null
+    }[]
+    timestamp?: number
+  }
+  const rawRows = data.rows ?? []
+  const routeRows: RouteUniverseRow[] = rawRows.map(r => ({
+    symbol: r.symbol,
+    routeRank: typeof r.rank === 'number' ? r.rank : null,
+    routeMomentumScore: typeof r.momentumScore === 'number' ? r.momentumScore : null,
+    changePct: typeof r.changePct === 'number' ? r.changePct : null,
+    price: typeof r.price === 'number' ? r.price : null,
+    volume: typeof r.volume === 'number' ? r.volume : null,
+    relativeVolume: typeof r.relativeVolume === 'number' ? r.relativeVolume : null,
+  }))
+  // UNCHANGED behavior: re-sort by raw changePct, truncate to top-15. See
+  // universe-journal.ts's DAEMON_SORT_METRIC doc for the observed tie-break
+  // (none explicit — stable-sort artifact only). Nulls sort last (a route
+  // row should always have a numeric changePct in practice; `?? -Infinity`
+  // is defensive, not a behavior change).
+  const symbols = rawRows
     .slice().sort((a, b) => b.changePct - a.changePct)
     .slice(0, TOP_GAINERS_UNIVERSE).map(r => r.symbol)
+  return {
+    symbols,
+    routeRows,
+    routeComputedAt: typeof data.timestamp === 'number' ? data.timestamp : null,
+  }
 }
 
 async function fetchResults(symbols: string[]): Promise<MonitorResult[]> {
@@ -297,11 +358,36 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
   // NB: position management is NOT done here — it runs on its own faster loop
   // (see positionLoop / POSITION_MS). Ticking here too would double-poll and, more
   // importantly, would put exits back behind the universe scan.
-  const universe = await fetchUniverse()
+  const universeResult = await fetchUniverse()
+  const universe = universeResult.symbols
   if (universe.length === 0) return buys
   const results = await fetchResults(universe)
 
   const now = Date.now()
+
+  // ── PROSPECTIVE_DISCOVERY_CAPTURE — build this sweep's records ────────────
+  // Right here: route rows, daemon-universe membership, and monitor results
+  // all coexist in scope, exactly as required. Read-only/additive: builds a
+  // local map this function owns; never touches `state`/BASE. Wrapped in
+  // try/catch so a bug here can never affect alerting/execution.
+  let captureEnvelope: SweepEnvelope | null = null
+  let captureRecords: Map<string, SymbolRecord> | null = null
+  try {
+    const built = buildSweepRecords({
+      now,
+      sweepId: `sweep-${now}`,
+      routeComputedAt: universeResult.routeComputedAt,
+      routeRows: universeResult.routeRows,
+      daemonSymbols: universe,
+      daemonTopN: TOP_GAINERS_UNIVERSE,
+      monitorRequestedSymbols: universe,
+      monitorResultSymbols: results.map(r => r.symbol),
+    })
+    captureEnvelope = built.envelope
+    captureRecords = built.recordsBySymbol
+  } catch (e) {
+    try { log('[universe-capture] build error (swallowed):', (e as Error)?.message ?? e) } catch { /* never throw */ }
+  }
   // Prune history to the session window so cap/dedup stay bounded.
   let state = buys.filter(b => now - b.timestamp < SYMBOL_LOG_WINDOW_MS)
   let triggered = 0, sent = 0
@@ -330,6 +416,13 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
       // the executor/Mike/provider requests. See runQualityOnlyObserver's doc
       // comment for the bar-availability honesty statement.
       try { runQualityOnlyObserver(setup, r, verdict, now, state) } catch { /* never propagate into BASE */ }
+      // PROSPECTIVE_DISCOVERY_CAPTURE — attach SETUP/BASE facts to the
+      // already-built record for this symbol. Read-only projection of the
+      // verdict already computed above; never recomputes or alters it.
+      try {
+        const rec = captureRecords?.get(setup.symbol)
+        if (rec) attachSetupDecision(rec, setup.id, verdict)
+      } catch { /* never propagate into BASE */ }
       const attrs = signalAttrs(setup, r)
       // Audit trail: every trigger + verdict, so end-of-session "did we miss X?"
       // is answerable from data — near-misses included. `attrs` is a read-only
@@ -416,6 +509,20 @@ async function sweep(buys: BuySignalRecord[], executor: PaperExecutor | null): P
     }
   } catch (e) {
     log('quality-only: resolver error (swallowed):', (e as Error)?.message ?? e)
+  }
+
+  // ── PROSPECTIVE_DISCOVERY_CAPTURE — one batched flush per sweep ───────────
+  // Everything for this sweep (envelope + every symbol record, SETUP/BASE
+  // fields now attached where applicable) is written in ONE call here,
+  // rather than as two separate incomplete writes at two different points
+  // in this function. Wrapped in try/catch: a flush failure is research-only
+  // and must never affect the already-completed alerting/execution flow above.
+  try {
+    if (captureEnvelope && captureRecords) {
+      appendSweepBatch(captureEnvelope, [...captureRecords.values()])
+    }
+  } catch (e) {
+    try { log('[universe-capture] flush error (swallowed):', (e as Error)?.message ?? e) } catch { /* never throw */ }
   }
 
   return state
