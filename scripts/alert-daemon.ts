@@ -96,11 +96,17 @@ let lastHeartbeat = 0
 // the daemon's existing graceful-shutdown path (see `shutdown` below). Never
 // imported by BASE, never touches the broker/executor, never blocks/alters the
 // real decision flow — see the try/catch wrapper at the call site in `sweep`.
-const QUALITY_ONLY_JOURNAL_FILE = join(homedir(), '.companion-quality-only-journal.ndjson')
+//
+// TEST ISOLATION: both paths honor an env-var override (same `process.env.X
+// || default` convention as BASE/DRY_RUN/ONCE above), so tests/quality-only-
+// daemon-integration.test.ts can point them at a throwaway temp directory
+// instead of the real host-local research paths. Unset in any real launch, so
+// production behavior is byte-for-byte the same default it always was.
+const QUALITY_ONLY_JOURNAL_FILE = process.env.QUALITY_ONLY_TEST_JOURNAL_PATH || join(homedir(), '.companion-quality-only-journal.ndjson')
 // Official collection-start marker path (host-local runtime research state,
 // not a repository artifact — named here only so the convention is documented
 // alongside the journal path above; nothing in this file creates it).
-const QUALITY_ONLY_MARKER_FILE = join(homedir(), '.companion-quality-only', 'quality-only-epoch-1.collection-start.json')
+const QUALITY_ONLY_MARKER_FILE = process.env.QUALITY_ONLY_TEST_MARKER_PATH || join(homedir(), '.companion-quality-only', 'quality-only-epoch-1.collection-start.json')
 const qualityOnlyFreshness = new FreshnessTracker()
 const qualityOnlyWriter = new JournalWriter(QUALITY_ONLY_JOURNAL_FILE)
 

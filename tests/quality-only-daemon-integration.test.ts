@@ -9,16 +9,53 @@
  * daemon: the module guards its `main()` auto-run with
  * `if (process.env.VITEST !== 'true')`, which Vitest sets by default, so this
  * import performs no network fetches and installs no SIGINT/SIGTERM handlers.
+ *
+ * ISOLATION: scripts/alert-daemon.ts's QUALITY_ONLY_JOURNAL_FILE/
+ * QUALITY_ONLY_MARKER_FILE module-level constants honor an env-var override
+ * (`QUALITY_ONLY_TEST_JOURNAL_PATH` / `QUALITY_ONLY_TEST_MARKER_PATH`) so this
+ * suite NEVER touches the real ~/.companion-quality-only* production research
+ * paths. Both env vars must be set BEFORE the module is first evaluated — ES
+ * module imports are hoisted above ordinary statements, so a plain top-level
+ * `import` would run before any `process.env.X = ...` assignment in this file
+ * ever executes. `beforeAll` + a dynamic `import()` sidesteps that: the
+ * module (and its module-level `qualityOnlyWriter`/`qualityOnlyFreshness`
+ * singletons) is only constructed once the env vars are already in place —
+ * this file contains no OTHER (static or earlier dynamic) import of
+ * scripts/alert-daemon.ts, so there is no risk of a pre-existing cached
+ * module instance built with the real default paths.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
-import { readFileSync, existsSync, unlinkSync } from 'fs'
-import { join } from 'path'
-import { homedir } from 'os'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'fs'
+import { join, resolve } from 'path'
+import { tmpdir, homedir } from 'os'
 import { classifyBuy } from '@/lib/buy-log'
 import type { DetectedSetup, MonitorResult, BuySignalRecord } from '@/types'
-import { runQualityOnlyObserver, qualityOnlyWriter, qualityOnlyFreshness } from '../scripts/alert-daemon'
+import type * as AlertDaemonModule from '../scripts/alert-daemon'
 
-const JOURNAL_FILE = join(homedir(), '.companion-quality-only-journal.ndjson')
+let TEMP_DIR: string
+let JOURNAL_FILE: string
+let MARKER_FILE: string
+let runQualityOnlyObserver: typeof AlertDaemonModule.runQualityOnlyObserver
+let qualityOnlyWriter: typeof AlertDaemonModule.qualityOnlyWriter
+let qualityOnlyFreshness: typeof AlertDaemonModule.qualityOnlyFreshness
+
+beforeAll(async () => {
+  TEMP_DIR = mkdtempSync(join(tmpdir(), 'quality-only-daemon-integration-test-'))
+  JOURNAL_FILE = join(TEMP_DIR, 'journal.ndjson')
+  MARKER_FILE = join(TEMP_DIR, 'marker.json')
+  process.env.QUALITY_ONLY_TEST_JOURNAL_PATH = JOURNAL_FILE
+  process.env.QUALITY_ONLY_TEST_MARKER_PATH = MARKER_FILE
+  const daemon: typeof AlertDaemonModule = await import('../scripts/alert-daemon')
+  runQualityOnlyObserver = daemon.runQualityOnlyObserver
+  qualityOnlyWriter = daemon.qualityOnlyWriter
+  qualityOnlyFreshness = daemon.qualityOnlyFreshness
+})
+
+afterAll(() => {
+  rmSync(TEMP_DIR, { recursive: true, force: true })
+  delete process.env.QUALITY_ONLY_TEST_JOURNAL_PATH
+  delete process.env.QUALITY_ONLY_TEST_MARKER_PATH
+})
 
 function fakeSetup(overrides: Partial<DetectedSetup> = {}): DetectedSetup {
   return {
@@ -85,10 +122,9 @@ describe('TRUE end-to-end daemon integration (real seam: runQualityOnlyObserver 
   // exercised in exactly ONE test ("real seam end-to-end", last in this file).
   // Every other test only asserts on pending()-count deltas, matching how the
   // real daemon accumulates queued writes across many sweeps before a single
-  // process-exit drain.
-  beforeEach(() => {
-    if (existsSync(JOURNAL_FILE)) { try { unlinkSync(JOURNAL_FILE) } catch { /* ignore */ } }
-  })
+  // process-exit drain. (No per-test file cleanup is needed: TEMP_DIR is a
+  // brand-new mkdtempSync() directory created once in beforeAll, so there is
+  // no possibility of stale content from a prior run.)
 
   it('repeated setupId across sweeps is deduplicated at the real seam (freshness persists across calls)', () => {
     const setup = fakeSetup({ id: 'DAEMON:vwap_bounce:dup-test', symbol: 'DAEMONDUP' })
@@ -187,7 +223,28 @@ describe('TRUE end-to-end daemon integration (real seam: runQualityOnlyObserver 
     expect(candidateRow.preOfficial).toBe(true)
     expect(candidateRow.payload.failedGateVector).toEqual(['QUALITY_OTHER'])
 
-    // No official collection-start marker exists anywhere in this worktree.
-    expect(existsSync(join(homedir(), '.companion-quality-only-COLLECTION_START.json'))).toBe(false)
+    // No official collection-start marker exists at the (isolated, temp-dir)
+    // marker path this test run is using — and, separately, the real
+    // production marker/journal paths were never referenced by this file at
+    // all (see the regression guard test below).
+    expect(existsSync(MARKER_FILE)).toBe(false)
+  })
+
+  it('regression guard: this suite\'s resolved journal/marker paths never point at the real production research paths', () => {
+    // Compare resolved absolute paths, not string fragments — a substring
+    // check (e.g. `.includes('.companion-quality-only')`) would pass for the
+    // real path *and* for a temp path that happens to embed the same prefix
+    // (as this suite's own temp dir name deliberately does, for readability),
+    // so it would not actually catch a regression. An exact resolved-path
+    // comparison against the real paths is the only check that can't be
+    // fooled by a coincidental substring match either way.
+    const realJournalPath = join(homedir(), '.companion-quality-only-journal.ndjson')
+    const realMarkerPath = join(homedir(), '.companion-quality-only', 'quality-only-epoch-1.collection-start.json')
+    expect(resolve(JOURNAL_FILE)).not.toBe(resolve(realJournalPath))
+    expect(resolve(MARKER_FILE)).not.toBe(resolve(realMarkerPath))
+    // And structurally: both resolved test paths must live under the
+    // test-owned TEMP_DIR (not merely "not equal to the real path" by luck).
+    expect(resolve(JOURNAL_FILE).startsWith(resolve(TEMP_DIR))).toBe(true)
+    expect(resolve(MARKER_FILE).startsWith(resolve(TEMP_DIR))).toBe(true)
   })
 })
